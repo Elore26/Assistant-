@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Auto-Sync — pulls from GitHub every 30 min -->
+    <key>Label</key>
+    <string>com.oren.auto-sync</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>auto-sync.sh</string>
+    </array>
+
+    <!-- UPDATE this to your repo directory -->
+    <key>WorkingDirectory</key>
+    <string>/Users/oren/Assistant-</string>
+
+    <!-- Run every 30 minutes (1800 seconds) -->
+    <key>StartInterval</key>
+    <integer>1800</integer>
+
+    <!-- Also run once when loaded -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Logs -->
+    <key>StandardOutPath</key>
+    <string>/tmp/oren-auto-sync-stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/oren-auto-sync-stderr.log</string>
+
+    <!-- Environment -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+        <key>HOME</key>
+        <string>/Users/oren</string>
+    </dict>
+</dict>
+</plist>
