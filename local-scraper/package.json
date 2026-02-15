@@ -1,0 +1,18 @@
+{
+  "name": "oren-local-scraper",
+  "version": "1.0.0",
+  "description": "Local Mac scraper for LinkedIn & WTTJ job listings → Supabase",
+  "type": "module",
+  "scripts": {
+    "scrape": "node src/index.mjs",
+    "scrape:linkedin": "node src/index.mjs --source linkedin",
+    "scrape:wttj": "node src/index.mjs --source wttj",
+    "setup": "npx playwright install chromium && echo 'Setup complete'",
+    "test": "node src/test.mjs"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.0",
+    "dotenv": "^16.3.1",
+    "playwright": "^1.41.0"
+  }
+}
