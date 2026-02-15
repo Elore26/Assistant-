@@ -1,6 +1,7 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { getSignalBus } from "../_shared/agent-signals.ts";
+import { robustFetch, robustFetchJSON, rateLimitedBatch } from "../_shared/robust-fetch.ts";
 
 // Types
 interface JobListing {
@@ -111,18 +112,22 @@ async function callOpenAI(systemPrompt: string, userContent: string, maxTokens =
   const apiKey = Deno.env.get("OPENAI_API_KEY");
   if (!apiKey) return "";
   try {
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
-      body: JSON.stringify({
-        model: "gpt-4o-mini",
-        temperature: 0.7,
-        max_tokens: maxTokens,
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userContent },
-        ],
-      }),
+    const response = await robustFetch("https://api.openai.com/v1/chat/completions", {
+      timeoutMs: 15000,
+      retries: 1,
+      init: {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
+        body: JSON.stringify({
+          model: "gpt-4o-mini",
+          temperature: 0.7,
+          max_tokens: maxTokens,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userContent },
+          ],
+        }),
+      },
     });
     if (!response.ok) return "";
     const data = await response.json();
@@ -163,15 +168,19 @@ async function sendTelegramMessage(text: string, parseMode: "HTML" | "Markdown" 
     }
 
     const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text: text,
-        parse_mode: parseMode,
-        disable_web_page_preview: true,
-      }),
+    const response = await robustFetch(url, {
+      timeoutMs: 10000,
+      retries: 2,
+      init: {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: text,
+          parse_mode: parseMode,
+          disable_web_page_preview: true,
+        }),
+      },
     });
 
     return response.ok;
@@ -590,15 +599,21 @@ async function fetchOneSearch(search: JSearchQuery): Promise<{ jobs: ParsedJob[]
     }
 
     const url = `https://jsearch.p.rapidapi.com/search?${params}`;
-    const resp = await fetch(url, {
-      headers: {
-        "X-RapidAPI-Key": RAPIDAPI_KEY,
-        "X-RapidAPI-Host": "jsearch.p.rapidapi.com",
+    const resp = await robustFetch(url, {
+      timeoutMs: 12000,
+      retries: 2,
+      retryDelayMs: 1500,
+      init: {
+        headers: {
+          "X-RapidAPI-Key": RAPIDAPI_KEY,
+          "X-RapidAPI-Host": "jsearch.p.rapidapi.com",
+        },
       },
     });
 
     if (!resp.ok) {
-      console.error(`JSearch failed [${search.query}]: ${resp.status}`);
+      const body = await resp.text().catch(() => "");
+      console.error(`JSearch failed [${search.query}]: ${resp.status} — ${body.slice(0, 200)}`);
       return { jobs: [], search };
     }
 
@@ -610,28 +625,66 @@ async function fetchOneSearch(search: JSearchQuery): Promise<{ jobs: ParsedJob[]
   }
 }
 
-async function scrapeJobBoards(supabase: any): Promise<{ newJobs: number; details: string[] }> {
+async function scrapeJobBoards(supabase: any): Promise<{ newJobs: number; details: string[]; errors: string[] }> {
   let totalNew = 0;
   const details: string[] = [];
+  const errors: string[] = [];
 
   if (!RAPIDAPI_KEY) {
     console.error("RAPIDAPI_KEY not set");
-    return { newJobs: 0, details: ["Config manquante: RAPIDAPI_KEY"] };
+    return { newJobs: 0, details: [], errors: ["Config manquante: RAPIDAPI_KEY"] };
   }
 
-  // Fetch all searches in parallel to avoid timeout
-  const results = await Promise.all(JOB_SEARCHES.map(s => fetchOneSearch(s)));
+  // Rate-limited sequential fetching (300ms between requests to respect API limits)
+  const results = await rateLimitedBatch(
+    JOB_SEARCHES,
+    (s) => fetchOneSearch(s),
+    300,
+  );
 
+  // Pre-fetch existing URLs for batch duplicate check (avoids N+1 queries)
+  const allJobUrls = results.flatMap(r => r.jobs.map(j => j.job_url));
+  const existingUrls = new Set<string>();
+  if (allJobUrls.length > 0) {
+    try {
+      // Check in batches of 50 to avoid query limits
+      for (let i = 0; i < allJobUrls.length; i += 50) {
+        const batch = allJobUrls.slice(i, i + 50);
+        const { data: existing } = await supabase
+          .from("job_listings")
+          .select("job_url")
+          .in("job_url", batch);
+        if (existing) {
+          existing.forEach((e: any) => existingUrls.add(e.job_url));
+        }
+      }
+    } catch (e) {
+      console.error("Duplicate check error:", e);
+    }
+  }
+
+  // Also check by company+title combo to catch reposted jobs with different URLs
+  const existingCompanyTitles = new Set<string>();
+  try {
+    const { data: recentJobs } = await supabase
+      .from("job_listings")
+      .select("company, title")
+      .gte("created_at", new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString());
+    if (recentJobs) {
+      recentJobs.forEach((j: any) => existingCompanyTitles.add(`${j.company}|||${j.title}`.toLowerCase()));
+    }
+  } catch (_) {}
+
+  let totalScraped = 0;
   for (const { jobs, search } of results) {
+    totalScraped += jobs.length;
     for (const job of jobs) {
-      // Check duplicate by URL
-      const { data: existing } = await supabase
-        .from("job_listings")
-        .select("id")
-        .eq("job_url", job.job_url)
-        .limit(1);
+      // Skip duplicates by URL
+      if (existingUrls.has(job.job_url)) continue;
 
-      if (existing && existing.length > 0) continue;
+      // Skip duplicates by company+title
+      const companyTitleKey = `${job.company}|||${job.title}`.toLowerCase();
+      if (existingCompanyTitles.has(companyTitleKey)) continue;
 
       // Generate cover letter snippet
       let coverLetterSnippet = "";
@@ -657,6 +710,8 @@ async function scrapeJobBoards(supabase: any): Promise<{ newJobs: number; detail
 
       if (!error) {
         totalNew++;
+        existingUrls.add(job.job_url);
+        existingCompanyTitles.add(companyTitleKey);
         if (details.length < 8) {
           details.push(`${search.role_type} · ${job.company} · ${search.region === "israel" ? "IL" : "FR"}`);
         }
@@ -664,7 +719,8 @@ async function scrapeJobBoards(supabase: any): Promise<{ newJobs: number; detail
     }
   }
 
-  return { newJobs: totalNew, details };
+  console.log(`[Career] Scraped ${totalScraped} jobs across ${JOB_SEARCHES.length} searches, ${totalNew} new`);
+  return { newJobs: totalNew, details, errors };
 }
 
 // Main handler
@@ -775,6 +831,9 @@ serve(async (req: Request) => {
     // 1. Send job scan results + pipeline (combined message)
     {
       let msg = `<b>CAREER — Scan</b>\n━━━━━━━━━━━━━━━━━━━━\n`;
+      if (scrapeResult.errors && scrapeResult.errors.length > 0) {
+        msg += `⚠️ ${scrapeResult.errors.join(", ")}\n`;
+      }
       if (scrapeResult.newJobs > 0) {
         msg += `<b>${scrapeResult.newJobs}</b> nouvelles offres\n\n`;
         scrapeResult.details.forEach(d => { msg += `${d}\n`; });

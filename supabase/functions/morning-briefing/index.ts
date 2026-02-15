@@ -2,6 +2,7 @@ import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { GoogleCalendar, GCAL_COLORS, getGoogleCalendar } from "../_shared/google-calendar.ts";
 import { getSignalBus } from "../_shared/agent-signals.ts";
+import { robustFetch } from "../_shared/robust-fetch.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") || "";
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
@@ -16,13 +17,17 @@ async function callOpenAI(systemPrompt: string, userContent: string, maxTokens =
   const apiKey = Deno.env.get("OPENAI_API_KEY");
   if (!apiKey) return "";
   try {
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
-      body: JSON.stringify({
-        model: "gpt-4o-mini", temperature: 0.7, max_tokens: maxTokens,
-        messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userContent }],
-      }),
+    const response = await robustFetch("https://api.openai.com/v1/chat/completions", {
+      timeoutMs: 15000,
+      retries: 1,
+      init: {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
+        body: JSON.stringify({
+          model: "gpt-4o-mini", temperature: 0.7, max_tokens: maxTokens,
+          messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userContent }],
+        }),
+      },
     });
     if (!response.ok) return "";
     const data = await response.json();
@@ -172,12 +177,22 @@ async function getDriveMin(from: string, to: string, departureTs?: number): Prom
       params.departure_time = String(departureTs);
     }
     const p = new URLSearchParams(params);
-    const r = await fetch(`https://maps.googleapis.com/maps/api/directions/json?${p}`);
+    const r = await robustFetch(`https://maps.googleapis.com/maps/api/directions/json?${p}`, {
+      timeoutMs: 8000,
+      retries: 1,
+    });
+    if (!r.ok) {
+      console.error(`Drive API HTTP ${r.status}`);
+      return 12;
+    }
     const j = await r.json();
-    if (j.status === "OK") {
+    if (j.status === "OK" && j.routes?.length > 0 && j.routes[0].legs?.length > 0) {
       const leg = j.routes[0].legs[0];
       const seconds = leg.duration_in_traffic?.value || leg.duration?.value || 720;
       return Math.ceil(seconds / 60);
+    }
+    if (j.status !== "OK") {
+      console.warn(`Drive API status: ${j.status} — ${j.error_message || ""}`);
     }
   } catch (e) { console.error("Drive API error:", e); }
   return 12;
@@ -195,21 +210,40 @@ async function getTrainSchedule(
       origin: fromStation, destination: toStation, mode: "transit", transit_mode: "rail",
       [timeParam]: String(ts), language: "fr", key: GMAPS_KEY,
     });
-    const r = await fetch(`https://maps.googleapis.com/maps/api/directions/json?${p}`);
+    const r = await robustFetch(`https://maps.googleapis.com/maps/api/directions/json?${p}`, {
+      timeoutMs: 10000,
+      retries: 1,
+    });
+    if (!r.ok) {
+      console.error(`Train API HTTP ${r.status}`);
+      return null;
+    }
     const j = await r.json();
-    if (j.status !== "OK" || !j.routes?.length) return null;
-    const leg = j.routes[0].legs[0];
-    for (const step of leg.steps) {
-      if (step.travel_mode === "TRANSIT") {
-        const td = step.transit_details;
-        if (!td) continue;
-        return {
-          dep: td.departure_time?.text || "", arr: td.arrival_time?.text || "",
-          dur: step.duration?.text || "", line: td.line?.short_name || td.line?.name || "",
-          depTs: td.departure_time?.value || 0, arrTs: td.arrival_time?.value || 0,
-        };
+    if (j.status !== "OK" || !j.routes?.length) {
+      if (j.status !== "OK") {
+        console.warn(`Train API status: ${j.status} — ${j.error_message || ""}`);
+      }
+      return null;
+    }
+    const leg = j.routes[0]?.legs?.[0];
+    if (!leg) return null;
+
+    // Search for TRANSIT step (rail) in the route
+    if (leg.steps) {
+      for (const step of leg.steps) {
+        if (step.travel_mode === "TRANSIT") {
+          const td = step.transit_details;
+          if (!td) continue;
+          return {
+            dep: td.departure_time?.text || "", arr: td.arrival_time?.text || "",
+            dur: step.duration?.text || "", line: td.line?.short_name || td.line?.name || "",
+            depTs: td.departure_time?.value || 0, arrTs: td.arrival_time?.value || 0,
+          };
+        }
       }
     }
+
+    // Fallback: use the leg-level timing if no TRANSIT step found
     return {
       dep: leg.departure_time?.text || "", arr: leg.arrival_time?.text || "",
       dur: leg.duration?.text || "", line: "Israel Railways",
@@ -223,16 +257,29 @@ async function getTrainSchedule(
 // =============================================
 async function sendTG(text: string): Promise<boolean> {
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-  let r = await fetch(url, {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text, parse_mode: "HTML", disable_web_page_preview: true }),
-  });
-  if (r.ok) return true;
-  r = await fetch(url, {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: text.replace(/<[^>]*>/g, "") }),
-  });
-  return r.ok;
+  try {
+    let r = await robustFetch(url, {
+      timeoutMs: 10000,
+      retries: 2,
+      init: {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text, parse_mode: "HTML", disable_web_page_preview: true }),
+      },
+    });
+    if (r.ok) return true;
+    r = await robustFetch(url, {
+      timeoutMs: 10000,
+      retries: 1,
+      init: {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: text.replace(/<[^>]*>/g, "") }),
+      },
+    });
+    return r.ok;
+  } catch (e) {
+    console.error("Telegram send error:", e);
+    return false;
+  }
 }
 
 function esc(s: string): string {

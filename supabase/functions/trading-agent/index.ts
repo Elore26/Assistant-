@@ -9,6 +9,7 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { getGoogleCalendar, GCAL_COLORS } from "../_shared/google-calendar.ts";
+import { robustFetch, robustFetchJSON } from "../_shared/robust-fetch.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") || "";
 const SUPABASE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
@@ -22,13 +23,17 @@ async function callOpenAI(systemPrompt: string, userContent: string, maxTokens =
   const apiKey = Deno.env.get("OPENAI_API_KEY");
   if (!apiKey) return "";
   try {
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
-      body: JSON.stringify({
-        model: "gpt-4o-mini", temperature: 0.5, max_tokens: maxTokens,
-        messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userContent }],
-      }),
+    const response = await robustFetch("https://api.openai.com/v1/chat/completions", {
+      timeoutMs: 15000,
+      retries: 1,
+      init: {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
+        body: JSON.stringify({
+          model: "gpt-4o-mini", temperature: 0.5, max_tokens: maxTokens,
+          messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userContent }],
+        }),
+      },
     });
     if (!response.ok) return "";
     const data = await response.json();
@@ -145,13 +150,23 @@ interface SignalResult {
 }
 
 // =============================================
-// BINANCE API
+// BINANCE API (with timeout, retry, graceful errors)
 // =============================================
 async function fetchKlines(symbol: string, interval: string, limit: number): Promise<Candle[]> {
   const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Binance klines error: ${res.status}`);
-  const data = await res.json();
+  const resp = await robustFetch(url, {
+    timeoutMs: 10000,
+    retries: 2,
+    retryDelayMs: 1000,
+  });
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => "");
+    throw new Error(`Binance klines ${symbol}/${interval}: HTTP ${resp.status} — ${body.slice(0, 100)}`);
+  }
+  const data = await resp.json();
+  if (!Array.isArray(data)) {
+    throw new Error(`Binance klines ${symbol}/${interval}: unexpected response format`);
+  }
   return data.map((k: any[]) => ({
     time: k[0],
     open: parseFloat(k[1]),
@@ -163,9 +178,19 @@ async function fetchKlines(symbol: string, interval: string, limit: number): Pro
 }
 
 async function fetchPrice(symbol: string): Promise<{ price: number; change: number }> {
-  const res = await fetch(`https://api.binance.com/api/v3/ticker/24hr?symbol=${symbol}`);
-  if (!res.ok) throw new Error(`Binance ticker error: ${res.status}`);
-  const data = await res.json();
+  const resp = await robustFetch(`https://api.binance.com/api/v3/ticker/24hr?symbol=${symbol}`, {
+    timeoutMs: 8000,
+    retries: 2,
+    retryDelayMs: 1000,
+  });
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => "");
+    throw new Error(`Binance ticker ${symbol}: HTTP ${resp.status} — ${body.slice(0, 100)}`);
+  }
+  const data = await resp.json();
+  if (!data.lastPrice) {
+    throw new Error(`Binance ticker ${symbol}: missing lastPrice in response`);
+  }
   return { price: parseFloat(data.lastPrice), change: parseFloat(data.priceChangePercent) };
 }
 
@@ -964,13 +989,22 @@ const TRADING_CAPITAL = parseFloat(Deno.env.get("TRADING_CAPITAL") || "144");
 const RISK_PCT = parseFloat(Deno.env.get("TRADING_RISK_PCT") || "2");
 
 async function analyzeAsset(symbol: string): Promise<AnalysisResult> {
-  // Fetch data — now includes 30min
-  const [klines1D, klines4H, klines30m, ticker] = await Promise.all([
-    fetchKlines(symbol, "1d", 200),
-    fetchKlines(symbol, "4h", 200),
-    fetchKlines(symbol, "30m", 100),
-    fetchPrice(symbol),
-  ]);
+  // Fetch data — parallel per symbol (Binance handles 4 concurrent requests fine)
+  let klines1D: Candle[], klines4H: Candle[], klines30m: Candle[], ticker: { price: number; change: number };
+  try {
+    [klines1D, klines4H, klines30m, ticker] = await Promise.all([
+      fetchKlines(symbol, "1d", 200),
+      fetchKlines(symbol, "4h", 200),
+      fetchKlines(symbol, "30m", 100),
+      fetchPrice(symbol),
+    ]);
+  } catch (e) {
+    throw new Error(`[${symbol}] Data fetch failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+
+  if (klines1D.length < 50 || klines4H.length < 50) {
+    throw new Error(`[${symbol}] Insufficient data: 1D=${klines1D.length}, 4H=${klines4H.length} candles`);
+  }
 
   const price = ticker.price;
   const change24h = ticker.change;
@@ -1236,20 +1270,33 @@ function formatTradingAnalysis(a: AnalysisResult): string {
 async function sendTG(text: string): Promise<boolean> {
   if (!BOT_TOKEN) return false;
   const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
-  let res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: CHAT_ID, text, parse_mode: "HTML", disable_web_page_preview: true }),
-  });
-  if (!res.ok) {
-    const plain = text.replace(/<[^>]+>/g, "");
-    res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: CHAT_ID, text: plain }),
+  try {
+    let res = await robustFetch(url, {
+      timeoutMs: 10000,
+      retries: 2,
+      init: {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: CHAT_ID, text, parse_mode: "HTML", disable_web_page_preview: true }),
+      },
     });
+    if (!res.ok) {
+      const plain = text.replace(/<[^>]+>/g, "");
+      res = await robustFetch(url, {
+        timeoutMs: 10000,
+        retries: 1,
+        init: {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ chat_id: CHAT_ID, text: plain }),
+        },
+      });
+    }
+    return res.ok;
+  } catch (e) {
+    console.error("Telegram send error:", e);
+    return false;
   }
-  return res.ok;
 }
 
 // =============================================
@@ -1322,12 +1369,17 @@ serve(async (req: Request) => {
     console.log(`[Trading Agent V2] Pairs: ${PAIRS.join(", ")}`);
     const analyses: AnalysisResult[] = [];
 
-    for (const pair of PAIRS) {
+    for (let i = 0; i < PAIRS.length; i++) {
+      const pair = PAIRS[i];
       try {
         const analysis = await analyzeAsset(pair);
         analyses.push(analysis);
       } catch (e) {
         console.error(`Error analyzing ${pair}:`, e);
+      }
+      // Small delay between symbols to respect Binance rate limits
+      if (i < PAIRS.length - 1) {
+        await new Promise(r => setTimeout(r, 500));
       }
     }
 
