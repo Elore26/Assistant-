@@ -157,21 +157,21 @@ function escapeMarkdown(text: string): string {
 // --- Command Handlers ---
 
 async function handleStart(chatId: number): Promise<void> {
-  const supabase = getSupabaseClient();
   let dbStatus = "offline";
   try {
-    const { error } = await supabase.from("missions").select("id").limit(1);
+    const supabase = getSupabaseClient();
+    const { error } = await supabase.from("tasks").select("id").limit(1);
     if (!error) dbStatus = "online";
   } catch {
     // DB offline
   }
 
   const text =
-    `*OREN SYSTEM*\n\n` +
+    `<b>OREN SYSTEM</b>\n\n` +
     `6 agents | Cloud 24/7\n` +
     `DB: ${dbStatus}`;
 
-  await sendTelegramMessage(chatId, text, 'Markdown', MAIN_MENU);
+  await sendTelegramMessage(chatId, text, 'HTML', MAIN_MENU);
 }
 
 async function handleBrief(chatId: number, args: string[]): Promise<void> {
@@ -4223,6 +4223,9 @@ serve(async (req: Request) => {
     }
   } catch (e) {
     console.error("Error:", e);
+    try {
+      await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 200)}`, 'HTML');
+    } catch { /* ignore send error */ }
   }
 
   return new Response(JSON.stringify({ ok: true }), {
