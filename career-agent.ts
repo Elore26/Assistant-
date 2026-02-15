@@ -1,0 +1,885 @@
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { getSignalBus } from "../_shared/agent-signals.ts";
+
+// Types
+interface JobListing {
+  id: string;
+  title: string;
+  company: string;
+  location?: string;
+  job_url: string;
+  status: "new" | "applied" | "interview" | "offer" | "rejected";
+  applied_date: string | null;
+  notes: string;
+  created_at: string;
+  cover_letter_snippet?: string;
+  last_followed_up?: string | null;
+}
+
+interface CareerTask {
+  id: string;
+  title: string;
+  status: "pending" | "in_progress" | "done";
+  priority: "low" | "medium" | "high";
+  due_date: string | null;
+  category: string;
+  notes: string;
+}
+
+interface PipelineData {
+  new: number;
+  applied: number;
+  interview: number;
+  offer: number;
+  rejected: number;
+}
+
+interface AgentResponse {
+  success: boolean;
+  type: string;
+  pipeline: PipelineData;
+  followups_needed: number;
+  timestamp: string;
+  message?: string;
+  error?: string;
+}
+
+// Helper: Get IST timezone adjusted date
+function getISTNow(): Date {
+  const utcDate = new Date();
+  const istDate = new Date(utcDate.getTime() + 5.5 * 60 * 60 * 1000);
+  return istDate;
+}
+
+// Helper: Get IST date string (YYYY-MM-DD)
+function getISTDateString(): string {
+  const istDate = getISTNow();
+  return istDate.toISOString().split("T")[0];
+}
+
+// Helper: Check if today is Sunday (IST)
+function isSunday(): boolean {
+  const istDate = getISTNow();
+  // getUTCDay() works on the UTC date, so we need to manually calculate
+  const utcDate = new Date();
+  const istTime = utcDate.getTime() + 5.5 * 60 * 60 * 1000;
+  const istDateObj = new Date(istTime);
+  return istDateObj.getUTCDay() === 0; // 0 = Sunday
+}
+
+// Helper: Get week start date (Monday) in IST
+function getWeekStartDate(): string {
+  const istDate = getISTNow();
+  const day = istDate.getUTCDay();
+  const diff = istDate.getUTCDate() - day + (day === 0 ? -6 : 1);
+  const weekStart = new Date(istDate.getUTCFullYear(), istDate.getUTCMonth(), diff);
+  return weekStart.toISOString().split("T")[0];
+}
+
+// Helper: Calculate days remaining until deadline
+function daysUntilDeadline(deadlineStr: string | null): { days: number; badge: string } {
+  if (!deadlineStr) return { days: -1, badge: "📅" };
+
+  const istDate = getISTNow();
+  const deadline = new Date(deadlineStr + "T23:59:59");
+  const diffMs = deadline.getTime() - istDate.getTime();
+  const days = Math.ceil(diffMs / (1000 * 60 * 60 * 24));
+
+  let badge = "📅";
+  if (days <= 0) {
+    badge = "🔴"; // overdue
+  } else if (days <= 30) {
+    badge = "🔴"; // critical (less than 30 days)
+  } else if (days <= 60) {
+    badge = "🟡"; // warning (30-60 days)
+  } else {
+    badge = "🟢"; // on track (more than 60 days)
+  }
+
+  return { days, badge };
+}
+
+// Helper: Format date for display
+function formatDate(dateString: string): string {
+  const date = new Date(dateString);
+  return date.toLocaleDateString("en-IN", { year: "numeric", month: "short", day: "numeric" });
+}
+
+// AI Coach: Call OpenAI for career advice
+async function callOpenAI(systemPrompt: string, userContent: string, maxTokens = 800): Promise<string> {
+  const apiKey = Deno.env.get("OPENAI_API_KEY");
+  if (!apiKey) return "";
+  try {
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        temperature: 0.7,
+        max_tokens: maxTokens,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userContent },
+        ],
+      }),
+    });
+    if (!response.ok) return "";
+    const data = await response.json();
+    return data.choices?.[0]?.message?.content || "";
+  } catch (e) {
+    console.error("OpenAI error:", e);
+    return "";
+  }
+}
+
+// Helper: Calculate days since a date
+function daysSince(dateString: string | null): number {
+  if (!dateString) return 0;
+  const istNow = getISTNow();
+  const jobDate = new Date(dateString);
+  const diffMs = istNow.getTime() - jobDate.getTime();
+  return Math.floor(diffMs / (1000 * 60 * 60 * 24));
+}
+
+// Helper: Generate cover letter snippet for a job
+async function generateCoverLetterSnippet(job: ParsedJob): Promise<string> {
+  const systemPrompt = `Tu es expert en candidature AE/SDR tech/SaaS. Oren est Account Executive bilingue FR/EN basé en Israël. Génère 2-3 phrases percutantes et personnalisées pour une lettre de motivation pour ce poste. Style: direct, orienté résultats, avec des métriques concrètes.`;
+  const userContent = `${job.title} chez ${job.company} (${job.location || "location non spécifiée"})`;
+
+  const snippet = await callOpenAI(systemPrompt, userContent, 200);
+  return snippet || "";
+}
+
+// Helper: Send Telegram message
+async function sendTelegramMessage(text: string, parseMode: "HTML" | "Markdown" = "HTML"): Promise<boolean> {
+  try {
+    const botToken = Deno.env.get("TELEGRAM_BOT_TOKEN");
+    const chatId = Deno.env.get("TELEGRAM_CHAT_ID") || "775360436";
+
+    if (!botToken) {
+      console.error("TELEGRAM_BOT_TOKEN not set");
+      return false;
+    }
+
+    const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: text,
+        parse_mode: parseMode,
+        disable_web_page_preview: true,
+      }),
+    });
+
+    return response.ok;
+  } catch (error) {
+    console.error("Error sending Telegram message:", error);
+    return false;
+  }
+}
+
+// Query: Get application follow-ups needed (applied 3+ days ago)
+async function getFollowupsNeeded(supabase: any): Promise<JobListing[]> {
+  try {
+    const istDate = getISTNow();
+    const threeDaysAgo = new Date(istDate.getTime() - 3 * 24 * 60 * 60 * 1000);
+    const threeDaysAgoStr = threeDaysAgo.toISOString().split("T")[0];
+
+    const { data, error } = await supabase
+      .from("job_listings")
+      .select("*")
+      .eq("status", "applied")
+      .lte("applied_date", threeDaysAgoStr);
+
+    if (error) throw error;
+    return data || [];
+  } catch (error) {
+    console.error("Error fetching followups:", error);
+    return [];
+  }
+}
+
+// Helper: Create followup tasks for jobs applied >5 days ago
+async function createFollowupTasks(supabase: any): Promise<number> {
+  try {
+    const istDate = getISTNow();
+    const fiveDaysAgo = new Date(istDate.getTime() - 5 * 24 * 60 * 60 * 1000);
+    const fiveDaysAgoStr = fiveDaysAgo.toISOString().split("T")[0];
+    const today = getISTDateString();
+
+    // Find all "applied" jobs where applied_date is more than 5 days ago
+    // AND (last_followed_up IS NULL OR last_followed_up < 5 days ago)
+    const { data: jobsNeedingFollowup, error: jobError } = await supabase
+      .from("job_listings")
+      .select("id, title, company, applied_date, last_followed_up")
+      .eq("status", "applied")
+      .lte("applied_date", fiveDaysAgoStr);
+
+    if (jobError) throw jobError;
+
+    let tasksCreated = 0;
+
+    for (const job of jobsNeedingFollowup || []) {
+      // Check if we already followed up recently (within 5 days)
+      if (job.last_followed_up) {
+        const lastFollowupDate = new Date(job.last_followed_up);
+        const daysSinceFollowup = Math.floor(
+          (istDate.getTime() - lastFollowupDate.getTime()) / (1000 * 60 * 60 * 24)
+        );
+        if (daysSinceFollowup < 5) continue;
+      }
+
+      // Check if a task with this linked_entity_id already exists
+      const { data: existingTask } = await supabase
+        .from("tasks")
+        .select("id")
+        .eq("linked_entity_id", job.id)
+        .eq("linked_entity_type", "job_listing")
+        .limit(1);
+
+      if (existingTask && existingTask.length > 0) {
+        continue; // Task already exists
+      }
+
+      // Create the followup task
+      const taskTitle = `Relancer ${job.company} — ${job.title}`;
+      const { error: insertError } = await supabase.from("tasks").insert({
+        title: taskTitle,
+        domain: "career",
+        priority: 2, // high priority
+        due_date: today,
+        linked_entity_id: job.id,
+        linked_entity_type: "job_listing",
+        status: "pending",
+        agent_type: "career",
+      });
+
+      if (!insertError) {
+        tasksCreated++;
+
+        // Update last_followed_up on the job
+        await supabase
+          .from("job_listings")
+          .update({ last_followed_up: today })
+          .eq("id", job.id);
+      }
+    }
+
+    return tasksCreated;
+  } catch (error) {
+    console.error("Error creating followup tasks:", error);
+    return 0;
+  }
+}
+
+// Query: Get interview prep jobs
+async function getInterviewPrep(supabase: any): Promise<JobListing[]> {
+  try {
+    const { data, error } = await supabase
+      .from("job_listings")
+      .select("*")
+      .eq("status", "interview");
+
+    if (error) throw error;
+    return data || [];
+  } catch (error) {
+    console.error("Error fetching interview prep:", error);
+    return [];
+  }
+}
+
+// Query: Get pipeline summary
+async function getPipelineSummary(supabase: any): Promise<PipelineData> {
+  try {
+    const { data, error } = await supabase
+      .from("job_listings")
+      .select("status");
+
+    if (error) throw error;
+
+    const pipeline: PipelineData = {
+      new: 0,
+      applied: 0,
+      interview: 0,
+      offer: 0,
+      rejected: 0,
+    };
+
+    if (data) {
+      data.forEach((job: any) => {
+        const status = job.status as keyof PipelineData;
+        if (status in pipeline) {
+          pipeline[status]++;
+        }
+      });
+    }
+
+    return pipeline;
+  } catch (error) {
+    console.error("Error fetching pipeline summary:", error);
+    return { new: 0, applied: 0, interview: 0, offer: 0, rejected: 0 };
+  }
+}
+
+// Query: Get overdue/high-priority career tasks
+async function getCareerTaskAlerts(supabase: any): Promise<CareerTask[]> {
+  try {
+    const today = getISTDateString();
+    const { data, error } = await supabase
+      .from("tasks")
+      .select("*")
+      .neq("status", "done")
+      .or(`priority.lte.2,due_date.lt.${today}`);
+
+    if (error) throw error;
+    return data || [];
+  } catch (error) {
+    console.error("Error fetching career task alerts:", error);
+    return [];
+  }
+}
+
+// Query: Get weekly career report (Sunday only)
+async function getWeeklyCareerReport(supabase: any): Promise<any> {
+  try {
+    const weekStart = getWeekStartDate();
+    const today = getISTDateString();
+
+    const { data: applicationsThisWeek, error: appError } = await supabase
+      .from("job_listings")
+      .select("*")
+      .gte("applied_date", weekStart)
+      .lte("applied_date", today)
+      .eq("status", "applied");
+
+    if (appError) throw appError;
+
+    const { data: interviewsThisWeek, error: intError } = await supabase
+      .from("job_listings")
+      .select("*")
+      .gte("created_at", weekStart)
+      .lte("created_at", today)
+      .eq("status", "interview");
+
+    if (intError) throw intError;
+
+    const { data: offersThisWeek, error: offError } = await supabase
+      .from("job_listings")
+      .select("*")
+      .gte("created_at", weekStart)
+      .lte("created_at", today)
+      .eq("status", "offer");
+
+    if (offError) throw offError;
+
+    const applicationsCount = applicationsThisWeek?.length || 0;
+    const interviewsCount = interviewsThisWeek?.length || 0;
+    const offersCount = offersThisWeek?.length || 0;
+    const conversionRate = applicationsCount > 0 ? ((interviewsCount / applicationsCount) * 100).toFixed(1) : "0";
+
+    return {
+      week_start: weekStart,
+      applications_sent: applicationsCount,
+      interviews_scheduled: interviewsCount,
+      offers_received: offersCount,
+      conversion_rate: `${conversionRate}%`,
+    };
+  } catch (error) {
+    console.error("Error fetching weekly report:", error);
+    return null;
+  }
+}
+
+// Format and send follow-up alerts
+async function sendFollowupAlerts(followups: JobListing[]): Promise<boolean> {
+  if (followups.length === 0) return true;
+
+  let message = "CAREER — Follow-ups\n";
+  message += "━━━━━━━━━━━━━━━━━━━━\n\n";
+  message += "Relances a faire:\n\n";
+  followups.slice(0, 3).forEach((job: JobListing) => {
+    const daysAgo = daysSince(job.applied_date);
+    message += `— ${job.company} · ${job.title} · ${daysAgo} jours\n`;
+  });
+
+  if (followups.length > 3) {
+    message += `\n(+${followups.length - 3} more)`;
+  }
+
+  // --- AI Career Coach ---
+  try {
+    const followupContext = followups
+      .slice(0, 3)
+      .map((j) => `${j.title} @ ${j.company} (appliqué il y a ${daysSince(j.applied_date)} jours)`)
+      .join("\n");
+    const followupMsg = await callOpenAI(
+      `Tu es coach carrière. Génère un court template de relance par email en français pour chaque candidature (max 3 lignes par poste). Professionnel mais chaleureux.`,
+      followupContext,
+      500
+    );
+    if (followupMsg) {
+      message += `\n\n📧 <b>TEMPLATES RELANCE</b>\n${followupMsg}`;
+    }
+  } catch (e) {
+    console.error("AI follow-up template error:", e);
+  }
+
+  return await sendTelegramMessage(message);
+}
+
+// Format and send interview prep alerts
+async function sendInterviewAlerts(interviews: JobListing[]): Promise<boolean> {
+  if (interviews.length === 0) return true;
+
+  let message = "CAREER — Interviews\n";
+  message += "━━━━━━━━━━━━━━━━━━━━\n\n";
+  message += "Preparation Required:\n\n";
+  interviews.slice(0, 3).forEach((job: JobListing) => {
+    message += `— ${job.company} · ${job.title}\n`;
+  });
+
+  // --- AI Career Coach ---
+  try {
+    const jobList = interviews.map((j) => `${j.title} @ ${j.company}`).join(", ");
+    const prepTips = await callOpenAI(
+      `Tu es un coach carrière expert en SaaS/tech. Oren est Account Executive / SDR. Génère des conseils de préparation d'entretien en français (max 5 lignes par poste). Inclus: questions probables, points à préparer, erreurs à éviter.`,
+      `Entretiens à venir: ${jobList}`,
+      600
+    );
+    if (prepTips) {
+      message += `\n🎯 <b>PREP INTERVIEW</b>\n${prepTips}`;
+    }
+  } catch (e) {
+    console.error("AI interview prep error:", e);
+  }
+
+  return await sendTelegramMessage(message);
+}
+
+// Format and send pipeline summary
+async function sendPipelineSummary(pipeline: PipelineData): Promise<boolean> {
+  const message = `CAREER — Pipeline\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `New ${pipeline.new} · Applied ${pipeline.applied} · Interview ${pipeline.interview} · Offer ${pipeline.offer}`;
+
+  return await sendTelegramMessage(message);
+}
+
+// Format and send task alerts
+async function sendTaskAlerts(tasks: CareerTask[]): Promise<boolean> {
+  if (tasks.length === 0) return true;
+
+  let message = "CAREER — Tasks\n";
+  message += "━━━━━━━━━━━━━━━━━━━━\n\n";
+  const today = getISTDateString();
+
+  const overdueTasks = tasks.filter((t) => t.due_date && t.due_date < today);
+  const highPriorityTasks = tasks.filter((t) => t.priority === "high" && (!t.due_date || t.due_date >= today));
+
+  if (overdueTasks.length > 0) {
+    message += "Overdue:\n";
+    overdueTasks.slice(0, 2).forEach((task) => {
+      message += `— ${task.title} · ${formatDate(task.due_date!)}\n`;
+    });
+    message += "\n";
+  }
+
+  if (highPriorityTasks.length > 0) {
+    message += "High Priority:\n";
+    highPriorityTasks.slice(0, 2).forEach((task) => {
+      message += `— ${task.title}`;
+      if (task.due_date) message += ` · ${formatDate(task.due_date)}`;
+      message += "\n";
+    });
+  }
+
+  return await sendTelegramMessage(message);
+}
+
+// Format and send weekly report
+async function sendWeeklyReport(report: any): Promise<boolean> {
+  let message = `CAREER — Weekly\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `Applications  ${report.applications_sent}\n` +
+    `Interviews    ${report.interviews_scheduled}\n` +
+    `Offers        ${report.offers_received}\n` +
+    `Conversion    ${report.conversion_rate}`;
+
+  // --- AI Career Coach ---
+  try {
+    const pipelineContext = `Cette semaine: ${report.applications_sent} candidatures, ${report.interviews_scheduled} entretiens, ${report.offers_received} offres, conversion ${report.conversion_rate}.`;
+    const strategy = await callOpenAI(
+      `Tu es coach carrière expert en SaaS. Oren est Account Executive / SDR. Basé sur les métriques de la semaine, fournis 3-4 conseils tactiques pour améliorer son pipeline de recrutement la semaine prochaine. Sois spécifique et actif.`,
+      pipelineContext,
+      400
+    );
+    if (strategy) {
+      message += `\n\n💡 <b>STRATÉGIE SEMAINE PRO</b>\n${strategy}`;
+    }
+  } catch (e) {
+    console.error("AI strategy advice error:", e);
+  }
+
+  return await sendTelegramMessage(message);
+}
+
+// =============================================
+// JSEARCH API JOB SCRAPING (RapidAPI)
+// =============================================
+
+const RAPIDAPI_KEY = Deno.env.get("RAPIDAPI_KEY") || "";
+
+interface JSearchQuery {
+  query: string;
+  country: string;
+  region: "israel" | "france";
+  role_type: "AE" | "SDR" | "BDR" | "other";
+}
+
+const JOB_SEARCHES: JSearchQuery[] = [
+  // Israel — no country filter (JSearch has poor IL coverage with filter)
+  { query: "Account Executive SaaS Tel Aviv", country: "", region: "israel", role_type: "AE" },
+  { query: "SDR SaaS Israel", country: "", region: "israel", role_type: "SDR" },
+  { query: "Sales Representative SaaS Tel Aviv", country: "", region: "israel", role_type: "SDR" },
+  // France
+  { query: "Account Executive SaaS Paris", country: "", region: "france", role_type: "AE" },
+  { query: "SDR SaaS Paris France", country: "", region: "france", role_type: "SDR" },
+  { query: "Business Development Representative SaaS France", country: "", region: "france", role_type: "BDR" },
+];
+
+interface ParsedJob {
+  title: string;
+  company: string;
+  location: string;
+  job_url: string;
+  date_posted: string;
+}
+
+function parseJSearchResults(json: any): ParsedJob[] {
+  const items: ParsedJob[] = [];
+  if (!json?.data) return items;
+
+  for (const r of json.data) {
+    if (!r.job_title || !r.job_apply_link) continue;
+    items.push({
+      title: r.job_title,
+      company: r.employer_name || "Unknown",
+      location: [r.job_city, r.job_country].filter(Boolean).join(", "),
+      job_url: r.job_apply_link,
+      date_posted: r.job_posted_at_datetime_utc
+        ? new Date(r.job_posted_at_datetime_utc).toISOString()
+        : new Date().toISOString(),
+    });
+  }
+  return items;
+}
+
+async function fetchOneSearch(search: JSearchQuery): Promise<{ jobs: ParsedJob[]; search: JSearchQuery }> {
+  try {
+    const params = new URLSearchParams({
+      query: search.query,
+      page: "1",
+      num_pages: "1",
+      date_posted: "month",
+    });
+    if (search.country) {
+      params.set("country", search.country);
+    }
+
+    const url = `https://jsearch.p.rapidapi.com/search?${params}`;
+    const resp = await fetch(url, {
+      headers: {
+        "X-RapidAPI-Key": RAPIDAPI_KEY,
+        "X-RapidAPI-Host": "jsearch.p.rapidapi.com",
+      },
+    });
+
+    if (!resp.ok) {
+      console.error(`JSearch failed [${search.query}]: ${resp.status}`);
+      return { jobs: [], search };
+    }
+
+    const json = await resp.json();
+    return { jobs: parseJSearchResults(json), search };
+  } catch (e) {
+    console.error(`JSearch error [${search.query}]:`, e);
+    return { jobs: [], search };
+  }
+}
+
+async function scrapeJobBoards(supabase: any): Promise<{ newJobs: number; details: string[] }> {
+  let totalNew = 0;
+  const details: string[] = [];
+
+  if (!RAPIDAPI_KEY) {
+    console.error("RAPIDAPI_KEY not set");
+    return { newJobs: 0, details: ["Config manquante: RAPIDAPI_KEY"] };
+  }
+
+  // Fetch all searches in parallel to avoid timeout
+  const results = await Promise.all(JOB_SEARCHES.map(s => fetchOneSearch(s)));
+
+  for (const { jobs, search } of results) {
+    for (const job of jobs) {
+      // Check duplicate by URL
+      const { data: existing } = await supabase
+        .from("job_listings")
+        .select("id")
+        .eq("job_url", job.job_url)
+        .limit(1);
+
+      if (existing && existing.length > 0) continue;
+
+      // Generate cover letter snippet
+      let coverLetterSnippet = "";
+      try {
+        coverLetterSnippet = await generateCoverLetterSnippet(job);
+      } catch (e) {
+        console.error("Error generating cover letter snippet:", e);
+      }
+
+      // Insert new job
+      const { error } = await supabase.from("job_listings").insert({
+        title: job.title,
+        company: job.company,
+        location: job.location || (search.region === "israel" ? "Israel" : "France"),
+        job_url: job.job_url,
+        source: "jsearch",
+        role_type: search.role_type,
+        region: search.region,
+        status: "new",
+        date_posted: job.date_posted,
+        cover_letter_snippet: coverLetterSnippet || null,
+      });
+
+      if (!error) {
+        totalNew++;
+        if (details.length < 8) {
+          details.push(`${search.role_type} · ${job.company} · ${search.region === "israel" ? "IL" : "FR"}`);
+        }
+      }
+    }
+  }
+
+  return { newJobs: totalNew, details };
+}
+
+// Main handler
+serve(async (req: Request) => {
+  try {
+    // Verify request is from Supabase (optional - adjust based on your security needs)
+    const supabaseUrl = Deno.env.get("SUPABASE_URL");
+    const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+
+    if (!supabaseUrl || !supabaseKey) {
+      return new Response(
+        JSON.stringify({
+          success: false,
+          error: "Missing Supabase configuration",
+          type: "error",
+          pipeline: { new: 0, applied: 0, interview: 0, offer: 0, rejected: 0 },
+          followups_needed: 0,
+          timestamp: getISTDateString(),
+        }),
+        { status: 500, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    const supabase = createClient(supabaseUrl, supabaseKey);
+    const signals = getSignalBus("career");
+
+    // 0. Scrape job boards first
+    const scrapeResult = await scrapeJobBoards(supabase);
+
+    // Get pipeline data (after scraping so counts are up to date)
+    const pipeline = await getPipelineSummary(supabase);
+
+    // Auto-update career goal metric (total applications sent)
+    try {
+      const { data: careerGoal } = await supabase.from("goals").select("id, metric_target")
+        .eq("domain", "career").eq("status", "active").limit(1);
+      if (careerGoal && careerGoal.length > 0) {
+        const totalApplied = pipeline.applied + pipeline.interview + pipeline.offer;
+        await supabase.from("goals").update({ metric_current: totalApplied }).eq("id", careerGoal[0].id);
+      }
+    } catch (_) {}
+
+    // Auto-create followup tasks for jobs applied >5 days ago (without recent followup)
+    const followupTasksCreated = await createFollowupTasks(supabase);
+
+    // --- Inter-Agent Signals ---
+    try {
+      // Emit skill gaps from job descriptions
+      const allDescs = (scrapeResult?.details || []).map((d: any) => (d.toString() || "").toLowerCase()).join(" ");
+      const skillKeywords: Record<string, string[]> = {
+        "salesforce": ["salesforce", "sfdc", "crm"],
+        "hubspot": ["hubspot"],
+        "english": ["english", "anglais", "fluent english"],
+        "hebrew": ["hebrew", "hébreu", "עברית"],
+        "negotiation": ["negotiation", "négociation", "closing"],
+        "cold_calling": ["cold call", "prospection", "outbound"],
+      };
+
+      for (const [skill, keywords] of Object.entries(skillKeywords)) {
+        const count = keywords.filter(kw => allDescs.includes(kw)).length;
+        if (count > 0) {
+          const pct = Math.round((count / Math.max(scrapeResult?.details?.length || 1, 1)) * 100);
+          if (pct >= 20) {
+            await signals.emit("skill_gap", `${skill} demandé dans ~${pct}% des offres`, {
+              skill, percentage: pct, jobCount: scrapeResult?.newJobs || 0,
+            }, { target: "learning", priority: 3, ttlHours: 48 });
+          }
+        }
+      }
+
+      // Check for interviews → signal urgency to learning
+      const { data: interviewsList } = await supabase.from("job_listings")
+        .select("id, title, company").eq("status", "interview").limit(5);
+      if (interviewsList && interviewsList.length > 0) {
+        await signals.emit("interview_scheduled", `${interviewsList.length} interview(s) en cours`, {
+          count: interviewsList.length,
+          companies: interviewsList.map((i: any) => i.company),
+        }, { target: "learning", priority: 1, ttlHours: 72 });
+      }
+
+      // Rejection pattern analysis
+      const { data: recentRejections } = await supabase.from("job_listings")
+        .select("company, title").eq("status", "rejected")
+        .gte("updated_at", new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString());
+      if (recentRejections && recentRejections.length >= 3) {
+        await signals.emit("rejection_pattern", `${recentRejections.length} rejets en 14j`, {
+          count: recentRejections.length,
+          companies: recentRejections.map((r: any) => r.company),
+        }, { priority: 2, ttlHours: 48 });
+      }
+    } catch (sigErr) {
+      console.error("[Signals] Career error:", sigErr);
+    }
+
+    // Get follow-ups needed
+    const followups = await getFollowupsNeeded(supabase);
+    const followupsNeeded = followups.length;
+
+    // Get interview prep jobs
+    const interviews = await getInterviewPrep(supabase);
+
+    // Get career task alerts
+    const taskAlerts = await getCareerTaskAlerts(supabase);
+
+    // Send alerts
+    let alertsSent: string[] = [];
+
+    // 1. Send job scan results + pipeline (combined message)
+    {
+      let msg = `<b>CAREER — Scan</b>\n━━━━━━━━━━━━━━━━━━━━\n`;
+      if (scrapeResult.newJobs > 0) {
+        msg += `<b>${scrapeResult.newJobs}</b> nouvelles offres\n\n`;
+        scrapeResult.details.forEach(d => { msg += `${d}\n`; });
+        if (scrapeResult.newJobs > scrapeResult.details.length) {
+          msg += `(+${scrapeResult.newJobs - scrapeResult.details.length} autres)\n`;
+        }
+      } else {
+        msg += `Aucune nouvelle offre\n`;
+      }
+      const totalActive = pipeline.applied + pipeline.interview + pipeline.offer;
+      const interviewRate = pipeline.applied > 0 ? Math.round((pipeline.interview / pipeline.applied) * 100) : 0;
+      msg += `\n<b>Pipeline</b>  New ${pipeline.new} · Applied ${pipeline.applied} · Interview ${pipeline.interview} · Offer ${pipeline.offer}`;
+      msg += `\nConversion → interview: ${interviewRate}%`;
+      msg += `\nTotal candidatures actives: ${totalActive}`;
+
+      // Add urgency badge from career goal deadline
+      try {
+        const { data: careerGoal } = await supabase
+          .from("goals")
+          .select("deadline")
+          .eq("domain", "career")
+          .eq("status", "active")
+          .limit(1);
+
+        if (careerGoal && careerGoal.length > 0 && careerGoal[0].deadline) {
+          const { days, badge } = daysUntilDeadline(careerGoal[0].deadline);
+          if (days > 0) {
+            msg += `\n\n${badge} <b>DEADLINE</b>: ${days} jours restants`;
+          }
+        }
+      } catch (_) {}
+
+      // AI daily career tip
+      try {
+        const aiTip = await callOpenAI(
+          "Tu es coach carrière. Oren cherche un poste AE/SDR en tech/SaaS en Israël. Salaire cible: 25k₪+.",
+          `Pipeline: ${pipeline.new} new, ${pipeline.applied} applied, ${pipeline.interview} interview, ${pipeline.offer} offer, ${pipeline.rejected} rejected. Conversion interview: ${interviewRate}%. Donne 1 conseil ACTIONNABLE en 2 lignes max pour aujourd'hui. Sois SPÉCIFIQUE (ex: "Relance X", "Prépare tel angle pour interview").`,
+          120
+        );
+        if (aiTip) msg += `\n\n💡 ${aiTip}`;
+      } catch (_) {}
+
+      await sendTelegramMessage(msg, "HTML");
+      alertsSent.push("scan_pipeline");
+    }
+
+    // 2. Send follow-up reminders
+    if (followupsNeeded > 0) {
+      const sent = await sendFollowupAlerts(followups);
+      if (sent) alertsSent.push("follow_up_alerts");
+    }
+
+    // 3. Send interview prep reminders
+    if (interviews.length > 0) {
+      const sent = await sendInterviewAlerts(interviews);
+      if (sent) alertsSent.push("interview_alerts");
+    }
+
+    // 4. Send task alerts
+    if (taskAlerts.length > 0) {
+      const sent = await sendTaskAlerts(taskAlerts);
+      if (sent) alertsSent.push("task_alerts");
+    }
+
+    // 5. Send weekly report on Sunday
+    let weeklyReportSent = false;
+    if (isSunday()) {
+      const weeklyReport = await getWeeklyCareerReport(supabase);
+      if (weeklyReport) {
+        const sent = await sendWeeklyReport(weeklyReport);
+        if (sent) {
+          alertsSent.push("weekly_report");
+          weeklyReportSent = true;
+        }
+      }
+    }
+
+    const response: AgentResponse = {
+      success: true,
+      type: "career_agent_daily",
+      pipeline,
+      followups_needed: followupsNeeded,
+      timestamp: getISTDateString(),
+      message: `Career agent completed. Created ${followupTasksCreated} followup task(s). Sent ${alertsSent.length} alerts: ${alertsSent.join(", ")}${weeklyReportSent ? " (including weekly report)" : ""}`,
+    };
+
+    return new Response(JSON.stringify(response), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  } catch (error) {
+    console.error("Career Agent Error:", error);
+
+    const response: AgentResponse = {
+      success: false,
+      type: "career_agent_error",
+      pipeline: { new: 0, applied: 0, interview: 0, offer: 0, rejected: 0 },
+      followups_needed: 0,
+      timestamp: getISTDateString(),
+      error: error instanceof Error ? error.message : "Unknown error",
+    };
+
+    return new Response(JSON.stringify(response), {
+      status: 500,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+});
