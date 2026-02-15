@@ -1602,29 +1602,8 @@ Style: direct, chiffres précis, pas de généralités. Emojis autorisés.`,
           }
         }
 
-        // On Sunday (weekly analysis) → sync weekly plans as all-week reminders
-        if (isSundayEvening) {
-          const allPlans = analyses.flatMap(a => a.weeklyPlans || []);
-          const now = new Date();
-          // Create events for Mon-Wed (trading days)
-          for (let d = 1; d <= 3; d++) {
-            const planDate = new Date(now);
-            planDate.setDate(now.getDate() + d);
-            const dateStr = planDate.toISOString().split("T")[0];
-
-            for (const plan of allPlans) {
-              const icon = plan.type === "BUY_ZONE" ? "🟢" : plan.type === "SELL_ZONE" ? "🔴" : "⚠️";
-              await gcal.createTaskEvent(
-                `[OREN] ${icon} ${plan.symbol}: ${plan.action}`,
-                dateStr,
-                "08:00",
-                30, // 30min reminder block
-                `Condition: ${plan.condition}\nAction: ${plan.action}\nZone: $${plan.zone}`,
-                GCAL_COLORS.TRADING
-              );
-            }
-          }
-        }
+        // Weekly plans are saved to DB only (no advance calendar events)
+        // Calendar events are created only when a signal is generated on the day of analysis
         console.log("📅 Trading signals synced to Google Calendar");
       }
     } catch (e) { console.error("GCal trading sync error:", e); }
