@@ -423,15 +423,21 @@ async function handleTaskAdd(chatId: number, args: string[]): Promise<void> {
   const supabase = getSupabaseClient();
 
   try {
-    const { error } = await supabase.from("tasks").insert({
+    const { data: inserted, error } = await supabase.from("tasks").insert({
       title: title.substring(0, 100),
       status: "pending",
       priority: 3,
       created_at: new Date().toISOString(),
-    });
+    }).select("id").single();
 
     if (error) throw error;
-    await sendTelegramMessage(chatId, `+ Tache: *${escapeMarkdown(title)}*`);
+    const taskId = inserted.id;
+    await sendTelegramMessage(chatId, `✅ Tâche ajoutée: *${escapeMarkdown(title)}*\n\n🏷 Quel contexte ?`, "Markdown", {
+      inline_keyboard: [
+        TASK_CONTEXTS.map(c => ({ text: `${CONTEXT_EMOJI[c]} ${c}`, callback_data: `task_setctx_${taskId}_${c}` })),
+        [{ text: "⏭ Pas de contexte", callback_data: `task_setctx_${taskId}_none` }],
+      ],
+    });
   } catch (e) {
     console.error("Task add error:", e);
     await sendTelegramMessage(chatId, `error: ${String(e).substring(0, 50)}`);
@@ -1625,10 +1631,10 @@ async function handleVelocity(chatId: number): Promise<void> {
     const topContext = Object.entries(contextCounts).sort((a, b) => b[1] - a[1])[0];
 
     let text = `📊 *VÉLOCITÉ* — 7 derniers jours\n\n`;
-    text += `✅ Complétées: *${thisWeekCount}* ${deltaStr} vs sem\\. dernière\n`;
+    text += `✅ Complétées: *${thisWeekCount}* ${deltaStr} vs sem. dernière\n`;
     text += `📝 Créées: ${created.length} · Ratio: ${completionRate}%\n`;
     if (totalPomodoros > 0) {
-      text += `🍅 Pomodoros: ${totalPomodoros} \\(${Math.round(deepWorkMin / 60)}h deep work\\)\n`;
+      text += `🍅 Pomodoros: ${totalPomodoros} (${Math.round(deepWorkMin / 60)}h deep work)\n`;
     }
     text += `\n`;
 
@@ -1641,21 +1647,21 @@ async function handleVelocity(chatId: number): Promise<void> {
     });
 
     if (bestDayIdx) {
-      text += `\n💪 Meilleur jour: *${dayNames[Number(bestDayIdx[0])]}* \\(${bestDayIdx[1]}\\)\n`;
+      text += `\n💪 Meilleur jour: *${dayNames[Number(bestDayIdx[0])]}* (${bestDayIdx[1]})\n`;
     }
     if (topContext) {
-      text += `🏷 Top contexte: ${CONTEXT_EMOJI[topContext[0]] || "📌"} ${topContext[0]} \\(${topContext[1]}\\)\n`;
+      text += `🏷 Top contexte: ${CONTEXT_EMOJI[topContext[0]] || "📌"} ${topContext[0]} (${topContext[1]})\n`;
     }
 
     // Most rescheduled
     if (rescheduled.length > 0) {
       text += `\n⚠️ *Plus reportées:*\n`;
       rescheduled.forEach((t: any) => {
-        text += `  ↻ x${t.reschedule_count} ${escapeMarkdown(t.title)}\n`;
+        text += `  ↻ x${t.reschedule_count} ${t.title}\n`;
       });
     }
 
-    await sendTelegramMessage(chatId, text, "MarkdownV2", {
+    await sendTelegramMessage(chatId, text, "Markdown", {
       inline_keyboard: [
         [{ text: "📋 Tâches", callback_data: "menu_tasks" }, { text: "🎯 Sprint", callback_data: "menu_sprint" }],
         [{ text: "🔙 Menu", callback_data: "menu_main" }],
@@ -2051,7 +2057,7 @@ async function handleTomorrowPlan(chatId: number): Promise<void> {
         const src = t.source === "overdue" ? " ⚠️" : t.source === "priority" ? " ⭐" : "";
         const time = t.due_time ? `${t.due_time.substring(0, 5)} ` : "";
         const rInfo = (t.reschedule_count || 0) > 0 ? ` (x${t.reschedule_count})` : "";
-        text += `${i + 1}\\. ${p} ${time}${escapeMarkdown(t.title)}${ctx}${src}${rInfo}\n`;
+        text += `${i + 1}. ${p} ${time}${t.title}${ctx}${src}${rInfo}\n`;
       });
     }
 
@@ -2067,7 +2073,7 @@ async function handleTomorrowPlan(chatId: number): Promise<void> {
       { text: "🔙 Menu", callback_data: "menu_main" },
     ]);
 
-    await sendTelegramMessage(chatId, text, "MarkdownV2", { inline_keyboard: buttons });
+    await sendTelegramMessage(chatId, text, "Markdown", { inline_keyboard: buttons });
 
     // Store the plan
     const taskIds = allSuggested.map((t: any) => t.id);
@@ -3169,6 +3175,20 @@ async function handleCallbackQuery(callbackId: string, chatId: number, data: str
       await sendTelegramMessage(chatId, `✅ Plan validé pour ${date} !\nBonne soirée, demain sera productif 💪`);
     } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
   }
+  // --- Task context assignment ---
+  else if (data.startsWith("task_setctx_")) {
+    const parts = data.replace("task_setctx_", "").split("_");
+    const taskId = parts[0];
+    const context = parts[1];
+    try {
+      if (context === "none") {
+        await sendTelegramMessage(chatId, `👌 Tâche sans contexte.`);
+      } else {
+        await supabase.from("tasks").update({ context }).eq("id", taskId);
+        await sendTelegramMessage(chatId, `${CONTEXT_EMOJI[context] || "🏷"} Contexte: *${context}*`, "Markdown");
+      }
+    } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
+  }
   // --- Context filters ---
   else if (data.startsWith("ctx_")) {
     const context = data.replace("ctx_", "");
@@ -3720,21 +3740,44 @@ async function handleTradingLast(chatId: number): Promise<void> {
     let text = `📊 *DERNIÈRE ANALYSE* (il y a ${agoText})\n\n`;
 
     for (const s of batch) {
-      const icon = s.signal_type === "BUY" ? "▲ BUY" : s.signal_type === "SELL" ? "▼ SELL" : "— HOLD";
-      text += `*${s.symbol}* ${icon}\n`;
-
       try {
         const notes = JSON.parse(s.notes || "{}");
-        text += `  1D ${notes.trend1D || "?"} · 4H ${notes.trend4H || "?"}\n`;
+        const trend1D = (notes.trend1D || "").toLowerCase();
+        const trend4H = (notes.trend4H || "").toLowerCase();
+        const isBearish = trend1D.includes("bear") || trend1D.includes("down") || trend4H.includes("bear") || trend4H.includes("down");
+
+        // Determine direction: SHORT if bearish + SELL, LONG if bullish + BUY
+        let direction = "";
+        let icon = "";
+        if (s.signal_type === "BUY") {
+          direction = "LONG ▲";
+          icon = "🟢";
+        } else if (s.signal_type === "SELL" && isBearish) {
+          direction = "SHORT ▼";
+          icon = "🔴";
+        } else if (s.signal_type === "SELL") {
+          direction = "SELL ▼";
+          icon = "🟠";
+        } else {
+          direction = "HOLD —";
+          icon = "⚪";
+        }
+
+        text += `${icon} *${s.symbol}* — ${direction}\n`;
+        text += `  Trend: 1D ${notes.trend1D || "?"} · 4H ${notes.trend4H || "?"}\n`;
         text += `  Contexte: ${notes.context || "?"} · EMA: ${notes.ema200 || "?"}\n`;
         text += `  Confluence: ${notes.confluence || "?"}/7\n`;
         if (notes.signal) {
           const sig = notes.signal;
-          text += `  Entry $${sig.entry?.toLocaleString() || "?"}\n`;
-          text += `  SL $${sig.sl?.toLocaleString() || "?"} · TP $${sig.tp?.toLocaleString() || "?"}\n`;
+          const posType = (s.signal_type === "SELL" && isBearish) ? "SHORT" : (s.signal_type === "BUY" ? "LONG" : "");
+          if (posType) text += `  📍 ${posType} Entry: $${sig.entry?.toLocaleString() || "?"}\n`;
+          else text += `  Entry $${sig.entry?.toLocaleString() || "?"}\n`;
+          text += `  🛑 SL $${sig.sl?.toLocaleString() || "?"} · 🎯 TP $${sig.tp?.toLocaleString() || "?"}\n`;
           text += `  R:R ${sig.rr || "?"} · ${sig.strategy || ""} · ${sig.confidence || "?"}%\n`;
         }
       } catch (_) {
+        const icon = s.signal_type === "BUY" ? "▲ BUY" : s.signal_type === "SELL" ? "▼ SELL" : "— HOLD";
+        text += `*${s.symbol}* ${icon}\n`;
         text += `  Conf: ${s.confidence}%\n`;
       }
       text += `\n`;
@@ -3772,8 +3815,16 @@ async function handleTradingFresh(chatId: number): Promise<void> {
     });
     const result = await res.json();
     if (result.success) {
-      await sendTelegramMessage(chatId, `✅ Analyse terminée!\n${result.analyses?.map((a: any) => `${a.symbol}: ${a.signal} (${a.confluence}/7)`).join("\n") || ""}`, "Markdown", {
-        inline_keyboard: [[{ text: "📊 Voir détails", callback_data: "trading_last" }, { text: "🔙 Trading", callback_data: "menu_signals" }]],
+      const count = result.analyses?.length || 0;
+      const summary = result.analyses?.map((a: any) => {
+        const icon = a.signal === "BUY" ? "▲" : a.signal === "SELL" ? "▼" : "—";
+        return `${icon} ${a.symbol}`;
+      }).join(" · ") || "";
+      await sendTelegramMessage(chatId, `✅ Analyse prête ! ${count} paires analysées\n${summary}`, "Markdown", {
+        inline_keyboard: [
+          [{ text: "📊 Voir l'analyse complète", callback_data: "trading_last" }],
+          [{ text: "🔙 Trading", callback_data: "menu_signals" }],
+        ],
       });
     } else {
       await sendTelegramMessage(chatId, `❌ Erreur: ${result.error || "inconnue"}`, "Markdown", {
@@ -4943,10 +4994,11 @@ async function handleNaturalLanguage(chatId: number, text: string): Promise<void
           taskData.due_time = params.due_time;
           taskData.duration_minutes = params.duration || 30;
         }
-        if (params.context && TASK_CONTEXTS.includes(params.context)) taskData.context = params.context;
+        // Don't auto-assign context — ask the user instead
         if (params.energy) taskData.energy_level = params.energy;
-        const { error } = await supabase.from("tasks").insert(taskData);
+        const { data: inserted, error } = await supabase.from("tasks").insert(taskData).select("id").single();
         if (error) throw error;
+        const taskId = inserted.id;
 
         // Sync to Google Calendar if task has a time
         let calSync = "";
@@ -4966,7 +5018,13 @@ async function handleNaturalLanguage(chatId: number, text: string): Promise<void
           } catch (ce) { console.error("GCal add_task:", ce); }
         }
 
-        await sendTelegramMessage(chatId, (reply || `✅ Tâche ajoutée: ${params.title}`) + calSync);
+        const taskTitle = params.title || text;
+        await sendTelegramMessage(chatId, `${reply || `✅ Tâche ajoutée: ${taskTitle}`}${calSync}\n\n🏷 Quel contexte ?`, "Markdown", {
+          inline_keyboard: [
+            TASK_CONTEXTS.map(c => ({ text: `${CONTEXT_EMOJI[c]} ${c}`, callback_data: `task_setctx_${taskId}_${c}` })),
+            [{ text: "⏭ Pas de contexte", callback_data: `task_setctx_${taskId}_none` }],
+          ],
+        });
         break;
       }
 
