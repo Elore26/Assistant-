@@ -1,0 +1,22 @@
+{
+  "name": "oren-server",
+  "version": "1.0.0",
+  "description": "Oren's 24/7 local Mac server — scraping, scoring, scheduling, monitoring",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.mjs",
+    "dev": "node --watch src/index.mjs",
+    "scrape": "node src/run-job.mjs scrape-all",
+    "scrape:linkedin": "node src/run-job.mjs scrape-linkedin",
+    "scrape:wttj": "node src/run-job.mjs scrape-wttj",
+    "scrape:indeed": "node src/run-job.mjs scrape-indeed",
+    "score": "node src/run-job.mjs score-jobs",
+    "health": "curl -s http://localhost:7600/health | node -e \"process.stdin.on('data',d=>console.log(JSON.parse(d+'').status))\"",
+    "setup": "node src/setup.mjs"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.0",
+    "dotenv": "^16.3.1",
+    "playwright": "^1.41.0"
+  }
+}
