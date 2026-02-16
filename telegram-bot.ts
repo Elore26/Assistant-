@@ -65,6 +65,20 @@ const EXPENSE_CATEGORIES = ['restaurant', 'transport', 'shopping', 'health', 'en
 const INCOME_CATEGORIES = ['salaire', 'freelance', 'bonus', 'other'];
 const LEARNING_TOPICS = ['english', 'ae_skills', 'ai', 'trading', 'product'];
 
+// --- Task Management V2 Constants ---
+const TASK_CONTEXTS = ['work', 'home', 'errands', 'health', 'learning'] as const;
+const CONTEXT_EMOJI: Record<string, string> = { work: '💼', home: '🏠', errands: '🛒', health: '🏋️', learning: '📚' };
+const ENERGY_LEVELS = ['high', 'medium', 'low'] as const;
+const RECURRENCE_LABELS: Record<string, string> = {
+  daily: 'Tous les jours', weekdays: 'Lun-Ven',
+  'weekly:0': 'Chaque dimanche', 'weekly:1': 'Chaque lundi', 'weekly:2': 'Chaque mardi',
+  'weekly:3': 'Chaque mercredi', 'weekly:4': 'Chaque jeudi', 'weekly:5': 'Chaque vendredi',
+  'weekly:6': 'Chaque samedi', monthly: 'Chaque mois',
+};
+const POMODORO_WORK_MIN = 25;
+const POMODORO_BREAK_MIN = 5;
+const POMODORO_LONG_BREAK_MIN = 15;
+
 // --- Utility Functions ---
 function getSupabaseClient() {
   return createClient(
@@ -140,6 +154,7 @@ const MAIN_MENU: InlineKeyboardMarkup = {
     [{ text: "☀️ Briefing", callback_data: "morning_briefing" }, { text: "📋 Tasks", callback_data: "menu_tasks" }, { text: "💰 Budget", callback_data: "menu_budget" }],
     [{ text: "🏋️ Santé", callback_data: "menu_health" }, { text: "💼 Carrière", callback_data: "menu_jobs" }, { text: "🚀 HiGrow", callback_data: "menu_leads" }],
     [{ text: "📈 Trading", callback_data: "menu_signals" }, { text: "🧠 Insights", callback_data: "menu_insights" }, { text: "🎯 Goals", callback_data: "menu_goals" }],
+    [{ text: "🌙 Plan demain", callback_data: "menu_tomorrow" }, { text: "🍅 Pomodoro", callback_data: "menu_pomodoro" }, { text: "📊 Vélocité", callback_data: "menu_velocity" }],
     [{ text: "❓ Tuto — Guide complet", callback_data: "tuto_main" }],
   ],
 };
@@ -358,6 +373,16 @@ async function handleHelp(chatId: number): Promise<void> {
     `FOCUS\n` +
     `/focus [min] — mode silencieux\n` +
     `/focus off — reprendre notifs\n\n` +
+    `PLANNING V2\n` +
+    `/inbox — voir/trier l'inbox\n` +
+    `/pomodoro — session focus 25min\n` +
+    `/velocity — stats productivité\n` +
+    `/repeat titre règle — tâche récurrente\n` +
+    `/sprint domaine "obj" cible\n` +
+    `/timeblock — planifier la journée\n` +
+    `/tomorrow — plan de demain\n` +
+    `/subtask id titre — sous-tâche\n` +
+    `/ctx work|home|errands — filtre\n\n` +
     `AUTRES\n` +
     `/morning — briefing du jour + coach santé\n` +
     `/today\n` +
@@ -893,6 +918,17 @@ function urgencyBadge(level: string | null): string {
   return "";
 }
 
+async function getRescheduleCount(supabase: any, taskId: string): Promise<number> {
+  const { data } = await supabase.from("tasks").select("reschedule_count").eq("id", taskId).single();
+  return data?.reschedule_count || 0;
+}
+
+function nextWeekday(fromDate: Date, targetDay: number): Date {
+  const d = new Date(fromDate);
+  do { d.setDate(d.getDate() + 1); } while (d.getDay() !== targetDay);
+  return d;
+}
+
 // Fixed schedule blocks per day (minutes ranges that are occupied)
 function getFixedBlocks(dayOfWeek: number): Array<{ start: number; end: number; label: string }> {
   const s = SCHEDULE[dayOfWeek];
@@ -1127,6 +1163,1003 @@ async function handleTasksCompleted(chatId: number): Promise<void> {
       inline_keyboard: [[{ text: "📋 Tâches", callback_data: "menu_tasks" }, { text: "🔙 Menu", callback_data: "menu_main" }]],
     });
   } catch (e) {
+    await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`);
+  }
+}
+
+// ============================================
+// TASK MANAGEMENT V2 — New Features
+// ============================================
+
+// --- 1. INBOX (Quick Capture) ---
+async function handleInbox(chatId: number): Promise<void> {
+  const supabase = getSupabaseClient();
+  try {
+    const { data: inboxTasks } = await supabase.from("tasks")
+      .select("id, title, created_at")
+      .eq("is_inbox", true).in("status", ["pending", "in_progress"])
+      .order("created_at", { ascending: false }).limit(10);
+    const tasks = inboxTasks || [];
+
+    if (tasks.length === 0) {
+      await sendTelegramMessage(chatId, `📥 *INBOX* — Vide\n\nTout est trié ! Envoie un message rapide pour capturer une idée.`, "Markdown", {
+        inline_keyboard: [[{ text: "📋 Tâches", callback_data: "menu_tasks" }, { text: "🔙 Menu", callback_data: "menu_main" }]],
+      });
+      return;
+    }
+
+    let text = `📥 *INBOX* — ${tasks.length} à trier\n\n`;
+    const buttons: InlineKeyboardButton[][] = [];
+    tasks.forEach((t: any, i: number) => {
+      text += `${i + 1}. ${escapeMarkdown(t.title)}\n`;
+      if (i < 5) {
+        buttons.push([
+          { text: `🔴 P1`, callback_data: `inbox_p_${t.id}_1` },
+          { text: `🟡 P3`, callback_data: `inbox_p_${t.id}_3` },
+          { text: `🟢 P5`, callback_data: `inbox_p_${t.id}_5` },
+          { text: `🗑`, callback_data: `inbox_del_${t.id}` },
+        ]);
+      }
+    });
+    text += `\nAssigne une priorité pour sortir de l'inbox.`;
+    buttons.push([{ text: "📋 Tâches", callback_data: "menu_tasks" }, { text: "🔙 Menu", callback_data: "menu_main" }]);
+
+    await sendTelegramMessage(chatId, text, "Markdown", { inline_keyboard: buttons });
+  } catch (e) {
+    console.error("Inbox error:", e);
+    await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`);
+  }
+}
+
+async function handleInboxCapture(chatId: number, text: string): Promise<void> {
+  const supabase = getSupabaseClient();
+  try {
+    const { error } = await supabase.from("tasks").insert({
+      title: text.substring(0, 100),
+      status: "pending",
+      is_inbox: true,
+      created_at: new Date().toISOString(),
+    });
+    if (error) throw error;
+
+    const { count } = await supabase.from("tasks")
+      .select("id", { count: "exact", head: true })
+      .eq("is_inbox", true).in("status", ["pending", "in_progress"]);
+
+    await sendTelegramMessage(chatId, `📥 Capturé: *${escapeMarkdown(text.substring(0, 100))}*\n_${count || 1} dans l'inbox_`, "Markdown", {
+      inline_keyboard: [[{ text: "📥 Voir inbox", callback_data: "menu_inbox" }, { text: "📋 Tâches", callback_data: "menu_tasks" }]],
+    });
+  } catch (e) {
+    console.error("Inbox capture error:", e);
+    await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`);
+  }
+}
+
+// --- 2. SMART RESCHEDULING ---
+async function handleSmartReschedule(chatId: number, taskId: string): Promise<void> {
+  const supabase = getSupabaseClient();
+  try {
+    const { data: task } = await supabase.from("tasks")
+      .select("id, title, due_date, due_time, priority, reschedule_count, duration_minutes")
+      .eq("id", taskId).single();
+    if (!task) { await sendTelegramMessage(chatId, "Tâche introuvable."); return; }
+
+    const now = getIsraelNow();
+    const rCount = (task.reschedule_count || 0);
+
+    // Find next free slot today
+    const nowMin = now.getHours() * 60 + now.getMinutes();
+    const nextSlotToday = fromMin(Math.ceil((nowMin + 30) / 15) * 15); // Next 15-min slot, at least 30min from now
+
+    // Tomorrow morning slot
+    const tomorrow = new Date(now);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    const tmrwStr = `${tomorrow.getFullYear()}-${String(tomorrow.getMonth() + 1).padStart(2, "0")}-${String(tomorrow.getDate()).padStart(2, "0")}`;
+    const tmrwDay = tomorrow.getDay();
+    const tmrwSched = SCHEDULE[tmrwDay];
+    const tmrwSlot = tmrwSched?.work_start || "09:00";
+
+    let msg = `🔄 *Reporter: ${escapeMarkdown(task.title)}*\n`;
+    if (rCount >= 3) {
+      msg += `\n⚠️ _Déjà reportée ${rCount} fois\\. Découper en sous\\-tâches ?_\n`;
+    }
+    msg += `\nQuand veux\\-tu la faire ?`;
+
+    const buttons: InlineKeyboardButton[][] = [
+      [
+        { text: `⏰ Auj ${nextSlotToday}`, callback_data: `tsnz_custom_${taskId}_${todayStr()}_${nextSlotToday}` },
+        { text: `🌅 Demain ${tmrwSlot}`, callback_data: `tsnz_custom_${taskId}_${tmrwStr}_${tmrwSlot}` },
+      ],
+      [
+        { text: `📅 +2 jours`, callback_data: `tsnz_days_${taskId}_2` },
+        { text: `📅 Lundi`, callback_data: `tsnz_nextmon_${taskId}` },
+      ],
+    ];
+
+    if (rCount >= 3) {
+      buttons.push([{ text: "✂️ Découper en sous-tâches", callback_data: `subtask_split_${taskId}` }]);
+    }
+    buttons.push([{ text: "❌ Annuler", callback_data: `tcancel_${taskId}` }]);
+
+    await sendTelegramMessage(chatId, msg, "MarkdownV2", { inline_keyboard: buttons });
+  } catch (e) {
+    console.error("SmartReschedule error:", e);
+    await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`);
+  }
+}
+
+// --- 3. SUBTASKS / CHECKLISTS ---
+async function handleSubtaskAdd(chatId: number, parentId: string, subtitleText: string): Promise<void> {
+  const supabase = getSupabaseClient();
+  try {
+    const { data: parent } = await supabase.from("tasks")
+      .select("id, title, priority, due_date, context").eq("id", parentId).single();
+    if (!parent) { await sendTelegramMessage(chatId, "Tâche parent introuvable."); return; }
+
+    const { error } = await supabase.from("tasks").insert({
+      title: subtitleText.substring(0, 100),
+      parent_task_id: parentId,
+      status: "pending",
+      priority: parent.priority || 3,
+      due_date: parent.due_date || null,
+      context: parent.context || null,
+      created_at: new Date().toISOString(),
+    });
+    if (error) throw error;
+
+    // Get subtask count
+    const { data: subs } = await supabase.from("tasks")
+      .select("id, status").eq("parent_task_id", parentId);
+    const total = (subs || []).length;
+    const done = (subs || []).filter((s: any) => s.status === "completed").length;
+
+    await sendTelegramMessage(chatId,
+      `✅ Sous-tâche ajoutée à *${escapeMarkdown(parent.title)}*\n→ ${escapeMarkdown(subtitleText)}\n\nProgression: \\[${done}/${total}\\]`,
+      "MarkdownV2");
+  } catch (e) {
+    console.error("SubtaskAdd error:", e);
+    await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`);
+  }
+}
+
+async function handleSubtaskList(chatId: number, parentId: string): Promise<void> {
+  const supabase = getSupabaseClient();
+  try {
+    const { data: parent } = await supabase.from("tasks")
+      .select("id, title").eq("id", parentId).single();
+    if (!parent) { await sendTelegramMessage(chatId, "Tâche introuvable."); return; }
+
+    const { data: subs } = await supabase.from("tasks")
+      .select("id, title, status").eq("parent_task_id", parentId)
+      .order("created_at", { ascending: true });
+    const subtasks = subs || [];
+    const done = subtasks.filter((s: any) => s.status === "completed").length;
+
+    let text = `📝 *${escapeMarkdown(parent.title)}*\nProgression: [${done}/${subtasks.length}]\n\n`;
+    const buttons: InlineKeyboardButton[][] = [];
+
+    subtasks.forEach((s: any, i: number) => {
+      const check = s.status === "completed" ? "✅" : "⬜";
+      text += `${check} ${escapeMarkdown(s.title)}\n`;
+      if (s.status !== "completed" && buttons.length < 6) {
+        buttons.push([
+          { text: `✅ ${s.title.substring(0, 20)}`, callback_data: `subdone_${s.id}` },
+        ]);
+      }
+    });
+
+    buttons.push([{ text: "➕ Ajouter sous-tâche", callback_data: `subadd_${parentId}` }]);
+    buttons.push([{ text: "📋 Tâches", callback_data: "menu_tasks" }, { text: "🔙 Menu", callback_data: "menu_main" }]);
+
+    await sendTelegramMessage(chatId, text, "Markdown", { inline_keyboard: buttons });
+  } catch (e) {
+    console.error("SubtaskList error:", e);
+    await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`);
+  }
+}
+
+// --- 4. RECURRING TASKS ---
+async function handleRecurringAdd(chatId: number, args: string[]): Promise<void> {
+  // Format: /repeat "title" rule [time] [duration]
+  // rule: daily, weekdays, weekly:1 (monday), monthly
+  if (args.length < 2) {
+    await sendTelegramMessage(chatId,
+      `Format: /repeat titre règle [heure] [durée]\n\nRègles:\n• daily — tous les jours\n• weekdays — lun-ven\n• weekly:1 — chaque lundi (0=dim)\n• monthly — chaque mois\n\nEx: /repeat "Sport push" weekly:1 17:00 60`);
+    return;
+  }
+
+  const supabase = getSupabaseClient();
+  try {
+    // Parse title (could be in quotes)
+    let title = "";
+    let restArgs: string[] = [];
+    const fullText = args.join(" ");
+    const quoted = fullText.match(/"([^"]+)"\s+(.*)/);
+    if (quoted) {
+      title = quoted[1];
+      restArgs = quoted[2].trim().split(/\s+/);
+    } else {
+      title = args[0];
+      restArgs = args.slice(1);
+    }
+
+    const rule = restArgs[0] || "daily";
+    const time = restArgs[1] && restArgs[1].includes(":") ? restArgs[1] : null;
+    const duration = restArgs.find(a => /^\d+$/.test(a) && !a.includes(":"));
+
+    if (!RECURRENCE_LABELS[rule]) {
+      await sendTelegramMessage(chatId, `Règle invalide: ${rule}\nUtilise: daily, weekdays, weekly:0-6, monthly`);
+      return;
+    }
+
+    // Create the template recurring task
+    const taskData: any = {
+      title: title.substring(0, 100),
+      status: "pending",
+      priority: 3,
+      recurrence_rule: rule,
+      due_date: todayStr(),
+      created_at: new Date().toISOString(),
+    };
+    if (time) taskData.due_time = time;
+    if (duration) taskData.duration_minutes = parseInt(duration, 10);
+
+    const { data: inserted, error } = await supabase.from("tasks").insert(taskData).select("id").single();
+    if (error) throw error;
+
+    // Mark as recurrence source
+    if (inserted) {
+      await supabase.from("tasks").update({ recurrence_source_id: inserted.id }).eq("id", inserted.id);
+    }
+
+    const label = RECURRENCE_LABELS[rule] || rule;
+    const timeStr = time ? ` à ${time}` : "";
+    const durStr = duration ? ` (${duration}min)` : "";
+
+    await sendTelegramMessage(chatId,
+      `🔄 Tâche récurrente créée:\n*${escapeMarkdown(title)}*\n${label}${timeStr}${durStr}`, "Markdown");
+  } catch (e) {
+    console.error("RecurringAdd error:", e);
+    await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`);
+  }
+}
+
+async function handleRecurringList(chatId: number): Promise<void> {
+  const supabase = getSupabaseClient();
+  try {
+    const { data: recurring } = await supabase.from("tasks")
+      .select("id, title, recurrence_rule, due_time, duration_minutes")
+      .not("recurrence_rule", "is", null)
+      .eq("recurrence_source_id", "id") // self-referencing = template
+      .in("status", ["pending", "in_progress"])
+      .limit(15);
+
+    // Fallback: get all tasks with recurrence_rule
+    const { data: allRecurring } = await supabase.from("tasks")
+      .select("id, title, recurrence_rule, due_time, duration_minutes, recurrence_source_id")
+      .not("recurrence_rule", "is", null)
+      .in("status", ["pending", "in_progress"])
+      .order("created_at", { ascending: false })
+      .limit(20);
+
+    // Filter to just templates (source = self or no source)
+    const templates = (allRecurring || []).filter((t: any) =>
+      !t.recurrence_source_id || t.recurrence_source_id === t.id
+    );
+
+    if (templates.length === 0) {
+      await sendTelegramMessage(chatId, `🔄 *TÂCHES RÉCURRENTES*\n\nAucune tâche récurrente.\nCrée-en une: /repeat titre règle`, "Markdown");
+      return;
+    }
+
+    let text = `🔄 *TÂCHES RÉCURRENTES* (${templates.length})\n\n`;
+    const buttons: InlineKeyboardButton[][] = [];
+
+    templates.forEach((t: any, i: number) => {
+      const label = RECURRENCE_LABELS[t.recurrence_rule] || t.recurrence_rule;
+      const time = t.due_time ? ` ${t.due_time.substring(0, 5)}` : "";
+      const dur = t.duration_minutes ? ` · ${t.duration_minutes}min` : "";
+      text += `${i + 1}. ${escapeMarkdown(t.title)}\n   _${label}${time}${dur}_\n`;
+      if (i < 5) {
+        buttons.push([
+          { text: `❌ Supprimer: ${t.title.substring(0, 18)}`, callback_data: `recurring_del_${t.id}` },
+        ]);
+      }
+    });
+
+    buttons.push([{ text: "📋 Tâches", callback_data: "menu_tasks" }, { text: "🔙 Menu", callback_data: "menu_main" }]);
+    await sendTelegramMessage(chatId, text, "Markdown", { inline_keyboard: buttons });
+  } catch (e) {
+    console.error("RecurringList error:", e);
+    await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`);
+  }
+}
+
+// Spawn next occurrence of a recurring task
+async function spawnNextRecurrence(supabase: any, completedTask: any): Promise<void> {
+  if (!completedTask.recurrence_rule) return;
+  const rule = completedTask.recurrence_rule;
+  const sourceId = completedTask.recurrence_source_id || completedTask.id;
+
+  const now = getIsraelNow();
+  let nextDate: Date | null = null;
+
+  if (rule === "daily") {
+    nextDate = new Date(now);
+    nextDate.setDate(nextDate.getDate() + 1);
+  } else if (rule === "weekdays") {
+    nextDate = new Date(now);
+    do { nextDate.setDate(nextDate.getDate() + 1); } while (nextDate.getDay() === 0 || nextDate.getDay() === 6);
+  } else if (rule.startsWith("weekly:")) {
+    const targetDay = parseInt(rule.split(":")[1], 10);
+    nextDate = new Date(now);
+    do { nextDate.setDate(nextDate.getDate() + 1); } while (nextDate.getDay() !== targetDay);
+  } else if (rule === "monthly") {
+    nextDate = new Date(now);
+    nextDate.setMonth(nextDate.getMonth() + 1);
+  }
+
+  if (!nextDate) return;
+
+  const nextDateStr = `${nextDate.getFullYear()}-${String(nextDate.getMonth() + 1).padStart(2, "0")}-${String(nextDate.getDate()).padStart(2, "0")}`;
+
+  // Check if next occurrence already exists
+  const { data: existing } = await supabase.from("tasks")
+    .select("id").eq("recurrence_source_id", sourceId)
+    .eq("due_date", nextDateStr).in("status", ["pending", "in_progress"]).limit(1);
+  if (existing && existing.length > 0) return;
+
+  await supabase.from("tasks").insert({
+    title: completedTask.title,
+    status: "pending",
+    priority: completedTask.priority || 3,
+    due_date: nextDateStr,
+    due_time: completedTask.due_time || null,
+    duration_minutes: completedTask.duration_minutes || null,
+    context: completedTask.context || null,
+    recurrence_rule: rule,
+    recurrence_source_id: sourceId,
+    created_at: new Date().toISOString(),
+  });
+}
+
+// --- 5. CONTEXT / TAGS ---
+async function handleTasksByContext(chatId: number, context: string): Promise<void> {
+  const supabase = getSupabaseClient();
+  try {
+    const { data: tasks } = await supabase.from("tasks")
+      .select("id, title, priority, status, due_date, due_time")
+      .eq("context", context)
+      .in("status", ["pending", "in_progress"])
+      .order("priority", { ascending: true }).limit(15);
+
+    const emoji = CONTEXT_EMOJI[context] || "📌";
+    const label = context.charAt(0).toUpperCase() + context.slice(1);
+
+    if (!tasks || tasks.length === 0) {
+      await sendTelegramMessage(chatId, `${emoji} *${label}* — Aucune tâche\n`, "Markdown", {
+        inline_keyboard: [[{ text: "📋 Toutes les tâches", callback_data: "menu_tasks" }, { text: "🔙 Menu", callback_data: "menu_main" }]],
+      });
+      return;
+    }
+
+    let text = `${emoji} *${label}* — ${tasks.length} tâches\n\n`;
+    const buttons: InlineKeyboardButton[][] = [];
+    tasks.forEach((t: any, i: number) => {
+      const p = (t.priority || 3) <= 2 ? "●" : (t.priority || 3) === 3 ? "◐" : "○";
+      const due = t.due_date ? ` · ${t.due_date.substring(5)}` : "";
+      text += `${p} ${escapeMarkdown(t.title)}${due}\n`;
+      if (i < 4) {
+        buttons.push([
+          { text: `✅ ${t.title.substring(0, 18)}`, callback_data: `tdone_${t.id}` },
+          { text: `📅`, callback_data: `reschedule_${t.id}` },
+        ]);
+      }
+    });
+
+    buttons.push([{ text: "📋 Toutes", callback_data: "menu_tasks" }, { text: "🔙 Menu", callback_data: "menu_main" }]);
+    await sendTelegramMessage(chatId, text, "Markdown", { inline_keyboard: buttons });
+  } catch (e) {
+    console.error("TasksByContext error:", e);
+    await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`);
+  }
+}
+
+// --- 6. VELOCITY & ANALYTICS ---
+async function handleVelocity(chatId: number): Promise<void> {
+  const supabase = getSupabaseClient();
+  try {
+    const now = getIsraelNow();
+    const today = todayStr();
+    const weekAgo = new Date(now.getTime() - 7 * 86400000);
+    const weekAgoStr = `${weekAgo.getFullYear()}-${String(weekAgo.getMonth() + 1).padStart(2, "0")}-${String(weekAgo.getDate()).padStart(2, "0")}`;
+    const twoWeekAgo = new Date(now.getTime() - 14 * 86400000);
+    const twoWeekAgoStr = `${twoWeekAgo.getFullYear()}-${String(twoWeekAgo.getMonth() + 1).padStart(2, "0")}-${String(twoWeekAgo.getDate()).padStart(2, "0")}`;
+
+    const [thisWeekRes, lastWeekRes, thisWeekCreated, rescheduledRes, pomodoroRes] = await Promise.all([
+      supabase.from("tasks").select("id, title, updated_at, context, duration_minutes")
+        .eq("status", "completed").gte("updated_at", weekAgoStr + "T00:00:00"),
+      supabase.from("tasks").select("id")
+        .eq("status", "completed").gte("updated_at", twoWeekAgoStr + "T00:00:00").lt("updated_at", weekAgoStr + "T00:00:00"),
+      supabase.from("tasks").select("id")
+        .gte("created_at", weekAgoStr + "T00:00:00"),
+      supabase.from("tasks").select("id, title, reschedule_count")
+        .gt("reschedule_count", 0).in("status", ["pending", "in_progress"])
+        .order("reschedule_count", { ascending: false }).limit(3),
+      supabase.from("pomodoro_sessions").select("id, duration_minutes")
+        .eq("completed", true).gte("started_at", weekAgoStr + "T00:00:00"),
+    ]);
+
+    const thisWeek = thisWeekRes.data || [];
+    const lastWeek = lastWeekRes.data || [];
+    const created = thisWeekCreated.data || [];
+    const rescheduled = rescheduledRes.data || [];
+    const pomodoros = pomodoroRes.data || [];
+
+    const thisWeekCount = thisWeek.length;
+    const lastWeekCount = lastWeek.length;
+    const delta = thisWeekCount - lastWeekCount;
+    const deltaStr = delta > 0 ? `↑ +${delta}` : delta < 0 ? `↓ ${delta}` : `→ =`;
+    const completionRate = created.length > 0 ? Math.round((thisWeekCount / created.length) * 100) : 0;
+
+    // Pomodoro stats
+    const totalPomodoros = pomodoros.length;
+    const deepWorkMin = pomodoros.reduce((s: number, p: any) => s + (p.duration_minutes || 25), 0);
+
+    // Per-day breakdown
+    const dayNames = ["Dim", "Lun", "Mar", "Mer", "Jeu", "Ven", "Sam"];
+    const dayCounts: Record<number, number> = {};
+    for (let d = 0; d < 7; d++) dayCounts[d] = 0;
+    thisWeek.forEach((t: any) => {
+      const d = new Date(t.updated_at).getDay();
+      dayCounts[d]++;
+    });
+    const bestDayIdx = Object.entries(dayCounts).sort((a, b) => Number(b[1]) - Number(a[1]))[0];
+
+    // Context breakdown
+    const contextCounts: Record<string, number> = {};
+    thisWeek.forEach((t: any) => {
+      const ctx = t.context || "sans contexte";
+      contextCounts[ctx] = (contextCounts[ctx] || 0) + 1;
+    });
+    const topContext = Object.entries(contextCounts).sort((a, b) => b[1] - a[1])[0];
+
+    let text = `📊 *VÉLOCITÉ* — 7 derniers jours\n\n`;
+    text += `✅ Complétées: *${thisWeekCount}* ${deltaStr} vs sem\\. dernière\n`;
+    text += `📝 Créées: ${created.length} · Ratio: ${completionRate}%\n`;
+    if (totalPomodoros > 0) {
+      text += `🍅 Pomodoros: ${totalPomodoros} \\(${Math.round(deepWorkMin / 60)}h deep work\\)\n`;
+    }
+    text += `\n`;
+
+    // Day chart
+    text += `*Par jour:*\n`;
+    dayNames.forEach((name, i) => {
+      const count = dayCounts[i] || 0;
+      const bar = "█".repeat(Math.min(count, 10)) + (count > 0 ? ` ${count}` : "");
+      text += `${name}: ${bar || "—"}\n`;
+    });
+
+    if (bestDayIdx) {
+      text += `\n💪 Meilleur jour: *${dayNames[Number(bestDayIdx[0])]}* \\(${bestDayIdx[1]}\\)\n`;
+    }
+    if (topContext) {
+      text += `🏷 Top contexte: ${CONTEXT_EMOJI[topContext[0]] || "📌"} ${topContext[0]} \\(${topContext[1]}\\)\n`;
+    }
+
+    // Most rescheduled
+    if (rescheduled.length > 0) {
+      text += `\n⚠️ *Plus reportées:*\n`;
+      rescheduled.forEach((t: any) => {
+        text += `  ↻ x${t.reschedule_count} ${escapeMarkdown(t.title)}\n`;
+      });
+    }
+
+    await sendTelegramMessage(chatId, text, "MarkdownV2", {
+      inline_keyboard: [
+        [{ text: "📋 Tâches", callback_data: "menu_tasks" }, { text: "🎯 Sprint", callback_data: "menu_sprint" }],
+        [{ text: "🔙 Menu", callback_data: "menu_main" }],
+      ],
+    });
+  } catch (e) {
+    console.error("Velocity error:", e);
+    await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`);
+  }
+}
+
+// --- 7. POMODORO ---
+async function handlePomodoro(chatId: number, args: string[]): Promise<void> {
+  const supabase = getSupabaseClient();
+  try {
+    // Check for active pomodoro
+    const { data: active } = await supabase.from("pomodoro_sessions")
+      .select("id, task_id, started_at, duration_minutes")
+      .is("ended_at", null).eq("completed", false)
+      .order("started_at", { ascending: false }).limit(1);
+
+    if (active && active.length > 0) {
+      const session = active[0];
+      const startTime = new Date(session.started_at);
+      const elapsed = Math.floor((Date.now() - startTime.getTime()) / 60000);
+      const remaining = (session.duration_minutes || POMODORO_WORK_MIN) - elapsed;
+
+      if (remaining > 0) {
+        let taskName = "Tâche en cours";
+        if (session.task_id) {
+          const { data: t } = await supabase.from("tasks").select("title").eq("id", session.task_id).single();
+          if (t) taskName = t.title;
+        }
+
+        await sendTelegramMessage(chatId,
+          `🍅 *Pomodoro en cours*\n\n${escapeMarkdown(taskName)}\n⏱ ${remaining} min restantes\n\nConcentre-toi !`,
+          "Markdown", {
+            inline_keyboard: [
+              [{ text: "✅ Terminé !", callback_data: `pomo_done_${session.id}` }],
+              [{ text: "❌ Abandonner", callback_data: `pomo_cancel_${session.id}` }],
+            ],
+          });
+        return;
+      } else {
+        // Timer expired — mark as completed
+        await supabase.from("pomodoro_sessions").update({
+          ended_at: new Date().toISOString(), completed: true,
+        }).eq("id", session.id);
+        if (session.task_id) {
+          await supabase.from("tasks").update({
+            pomodoro_count: supabase.rpc ? undefined : undefined, // handled below
+          }).eq("id", session.task_id);
+          // Increment pomodoro count
+          const { data: taskData } = await supabase.from("tasks").select("pomodoro_count").eq("id", session.task_id).single();
+          if (taskData) {
+            await supabase.from("tasks").update({ pomodoro_count: (taskData.pomodoro_count || 0) + 1 }).eq("id", session.task_id);
+          }
+        }
+      }
+    }
+
+    // Start new pomodoro
+    if (args.length === 0) {
+      // Show task picker
+      const { data: tasks } = await supabase.from("tasks")
+        .select("id, title, priority, pomodoro_count")
+        .in("status", ["pending", "in_progress"])
+        .order("priority", { ascending: true }).limit(6);
+
+      let text = `🍅 *POMODORO* — ${POMODORO_WORK_MIN} min focus\n\nChoisis une tâche:\n`;
+      const buttons: InlineKeyboardButton[][] = [];
+      (tasks || []).forEach((t: any) => {
+        const pomCount = t.pomodoro_count || 0;
+        const pomStr = pomCount > 0 ? ` 🍅x${pomCount}` : "";
+        buttons.push([{ text: `${t.title.substring(0, 28)}${pomStr}`, callback_data: `pomo_start_${t.id}` }]);
+      });
+      buttons.push([{ text: "🍅 Sans tâche", callback_data: "pomo_start_free" }]);
+      buttons.push([{ text: "🔙 Menu", callback_data: "menu_main" }]);
+
+      await sendTelegramMessage(chatId, text, "Markdown", { inline_keyboard: buttons });
+      return;
+    }
+
+    // Start with specific task search
+    const search = args.join(" ");
+    const { data: matchedTasks } = await supabase.from("tasks")
+      .select("id, title").in("status", ["pending", "in_progress"])
+      .ilike("title", `%${search}%`).limit(1);
+
+    const taskId = matchedTasks?.[0]?.id || null;
+    const taskTitle = matchedTasks?.[0]?.title || search;
+
+    await startPomodoro(chatId, supabase, taskId, taskTitle);
+  } catch (e) {
+    console.error("Pomodoro error:", e);
+    await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`);
+  }
+}
+
+async function startPomodoro(chatId: number, supabase: any, taskId: string | null, taskTitle: string): Promise<void> {
+  const { data: session, error } = await supabase.from("pomodoro_sessions").insert({
+    task_id: taskId,
+    started_at: new Date().toISOString(),
+    duration_minutes: POMODORO_WORK_MIN,
+    break_minutes: POMODORO_BREAK_MIN,
+    completed: false,
+  }).select("id").single();
+  if (error) throw error;
+
+  if (taskId) {
+    await supabase.from("tasks").update({ status: "in_progress" }).eq("id", taskId);
+  }
+
+  await sendTelegramMessage(chatId,
+    `🍅 *POMODORO — GO !*\n\n📌 ${escapeMarkdown(taskTitle)}\n⏱ ${POMODORO_WORK_MIN} minutes\n\n_Concentre-toi. Pas de distraction._`,
+    "Markdown", {
+      inline_keyboard: [
+        [{ text: "✅ Terminé !", callback_data: `pomo_done_${session.id}` }],
+        [{ text: "❌ Abandonner", callback_data: `pomo_cancel_${session.id}` }],
+      ],
+    });
+}
+
+// --- 8. TIME BLOCKING ---
+async function handleTimeBlock(chatId: number): Promise<void> {
+  const supabase = getSupabaseClient();
+  try {
+    const now = getIsraelNow();
+    const today = todayStr();
+    const dow = now.getDay();
+    const sched = SCHEDULE[dow];
+
+    if (!sched || sched.type === 'off') {
+      await sendTelegramMessage(chatId, `📅 Jour de repos — pas de time blocking.`);
+      return;
+    }
+
+    // Get today's unscheduled tasks
+    const { data: tasks } = await supabase.from("tasks")
+      .select("id, title, priority, duration_minutes, energy_level, due_time, context")
+      .eq("due_date", today).in("status", ["pending", "in_progress"])
+      .order("priority", { ascending: true });
+
+    const unscheduled = (tasks || []).filter((t: any) => !t.due_time);
+    const scheduled = (tasks || []).filter((t: any) => t.due_time);
+
+    if (unscheduled.length === 0) {
+      let text = `📅 *TIME BLOCK* — Tout est planifié !\n\n`;
+      scheduled.forEach((t: any) => {
+        text += `${t.due_time?.substring(0, 5)} · ${escapeMarkdown(t.title)}\n`;
+      });
+      await sendTelegramMessage(chatId, text, "Markdown", {
+        inline_keyboard: [[{ text: "📋 Tâches", callback_data: "menu_tasks" }, { text: "🔙 Menu", callback_data: "menu_main" }]],
+      });
+      return;
+    }
+
+    // Get free slots
+    const fixedBlocks = getFixedBlocks(dow);
+    const scheduledBlocks = scheduled.map((t: any) => ({
+      start: toMin(t.due_time),
+      end: toMin(t.due_time) + (t.duration_minutes || 30),
+      label: t.title,
+    }));
+    const allBlocks = [...fixedBlocks, ...scheduledBlocks].sort((a, b) => a.start - b.start);
+
+    // Find free slots (between 7:00 and 21:00)
+    const dayStart = sched.work_start ? toMin(sched.work_start) - 60 : 420; // 1h before work or 7:00
+    const dayEnd = sched.work_end ? toMin(sched.work_end) + 60 : 1260; // 1h after work or 21:00
+    const freeSlots: Array<{ start: number; end: number }> = [];
+    let cursor = Math.max(dayStart, now.getHours() * 60 + now.getMinutes() + 15); // at least 15min from now
+
+    for (const block of allBlocks) {
+      if (block.start > cursor && block.start - cursor >= 15) {
+        freeSlots.push({ start: cursor, end: block.start });
+      }
+      cursor = Math.max(cursor, block.end);
+    }
+    if (dayEnd > cursor && dayEnd - cursor >= 15) {
+      freeSlots.push({ start: cursor, end: dayEnd });
+    }
+
+    // Sort tasks: high energy first (mornings), low energy later
+    const sortedTasks = [...unscheduled].sort((a: any, b: any) => {
+      const eA = a.energy_level === "high" ? 0 : a.energy_level === "low" ? 2 : 1;
+      const eB = b.energy_level === "high" ? 0 : b.energy_level === "low" ? 2 : 1;
+      if (eA !== eB) return eA - eB;
+      return (a.priority || 3) - (b.priority || 3);
+    });
+
+    // Assign tasks to slots
+    let text = `📅 *TIME BLOCK PROPOSÉ*\n\n`;
+    const assignments: Array<{ taskId: string; time: string; dur: number }> = [];
+    let slotIdx = 0;
+
+    for (const task of sortedTasks) {
+      const dur = task.duration_minutes || 30;
+      while (slotIdx < freeSlots.length) {
+        const slot = freeSlots[slotIdx];
+        if (slot.end - slot.start >= dur) {
+          const startTime = fromMin(slot.start);
+          const endTime = fromMin(slot.start + dur);
+          const energy = task.energy_level === "high" ? "⚡" : task.energy_level === "low" ? "🌙" : "☀️";
+          const ctx = task.context ? ` ${CONTEXT_EMOJI[task.context] || ""}` : "";
+          text += `${startTime}\\-${endTime} ${energy}${ctx} ${escapeMarkdown(task.title)}\n`;
+          assignments.push({ taskId: task.id, time: startTime, dur });
+          slot.start += dur + 5; // 5min buffer
+          break;
+        }
+        slotIdx++;
+      }
+    }
+
+    if (assignments.length === 0) {
+      text += `Pas de créneau libre suffisant aujourd'hui.`;
+    } else {
+      text += `\n_${assignments.length}/${unscheduled.length} tâches placées_`;
+    }
+
+    const buttons: InlineKeyboardButton[][] = [];
+    if (assignments.length > 0) {
+      buttons.push([{ text: "✅ Appliquer ce planning", callback_data: `timeblock_apply_${today}` }]);
+    }
+    buttons.push([{ text: "📋 Tâches", callback_data: "menu_tasks" }, { text: "🔙 Menu", callback_data: "menu_main" }]);
+
+    // Store assignments temporarily in agent_signals for the apply button
+    if (assignments.length > 0) {
+      const signals = getSignalBus("telegram-bot");
+      await signals.emit("timeblock_proposal", "Time block proposal", {
+        date: today, assignments,
+      }, { target: "telegram-bot", priority: 3, ttlHours: 2 });
+    }
+
+    await sendTelegramMessage(chatId, text, "MarkdownV2", { inline_keyboard: buttons });
+  } catch (e) {
+    console.error("TimeBlock error:", e);
+    await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`);
+  }
+}
+
+// --- 9. SPRINT GOALS ---
+async function handleSprintGoals(chatId: number): Promise<void> {
+  const supabase = getSupabaseClient();
+  try {
+    const now = getIsraelNow();
+    // Find current week's Monday (or Sunday for Israel)
+    const weekStart = new Date(now);
+    const dow = weekStart.getDay();
+    weekStart.setDate(weekStart.getDate() - dow); // Go to Sunday
+    const weekStartStr = `${weekStart.getFullYear()}-${String(weekStart.getMonth() + 1).padStart(2, "0")}-${String(weekStart.getDate()).padStart(2, "0")}`;
+
+    const { data: sprints } = await supabase.from("sprint_goals")
+      .select("*").eq("week_start", weekStartStr).eq("status", "active")
+      .order("domain");
+
+    if (!sprints || sprints.length === 0) {
+      await sendTelegramMessage(chatId,
+        `🎯 *SPRINT DE LA SEMAINE*\n\nAucun objectif défini.\n\nFormat: /sprint domaine "objectif" cible\nEx: /sprint career "3 candidatures" 3\nEx: /sprint health "4 workouts" 4`,
+        "Markdown", {
+          inline_keyboard: [
+            [{ text: "➕ Créer sprint", callback_data: "sprint_create" }],
+            [{ text: "🔙 Menu", callback_data: "menu_main" }],
+          ],
+        });
+      return;
+    }
+
+    let text = `🎯 *SPRINT — Semaine du ${weekStartStr.substring(5)}*\n\n`;
+    let totalProgress = 0;
+
+    sprints.forEach((s: any) => {
+      const current = s.current_value || 0;
+      const target = s.target_value || 1;
+      const pct = Math.min(100, Math.round((current / target) * 100));
+      totalProgress += pct;
+      const bar = "█".repeat(Math.round(pct / 10)) + "░".repeat(10 - Math.round(pct / 10));
+      const emoji = CONTEXT_EMOJI[s.domain] || "📌";
+      const status = pct >= 100 ? "✅" : pct >= 60 ? "🟡" : "🔴";
+      text += `${emoji} *${escapeMarkdown(s.title)}*\n`;
+      text += `${bar} ${current}/${target} ${s.metric_unit} ${status}\n\n`;
+    });
+
+    const avgProgress = Math.round(totalProgress / sprints.length);
+    text += `\n📊 Progression globale: *${avgProgress}%*`;
+
+    await sendTelegramMessage(chatId, text, "Markdown", {
+      inline_keyboard: [
+        [{ text: "➕ Ajouter objectif", callback_data: "sprint_create" }],
+        [{ text: "📊 Vélocité", callback_data: "menu_velocity" }, { text: "🔙 Menu", callback_data: "menu_main" }],
+      ],
+    });
+  } catch (e) {
+    console.error("SprintGoals error:", e);
+    await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`);
+  }
+}
+
+async function handleSprintCreate(chatId: number, args: string[]): Promise<void> {
+  if (args.length < 3) {
+    await sendTelegramMessage(chatId,
+      `Format: /sprint domaine "objectif" cible [unité]\n\nDomaines: career, health, finance, learning, personal\n\nEx:\n/sprint career "3 candidatures" 3\n/sprint health "4 workouts" 4 sessions\n/sprint learning "5h anglais" 300 min`);
+    return;
+  }
+
+  const supabase = getSupabaseClient();
+  try {
+    const domain = args[0];
+    const fullText = args.slice(1).join(" ");
+    const quoted = fullText.match(/"([^"]+)"\s+([\d.]+)\s*(.*)?/);
+
+    let title = "", target = 1, unit = "count";
+    if (quoted) {
+      title = quoted[1];
+      target = parseFloat(quoted[2]);
+      unit = quoted[3]?.trim() || "count";
+    } else {
+      title = args.slice(1, -1).join(" ");
+      target = parseFloat(args[args.length - 1]) || 1;
+    }
+
+    const now = getIsraelNow();
+    const weekStart = new Date(now);
+    weekStart.setDate(weekStart.getDate() - weekStart.getDay());
+    const weekStartStr = `${weekStart.getFullYear()}-${String(weekStart.getMonth() + 1).padStart(2, "0")}-${String(weekStart.getDate()).padStart(2, "0")}`;
+
+    const { error } = await supabase.from("sprint_goals").insert({
+      week_start: weekStartStr,
+      domain,
+      title: title.substring(0, 100),
+      target_value: target,
+      current_value: 0,
+      metric_unit: unit,
+      status: "active",
+    });
+    if (error) throw error;
+
+    await sendTelegramMessage(chatId,
+      `🎯 Sprint créé: *${escapeMarkdown(title)}*\nObjectif: ${target} ${unit} cette semaine`,
+      "Markdown");
+  } catch (e) {
+    console.error("SprintCreate error:", e);
+    await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`);
+  }
+}
+
+// --- 10. TOMORROW PLANNING (Evening) ---
+async function handleTomorrowPlan(chatId: number): Promise<void> {
+  const supabase = getSupabaseClient();
+  try {
+    const now = getIsraelNow();
+    const tomorrow = new Date(now);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    const tmrwStr = `${tomorrow.getFullYear()}-${String(tomorrow.getMonth() + 1).padStart(2, "0")}-${String(tomorrow.getDate()).padStart(2, "0")}`;
+    const tmrwDay = tomorrow.getDay();
+    const dayNames = ['Dimanche', 'Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi'];
+
+    // Get tasks for tomorrow + overdue + high priority
+    const [tmrwTasksRes, overdueRes, p1p2Res] = await Promise.all([
+      supabase.from("tasks").select("id, title, priority, due_time, duration_minutes, context, reschedule_count")
+        .eq("due_date", tmrwStr).in("status", ["pending", "in_progress"]).order("priority"),
+      supabase.from("tasks").select("id, title, priority, due_date, reschedule_count, urgency_level")
+        .in("status", ["pending", "in_progress"]).lt("due_date", tmrwStr)
+        .order("priority").limit(5),
+      supabase.from("tasks").select("id, title, priority, due_date")
+        .in("status", ["pending", "in_progress"]).in("priority", [1, 2])
+        .is("due_date", null).limit(3),
+    ]);
+
+    const tmrwTasks = tmrwTasksRes.data || [];
+    const overdue = overdueRes.data || [];
+    const p1p2 = p1p2Res.data || [];
+
+    // Build suggested plan
+    const allSuggested = [
+      ...overdue.map((t: any) => ({ ...t, source: "overdue" })),
+      ...tmrwTasks.map((t: any) => ({ ...t, source: "planned" })),
+      ...p1p2.filter((t: any) => !tmrwTasks.find((tt: any) => tt.id === t.id)).map((t: any) => ({ ...t, source: "priority" })),
+    ].slice(0, 8);
+
+    const sched = SCHEDULE[tmrwDay];
+    const schedLabel = sched?.type === 'off' ? 'Repos' : sched?.type === 'variable' ? 'Variable' :
+      `${sched?.work_start || "?"} — ${sched?.work_end || "?"}`;
+
+    let text = `🌙 *PLAN DEMAIN* — ${dayNames[tmrwDay]} ${tmrwStr.substring(5)}\n`;
+    text += `📅 ${schedLabel}\n\n`;
+
+    if (allSuggested.length === 0) {
+      text += `Aucune tâche prévue demain.\n_Envoie un message pour capturer une tâche._`;
+    } else {
+      allSuggested.forEach((t: any, i: number) => {
+        const p = (t.priority || 3) <= 1 ? "🔴" : (t.priority || 3) === 2 ? "🟠" : (t.priority || 3) === 3 ? "🟡" : "🟢";
+        const ctx = t.context ? ` ${CONTEXT_EMOJI[t.context] || ""}` : "";
+        const src = t.source === "overdue" ? " ⚠️" : t.source === "priority" ? " ⭐" : "";
+        const time = t.due_time ? `${t.due_time.substring(0, 5)} ` : "";
+        const rInfo = (t.reschedule_count || 0) > 0 ? ` (x${t.reschedule_count})` : "";
+        text += `${i + 1}\\. ${p} ${time}${escapeMarkdown(t.title)}${ctx}${src}${rInfo}\n`;
+      });
+    }
+
+    const buttons: InlineKeyboardButton[][] = [];
+    if (allSuggested.length > 0) {
+      buttons.push([
+        { text: "✅ Valider ce plan", callback_data: `plan_validate_${tmrwStr}` },
+        { text: "✏️ Modifier", callback_data: "menu_tasks" },
+      ]);
+    }
+    buttons.push([
+      { text: "📅 Time Block", callback_data: "menu_timeblock" },
+      { text: "🔙 Menu", callback_data: "menu_main" },
+    ]);
+
+    await sendTelegramMessage(chatId, text, "MarkdownV2", { inline_keyboard: buttons });
+
+    // Store the plan
+    const taskIds = allSuggested.map((t: any) => t.id);
+    await supabase.from("tomorrow_plans").upsert({
+      plan_date: tmrwStr,
+      task_ids: taskIds,
+      validated: false,
+    }, { onConflict: "plan_date" });
+
+  } catch (e) {
+    console.error("TomorrowPlan error:", e);
+    await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`);
+  }
+}
+
+// ============================================
+// UPDATED TASKS MAIN MENU — with new sub-menus
+// ============================================
+async function handleTasksMainV2(chatId: number): Promise<void> {
+  const supabase = getSupabaseClient();
+  try {
+    const today = todayStr();
+
+    const [todayRes, inboxRes, allRes] = await Promise.all([
+      supabase.from("tasks").select("id, title, priority, status, due_time, duration_minutes, context, parent_task_id, pomodoro_count")
+        .eq("due_date", today).in("status", ["pending", "in_progress"]).is("parent_task_id", null)
+        .order("due_time", { ascending: true, nullsFirst: false }),
+      supabase.from("tasks").select("id", { count: "exact", head: true })
+        .eq("is_inbox", true).in("status", ["pending", "in_progress"]),
+      supabase.from("tasks").select("id", { count: "exact", head: true })
+        .in("status", ["pending", "in_progress"]).is("parent_task_id", null),
+    ]);
+
+    const allTasks = todayRes.data || [];
+    const inboxCount = inboxRes.count || 0;
+    const totalCount = allRes.count || 0;
+
+    let text = `📋 *TÂCHES — Aujourd'hui*\n`;
+    if (inboxCount > 0) text += `📥 ${inboxCount} dans l'inbox\n`;
+    text += `\n`;
+
+    if (allTasks.length === 0) {
+      text += `Aucune tâche pour aujourd'hui.\n`;
+    } else {
+      allTasks.forEach((t: any) => {
+        const p = (t.priority || 3) <= 2 ? "●" : (t.priority || 3) === 3 ? "◐" : "○";
+        const time = t.due_time ? `${t.due_time.substring(0, 5)} ` : "";
+        const ctx = t.context ? ` ${CONTEXT_EMOJI[t.context] || ""}` : "";
+        const pom = (t.pomodoro_count || 0) > 0 ? ` 🍅${t.pomodoro_count}` : "";
+        text += `${p} ${time}${t.title}${ctx}${pom}\n`;
+      });
+    }
+
+    // Task done buttons (max 6)
+    const buttons: InlineKeyboardButton[][] = [];
+    allTasks.slice(0, 6).forEach((t: any, i: number) => {
+      if (i % 2 === 0) buttons.push([]);
+      buttons[buttons.length - 1].push({
+        text: `✅ ${(t.title || "").substring(0, 18)}`,
+        callback_data: `task_done_${t.id}`,
+      });
+    });
+
+    // New sub-menu buttons
+    buttons.push([
+      { text: "📥 Inbox", callback_data: "menu_inbox" },
+      { text: "📅 Planifier", callback_data: "tasks_schedule" },
+      { text: "✓ Terminées", callback_data: "tasks_completed" },
+    ]);
+    buttons.push([
+      { text: "🍅 Pomodoro", callback_data: "menu_pomodoro" },
+      { text: "📊 Vélocité", callback_data: "menu_velocity" },
+    ]);
+    buttons.push([
+      { text: "🔄 Récurrentes", callback_data: "menu_recurring" },
+      { text: "🎯 Sprint", callback_data: "menu_sprint" },
+    ]);
+
+    // Context filter buttons
+    buttons.push([
+      { text: "💼", callback_data: "ctx_work" },
+      { text: "🏠", callback_data: "ctx_home" },
+      { text: "🛒", callback_data: "ctx_errands" },
+      { text: "🏋️", callback_data: "ctx_health" },
+      { text: "📚", callback_data: "ctx_learning" },
+    ]);
+
+    buttons.push([{ text: "🔙 Menu", callback_data: "menu_main" }]);
+
+    await sendTelegramMessage(chatId, text, "Markdown", { inline_keyboard: buttons });
+  } catch (e) {
+    console.error("TasksMainV2 error:", e);
     await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`);
   }
 }
@@ -1886,7 +2919,7 @@ async function handleCallbackQuery(callbackId: string, chatId: number, data: str
   if (data === "menu_main") {
     await sendTelegramMessage(chatId, "📌 *OREN*", "Markdown", MAIN_MENU);
   } else if (data === "menu_tasks") {
-    await handleTasksMain(chatId);
+    await handleTasksMainV2(chatId);
   } else if (data === "menu_budget") {
     await handleBudgetMain(chatId);
   } else if (data === "menu_health") {
@@ -1909,6 +2942,237 @@ async function handleCallbackQuery(callbackId: string, chatId: number, data: str
     await sendTelegramMessage(chatId, "Dis-moi ta tâche en message.\nEx: _Appeler le comptable demain 14h_", "Markdown");
   } else if (data === "tasks_schedule") {
     await sendTelegramMessage(chatId, "Format: /mission titre heure [durée]\nEx: _Rdv dentiste 14:00 60_", "Markdown");
+  }
+  // === TASK MANAGEMENT V2 CALLBACKS ===
+  // --- Inbox ---
+  else if (data === "menu_inbox") {
+    await handleInbox(chatId);
+  }
+  else if (data.startsWith("inbox_p_")) {
+    // inbox_p_{taskId}_{priority}
+    const parts = data.replace("inbox_p_", "").split("_");
+    const taskId = parts.slice(0, -1).join("_"); // UUID has dashes
+    const priority = parseInt(parts[parts.length - 1], 10);
+    try {
+      await supabase.from("tasks").update({ is_inbox: false, priority, due_date: todayStr() }).eq("id", taskId);
+      await sendTelegramMessage(chatId, `✅ Tâche sortie de l'inbox (P${priority})`);
+    } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
+  }
+  else if (data.startsWith("inbox_del_")) {
+    const taskId = data.replace("inbox_del_", "");
+    try {
+      await supabase.from("tasks").update({ status: "cancelled" }).eq("id", taskId);
+      await sendTelegramMessage(chatId, `🗑 Supprimée de l'inbox`);
+    } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
+  }
+  // --- Smart Rescheduling ---
+  else if (data.startsWith("reschedule_")) {
+    const taskId = data.replace("reschedule_", "");
+    await handleSmartReschedule(chatId, taskId);
+  }
+  else if (data.startsWith("tsnz_custom_")) {
+    // tsnz_custom_{taskId}_{date}_{time}
+    const rest = data.replace("tsnz_custom_", "");
+    const lastUnderscore2 = rest.lastIndexOf("_");
+    const time = rest.substring(lastUnderscore2 + 1);
+    const beforeTime = rest.substring(0, lastUnderscore2);
+    const lastUnderscore1 = beforeTime.lastIndexOf("_");
+    // date is YYYY-MM-DD which contains dashes, not underscores
+    // Format: {uuid}_{YYYY-MM-DD}_{HH:MM} — find date by pattern
+    const dateMatch = rest.match(/(\d{4}-\d{2}-\d{2})_(\d{2}:\d{2})/);
+    if (dateMatch) {
+      const date = dateMatch[1];
+      const timeSlot = dateMatch[2];
+      const taskId = rest.substring(0, rest.indexOf(`_${date}`));
+      try {
+        const rCount = await getRescheduleCount(supabase, taskId);
+        const urgency = calcUrgency(rCount + 1, null);
+        await supabase.from("tasks").update({
+          due_date: date, due_time: timeSlot, reminder_sent: false,
+          reschedule_count: rCount + 1, urgency_level: urgency,
+        }).eq("id", taskId);
+        await sendTelegramMessage(chatId, `📅 Reportée → ${date} ${timeSlot}`);
+      } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
+    }
+  }
+  else if (data.startsWith("tsnz_days_")) {
+    const rest = data.replace("tsnz_days_", "");
+    const lastUnderscore = rest.lastIndexOf("_");
+    const taskId = rest.substring(0, lastUnderscore);
+    const days = parseInt(rest.substring(lastUnderscore + 1), 10);
+    try {
+      const future = new Date(getIsraelNow());
+      future.setDate(future.getDate() + days);
+      const futureStr = `${future.getFullYear()}-${String(future.getMonth() + 1).padStart(2, "0")}-${String(future.getDate()).padStart(2, "0")}`;
+      const rCount = await getRescheduleCount(supabase, taskId);
+      const urgency = calcUrgency(rCount + 1, null);
+      await supabase.from("tasks").update({
+        due_date: futureStr, due_time: null, reminder_sent: false,
+        reschedule_count: rCount + 1, urgency_level: urgency,
+      }).eq("id", taskId);
+      await sendTelegramMessage(chatId, `📅 Reportée → ${futureStr}`);
+    } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
+  }
+  else if (data.startsWith("tsnz_nextmon_")) {
+    const taskId = data.replace("tsnz_nextmon_", "");
+    try {
+      const now = getIsraelNow();
+      const nextMon = new Date(now);
+      do { nextMon.setDate(nextMon.getDate() + 1); } while (nextMon.getDay() !== 1);
+      const monStr = `${nextMon.getFullYear()}-${String(nextMon.getMonth() + 1).padStart(2, "0")}-${String(nextMon.getDate()).padStart(2, "0")}`;
+      const rCount = await getRescheduleCount(supabase, taskId);
+      const urgency = calcUrgency(rCount + 1, null);
+      await supabase.from("tasks").update({
+        due_date: monStr, due_time: null, reminder_sent: false,
+        reschedule_count: rCount + 1, urgency_level: urgency,
+      }).eq("id", taskId);
+      await sendTelegramMessage(chatId, `📅 Reportée → Lundi ${monStr.substring(5)}`);
+    } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
+  }
+  // --- Subtasks ---
+  else if (data.startsWith("subtask_split_")) {
+    const taskId = data.replace("subtask_split_", "");
+    await sendTelegramMessage(chatId,
+      `✂️ Pour découper cette tâche, envoie les sous-tâches:\n\n/subtask ${taskId.substring(0, 8)} Sous-tâche 1\n/subtask ${taskId.substring(0, 8)} Sous-tâche 2\n...`,
+      "Markdown");
+  }
+  else if (data.startsWith("subdone_")) {
+    const subId = data.replace("subdone_", "");
+    try {
+      const { data: sub } = await supabase.from("tasks")
+        .select("id, title, parent_task_id").eq("id", subId).single();
+      if (sub) {
+        await supabase.from("tasks").update({ status: "completed", completed_at: new Date().toISOString() }).eq("id", subId);
+        // Check if all subtasks are done
+        if (sub.parent_task_id) {
+          const { data: remaining } = await supabase.from("tasks")
+            .select("id").eq("parent_task_id", sub.parent_task_id)
+            .in("status", ["pending", "in_progress"]);
+          if (!remaining || remaining.length === 0) {
+            await supabase.from("tasks").update({ status: "completed", completed_at: new Date().toISOString() }).eq("id", sub.parent_task_id);
+            await sendTelegramMessage(chatId, `✅ ${sub.title}\n🎉 Toutes les sous-tâches terminées ! Tâche parent complétée.`);
+          } else {
+            await sendTelegramMessage(chatId, `✅ ${sub.title}\n${remaining.length} sous-tâche(s) restante(s)`);
+          }
+        } else {
+          await sendTelegramMessage(chatId, `✅ ${sub.title}`);
+        }
+      }
+    } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
+  }
+  else if (data.startsWith("subadd_")) {
+    const parentId = data.replace("subadd_", "");
+    await sendTelegramMessage(chatId, `Envoie la sous-tâche:\n/subtask ${parentId.substring(0, 8)} titre de la sous-tâche`);
+  }
+  // --- Pomodoro ---
+  else if (data === "menu_pomodoro") {
+    await handlePomodoro(chatId, []);
+  }
+  else if (data.startsWith("pomo_start_")) {
+    const taskRef = data.replace("pomo_start_", "");
+    if (taskRef === "free") {
+      await startPomodoro(chatId, supabase, null, "Session libre");
+    } else {
+      const { data: task } = await supabase.from("tasks").select("id, title").eq("id", taskRef).single();
+      if (task) await startPomodoro(chatId, supabase, task.id, task.title);
+      else await sendTelegramMessage(chatId, "Tâche introuvable.");
+    }
+  }
+  else if (data.startsWith("pomo_done_")) {
+    const sessionId = data.replace("pomo_done_", "");
+    try {
+      const { data: session } = await supabase.from("pomodoro_sessions")
+        .select("id, task_id, started_at").eq("id", sessionId).single();
+      if (session) {
+        await supabase.from("pomodoro_sessions").update({
+          ended_at: new Date().toISOString(), completed: true,
+        }).eq("id", sessionId);
+        let pomMsg = `✅ 🍅 Pomodoro terminé !`;
+        if (session.task_id) {
+          const { data: taskData } = await supabase.from("tasks").select("pomodoro_count, title").eq("id", session.task_id).single();
+          if (taskData) {
+            const newCount = (taskData.pomodoro_count || 0) + 1;
+            await supabase.from("tasks").update({ pomodoro_count: newCount }).eq("id", session.task_id);
+            pomMsg += `\n${taskData.title} — 🍅 x${newCount}`;
+          }
+        }
+        pomMsg += `\n\n☕ Pause ${POMODORO_BREAK_MIN} min !`;
+        await sendTelegramMessage(chatId, pomMsg, "Markdown", {
+          inline_keyboard: [
+            [{ text: "🍅 Encore un !", callback_data: session.task_id ? `pomo_start_${session.task_id}` : "pomo_start_free" }],
+            [{ text: "✅ Tâche terminée", callback_data: session.task_id ? `tdone_${session.task_id}` : "menu_tasks" }],
+            [{ text: "🔙 Menu", callback_data: "menu_main" }],
+          ],
+        });
+      }
+    } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
+  }
+  else if (data.startsWith("pomo_cancel_")) {
+    const sessionId = data.replace("pomo_cancel_", "");
+    try {
+      await supabase.from("pomodoro_sessions").update({
+        ended_at: new Date().toISOString(), completed: false,
+      }).eq("id", sessionId);
+      await sendTelegramMessage(chatId, `❌ Pomodoro abandonné.`);
+    } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
+  }
+  // --- Velocity, Sprint, TimeBlock, Recurring, Tomorrow Plan ---
+  else if (data === "menu_velocity") {
+    await handleVelocity(chatId);
+  }
+  else if (data === "menu_sprint") {
+    await handleSprintGoals(chatId);
+  }
+  else if (data === "sprint_create") {
+    await sendTelegramMessage(chatId, "Format: /sprint domaine \"objectif\" cible\n\nEx: /sprint health \"4 workouts\" 4", "Markdown");
+  }
+  else if (data === "menu_timeblock") {
+    await handleTimeBlock(chatId);
+  }
+  else if (data.startsWith("timeblock_apply_")) {
+    const date = data.replace("timeblock_apply_", "");
+    try {
+      const signals = getSignalBus("telegram-bot");
+      const proposal = await signals.getLatest("timeblock_proposal");
+      if (proposal?.payload?.assignments) {
+        for (const a of proposal.payload.assignments) {
+          await supabase.from("tasks").update({
+            due_time: a.time, duration_minutes: a.dur, reminder_sent: false,
+          }).eq("id", a.taskId);
+        }
+        await sendTelegramMessage(chatId, `✅ Time block appliqué ! ${proposal.payload.assignments.length} tâches planifiées.`);
+      } else {
+        await sendTelegramMessage(chatId, `Proposition expirée. Relance /timeblock.`);
+      }
+    } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
+  }
+  else if (data === "menu_recurring") {
+    await handleRecurringList(chatId);
+  }
+  else if (data.startsWith("recurring_del_")) {
+    const taskId = data.replace("recurring_del_", "");
+    try {
+      await supabase.from("tasks").update({ status: "cancelled", recurrence_rule: null }).eq("id", taskId);
+      // Also cancel future occurrences
+      await supabase.from("tasks").update({ status: "cancelled", recurrence_rule: null })
+        .eq("recurrence_source_id", taskId).in("status", ["pending", "in_progress"]);
+      await sendTelegramMessage(chatId, `🗑 Tâche récurrente supprimée.`);
+    } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
+  }
+  else if (data === "menu_tomorrow") {
+    await handleTomorrowPlan(chatId);
+  }
+  else if (data.startsWith("plan_validate_")) {
+    const date = data.replace("plan_validate_", "");
+    try {
+      await supabase.from("tomorrow_plans").update({ validated: true }).eq("plan_date", date);
+      await sendTelegramMessage(chatId, `✅ Plan validé pour ${date} !\nBonne soirée, demain sera productif 💪`);
+    } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
+  }
+  // --- Context filters ---
+  else if (data.startsWith("ctx_")) {
+    const context = data.replace("ctx_", "");
+    await handleTasksByContext(chatId, context);
   }
   // === BUDGET SUB-MENU ===
   else if (data === "budget_analyse") {
@@ -1972,9 +3236,14 @@ async function handleCallbackQuery(callbackId: string, chatId: number, data: str
   else if (data.startsWith("task_done_")) {
     const taskId = data.replace("task_done_", "");
     try {
-      const { error } = await supabase.from("tasks").update({ status: "completed" }).eq("id", taskId);
+      const { error } = await supabase.from("tasks").update({ status: "completed", completed_at: new Date().toISOString() }).eq("id", taskId);
       if (error) throw error;
       await sendTelegramMessage(chatId, `✓ Tache terminee`);
+      // Spawn next recurrence if applicable
+      try {
+        const { data: fullTask } = await supabase.from("tasks").select("*").eq("id", taskId).single();
+        if (fullTask?.recurrence_rule) await spawnNextRecurrence(supabase, fullTask);
+      } catch (_) {}
     } catch (e) {
       await sendTelegramMessage(chatId, `error: ${String(e).substring(0, 50)}`);
     }
@@ -2157,6 +3426,14 @@ async function handleCallbackQuery(callbackId: string, chatId: number, data: str
         const rCount = matchedTask.reschedule_count || 0;
         const extra = rCount > 0 ? ` (après ${rCount} report${rCount > 1 ? "s" : ""})` : "";
         await sendTelegramMessage(chatId, `✅ *${escapeMarkdown(matchedTask.title)}* — Terminée !${extra}`, "Markdown");
+        // Spawn next recurrence if applicable
+        try {
+          const { data: fullTask } = await supabase.from("tasks")
+            .select("*").eq("id", matchedTask.id).single();
+          if (fullTask?.recurrence_rule) {
+            await spawnNextRecurrence(supabase, fullTask);
+          }
+        } catch (re) { console.error("Recurrence spawn error:", re); }
       }
       // ── SNOOZE +30min (same day) ──
       else if (action === "tsnz") {
@@ -3338,8 +4615,10 @@ Tu dois comprendre l'intention et répondre UNIQUEMENT en JSON valide:
 ACTIONS DISPONIBLES:
 
 add_task - Ajouter une tâche ou rappel
-  params: { "title": "texte", "priority": 1-5, "due_date": "YYYY-MM-DD", "due_time": "HH:MM" }
+  params: { "title": "texte", "priority": 1-5, "due_date": "YYYY-MM-DD", "due_time": "HH:MM", "context": "work|home|errands|health|learning", "energy": "high|medium|low" }
   Priorité: 1=critique, 2=urgent, 3=normal, 4=faible, 5=un jour
+  Context: déduis selon le sujet (boulot=work, maison=home, courses=errands, sport=health, étude=learning)
+  Energy: tâches intellectuelles/créatives=high, admin/routine=medium, simple/mécanique=low
 
 complete_task - Marquer une tâche terminée (cherche par mot-clé)
   params: { "search": "mot clé" }
@@ -3433,6 +4712,38 @@ add_note - Sauvegarder une info, un contexte, une remarque, un lien entre person
 manage_trading_pairs - Ajouter ou supprimer une paire de trading
   params: { "action": "add|remove|list", "pair": "XRPUSDT" }
   Exemples: "ajoute XRP au trading", "retire DOGE", "quelles pairs?", "ajoute AVAX à l'analyse"
+
+quick_capture - Capturer une idée/rappel rapide dans l'inbox (sans date ni priorité)
+  params: { "title": "texte" }
+  UTILISE CECI quand l'utilisateur donne une note brève, un rappel vague, ou dit "note", "rappelle-moi", "faut que je..."
+  Exemples: "faut que j'appelle le dentiste", "penser à acheter du café", "rappelle-moi de répondre à David"
+
+add_recurring_task - Créer une tâche récurrente
+  params: { "title": "texte", "rule": "daily|weekdays|weekly:0-6|monthly", "time": "HH:MM", "duration": number }
+  UTILISE CECI quand l'utilisateur dit "tous les jours", "chaque lundi", "chaque semaine"
+  Exemples: "sport tous les lundis à 17h", "réviser l'anglais chaque jour 30min"
+
+start_pomodoro - Démarrer une session pomodoro (25 min focus)
+  params: { "task_search": "mot-clé optionnel" }
+  UTILISE CECI quand l'utilisateur dit "pomodoro", "focus", "timer", "25 minutes"
+  Exemples: "pomodoro sur le rapport", "lance un focus", "25 min sur l'anglais"
+
+show_velocity - Voir les stats de productivité / vélocité
+  params: {}
+  UTILISE CECI quand l'utilisateur demande ses stats, productivité, combien de tâches, rythme
+  Exemples: "mes stats", "combien de tâches cette semaine", "ma productivité"
+
+show_sprint - Voir les objectifs sprint de la semaine
+  params: {}
+  UTILISE CECI quand l'utilisateur parle d'objectifs de la semaine, sprint, weekly goals
+
+plan_tomorrow - Planifier demain (plan du soir)
+  params: {}
+  UTILISE CECI quand l'utilisateur dit "planifie demain", "qu'est-ce que j'ai demain", "plan de demain"
+
+show_timeblock - Proposer un time blocking automatique
+  params: {}
+  UTILISE CECI quand l'utilisateur dit "organise ma journée", "time block", "planifie mes tâches"
 
 chat - Conversation, question, conseil, ou quand aucune action n'est claire
   params: {}
@@ -3632,6 +4943,8 @@ async function handleNaturalLanguage(chatId: number, text: string): Promise<void
           taskData.due_time = params.due_time;
           taskData.duration_minutes = params.duration || 30;
         }
+        if (params.context && TASK_CONTEXTS.includes(params.context)) taskData.context = params.context;
+        if (params.energy) taskData.energy_level = params.energy;
         const { error } = await supabase.from("tasks").insert(taskData);
         if (error) throw error;
 
@@ -4058,6 +5371,49 @@ async function handleNaturalLanguage(chatId: number, text: string): Promise<void
         break;
       }
 
+      // === TASK MANAGEMENT V2 NL INTENTS ===
+      case "quick_capture": {
+        const title = params?.title || text.substring(0, 100);
+        await handleInboxCapture(chatId, title);
+        break;
+      }
+
+      case "add_recurring_task": {
+        const recArgs: string[] = [];
+        if (params?.title) recArgs.push(`"${params.title}"`);
+        if (params?.rule) recArgs.push(params.rule);
+        if (params?.time) recArgs.push(params.time);
+        if (params?.duration) recArgs.push(String(params.duration));
+        if (recArgs.length >= 2) {
+          await handleRecurringAdd(chatId, recArgs);
+        } else {
+          await sendTelegramMessage(chatId, reply || "Précise le titre et la fréquence.");
+        }
+        break;
+      }
+
+      case "start_pomodoro": {
+        const pomArgs = params?.task_search ? [params.task_search] : [];
+        await handlePomodoro(chatId, pomArgs);
+        break;
+      }
+
+      case "show_velocity":
+        await handleVelocity(chatId);
+        break;
+
+      case "show_sprint":
+        await handleSprintGoals(chatId);
+        break;
+
+      case "plan_tomorrow":
+        await handleTomorrowPlan(chatId);
+        break;
+
+      case "show_timeblock":
+        await handleTimeBlock(chatId);
+        break;
+
       case "chat":
         await sendTelegramMessage(chatId, reply || "...");
         break;
@@ -4114,6 +5470,27 @@ async function handleNaturalLanguageFallback(chatId: number, text: string): Prom
       await handleBudget(chatId);
       return;
     }
+  }
+
+  // NL fallback for V2 features
+  if (lowerText.match(/^(rappelle|penser|faut que|note|pas oublier)/)) {
+    await handleInboxCapture(chatId, text);
+    return;
+  }
+
+  if (lowerText.includes("pomodoro") || lowerText.includes("focus") || lowerText.includes("timer")) {
+    await handlePomodoro(chatId, []);
+    return;
+  }
+
+  if (lowerText.includes("demain") && (lowerText.includes("plan") || lowerText.includes("prévois"))) {
+    await handleTomorrowPlan(chatId);
+    return;
+  }
+
+  if (lowerText.includes("vélocité") || lowerText.includes("productivité") || lowerText.includes("stats tâches")) {
+    await handleVelocity(chatId);
+    return;
   }
 
   await handleUnknown(chatId, text);
@@ -4474,6 +5851,46 @@ serve(async (req: Request) => {
       await handleGoals(chatId);
     } else if (command === "/focus") {
       await handleFocus(chatId, args);
+    }
+    // === TASK MANAGEMENT V2 COMMANDS ===
+    else if (command === "/inbox") {
+      await handleInbox(chatId);
+    } else if (command === "/pomodoro" || command === "/pomo") {
+      await handlePomodoro(chatId, args);
+    } else if (command === "/velocity" || command === "/vel") {
+      await handleVelocity(chatId);
+    } else if (command === "/repeat" || command === "/recurring") {
+      if (args.length === 0) await handleRecurringList(chatId);
+      else await handleRecurringAdd(chatId, args);
+    } else if (command === "/sprint") {
+      if (args.length === 0) await handleSprintGoals(chatId);
+      else await handleSprintCreate(chatId, args);
+    } else if (command === "/timeblock" || command === "/tb") {
+      await handleTimeBlock(chatId);
+    } else if (command === "/tomorrow" || command === "/demain") {
+      await handleTomorrowPlan(chatId);
+    } else if (command === "/subtask" || command === "/sub") {
+      // /subtask parentId titre
+      if (args.length >= 2) {
+        const parentRef = args[0];
+        const subTitle = args.slice(1).join(" ");
+        // Find parent by short ID prefix
+        const supabase = getSupabaseClient();
+        const { data: parents } = await supabase.from("tasks")
+          .select("id").in("status", ["pending", "in_progress"])
+          .order("created_at", { ascending: false }).limit(20);
+        const parent = (parents || []).find((p: any) => p.id.startsWith(parentRef));
+        if (parent) await handleSubtaskAdd(chatId, parent.id, subTitle);
+        else await sendTelegramMessage(chatId, `Tâche parent "${parentRef}" introuvable.`);
+      } else {
+        await sendTelegramMessage(chatId, "Format: /subtask id_parent titre\nEx: /subtask abc123 Préparer le CV");
+      }
+    } else if (command === "/context" || command === "/ctx") {
+      if (args.length > 0 && TASK_CONTEXTS.includes(args[0] as any)) {
+        await handleTasksByContext(chatId, args[0]);
+      } else {
+        await sendTelegramMessage(chatId, `Contextes: ${TASK_CONTEXTS.map(c => `${CONTEXT_EMOJI[c]} ${c}`).join(', ')}\nEx: /ctx work`);
+      }
     } else if (command === "/tuto" || command === "/tutorial" || command === "/guide") {
       const page = TUTO_PAGES["tuto_main"];
       await sendTelegramMessage(chatId, page.text, "HTML", page.buttons);
