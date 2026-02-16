@@ -4668,7 +4668,7 @@ ACTIONS DISPONIBLES:
 add_task - Ajouter une tâche ou rappel
   params: { "title": "texte", "priority": 1-5, "due_date": "YYYY-MM-DD", "due_time": "HH:MM", "context": "work|home|errands|health|learning", "energy": "high|medium|low" }
   Priorité: 1=critique, 2=urgent, 3=normal, 4=faible, 5=un jour
-  Context: déduis selon le sujet (boulot=work, maison=home, courses=errands, sport=health, étude=learning)
+  Context: TOUJOURS déduire et inclure! (boulot=work, maison/voiture/perso=home, courses=errands, sport=health, étude=learning)
   Energy: tâches intellectuelles/créatives=high, admin/routine=medium, simple/mécanique=low
 
 complete_task - Marquer une tâche terminée (cherche par mot-clé)
@@ -4989,12 +4989,16 @@ async function handleNaturalLanguage(chatId: number, text: string): Promise<void
           priority: params.priority || 3,
           created_at: new Date().toISOString(),
         };
-        if (params.due_date) taskData.due_date = params.due_date;
+        // Default due_date to today so task appears in daily Tasks view
+        taskData.due_date = params.due_date || new Date().toISOString().split("T")[0];
         if (params.due_time) {
           taskData.due_time = params.due_time;
           taskData.duration_minutes = params.duration || 30;
         }
-        // Don't auto-assign context — ask the user instead
+        // Auto-assign context from AI deduction
+        if (params.context && TASK_CONTEXTS.includes(params.context)) {
+          taskData.context = params.context;
+        }
         if (params.energy) taskData.energy_level = params.energy;
         const { data: inserted, error } = await supabase.from("tasks").insert(taskData).select("id").single();
         if (error) throw error;
