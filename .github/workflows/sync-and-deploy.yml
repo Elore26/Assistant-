@@ -1,0 +1,110 @@
+name: Sync Sources & Deploy
+
+# This workflow syncs root .ts files into supabase/functions/
+# then deploys everything. This is the main workflow to use.
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "*.ts"
+      - "supabase/functions/**"
+      - "supabase/migrations/**"
+      - ".github/workflows/sync-and-deploy.yml"
+  workflow_dispatch:
+
+jobs:
+  sync-and-deploy:
+    runs-on: ubuntu-latest
+    env:
+      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+      SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      # --- Sync root .ts files to supabase/functions/ ---
+      - name: Sync source files to Edge Functions
+        run: |
+          declare -A FILE_MAP=(
+            ["telegram-bot.ts"]="telegram-bot"
+            ["task-reminder.ts"]="task-reminder"
+            ["evening-review.ts"]="evening-review"
+            ["weekly-planning.ts"]="weekly-planning"
+            ["morning-briefing.ts"]="morning-briefing"
+            ["sync-calendar.ts"]="sync-calendar"
+            ["career-agent.ts"]="career-agent"
+            ["finance-agent.ts"]="finance-agent"
+            ["health-agent.ts"]="health-agent"
+            ["learning-agent.ts"]="learning-agent"
+            ["trading-agent.ts"]="trading-agent"
+          )
+
+          SHARED_FILES=("agent-signals.ts" "google-calendar-shared.ts")
+
+          synced=false
+
+          for file in "${!FILE_MAP[@]}"; do
+            func="${FILE_MAP[$file]}"
+            if [ -f "$file" ]; then
+              mkdir -p "supabase/functions/$func"
+              if ! diff -q "$file" "supabase/functions/$func/index.ts" > /dev/null 2>&1; then
+                cp "$file" "supabase/functions/$func/index.ts"
+                echo "Synced $file -> supabase/functions/$func/index.ts"
+                synced=true
+              fi
+            fi
+          done
+
+          for file in "${SHARED_FILES[@]}"; do
+            if [ -f "$file" ]; then
+              mkdir -p "supabase/functions/_shared"
+              target="supabase/functions/_shared/$file"
+              if ! diff -q "$file" "$target" > /dev/null 2>&1; then
+                cp "$file" "$target"
+                echo "Synced $file -> $target"
+                synced=true
+              fi
+            fi
+          done
+
+          if [ "$synced" = true ]; then
+            echo "FILES_SYNCED=true" >> $GITHUB_ENV
+          else
+            echo "All files already in sync"
+            echo "FILES_SYNCED=false" >> $GITHUB_ENV
+          fi
+
+      # --- Run migrations if any ---
+      - name: Link Supabase project
+        run: supabase link --project-ref ${{ secrets.SUPABASE_PROJECT_REF }}
+
+      - name: Push database migrations
+        run: supabase db push
+
+      # --- Deploy all Edge Functions ---
+      - name: Deploy Edge Functions
+        run: |
+          for dir in supabase/functions/*/; do
+            func_name=$(basename "$dir")
+            if [ "$func_name" = "_shared" ] || [ "$func_name" = "tests" ]; then
+              continue
+            fi
+            if [ -f "$dir/index.ts" ]; then
+              echo "Deploying $func_name..."
+              supabase functions deploy "$func_name" \
+                --no-verify-jwt \
+                --project-ref ${{ secrets.SUPABASE_PROJECT_REF }}
+              echo "$func_name deployed"
+            fi
+          done
+
+      - name: Summary
+        run: |
+          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- Migrations: applied" >> $GITHUB_STEP_SUMMARY
+          echo "- Edge Functions: deployed" >> $GITHUB_STEP_SUMMARY
+          echo "- Files synced: ${{ env.FILES_SYNCED }}" >> $GITHUB_STEP_SUMMARY
