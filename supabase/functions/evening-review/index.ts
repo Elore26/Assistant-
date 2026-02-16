@@ -280,8 +280,9 @@ serve(async (_req: Request) => {
     // --- Accountability: planned but not done (human tasks only) ---
     const failedTasks = humanPending.filter((t: any) => t.due_date === todayStr);
     const failedCount = failedTasks.length;
-    const completionRate = (tasksDoneToday + failedCount) > 0
-      ? Math.round((tasksDoneToday / (tasksDoneToday + failedCount)) * 100) : 100;
+    const todayTotalScheduled = tasksDoneToday + failedCount;
+    const completionRate = todayTotalScheduled > 0
+      ? Math.round((tasksDoneToday / todayTotalScheduled) * 100) : 100;
 
     // --- Day-of-week pattern ---
     let dayPattern = "";
@@ -482,12 +483,13 @@ serve(async (_req: Request) => {
       if (humanCompleted.length > 4) msg += `  + ${humanCompleted.length - 4} autres\n`;
     }
     if (failedTasks.length > 0) {
-      msg += `\n<b>⚠️ PAS FAIT:</b>\n`;
-      failedTasks.slice(0, 3).forEach((t: any) => {
-        const dueTime = t.due_time ? ` (prévu ${t.due_time.substring(0, 5)})` : "";
-        msg += `  ✗ ${esc(t.title)}${dueTime}\n`;
+      msg += `\n<b>⚠️ PAS FAIT (${failedTasks.length}):</b>\n`;
+      failedTasks.slice(0, 15).forEach((t: any) => {
+        const dueTime = t.due_time ? ` (${t.due_time.substring(0, 5)})` : "";
+        const p = (t.priority || 3) <= 1 ? "🔴" : (t.priority || 3) === 2 ? "🟠" : "🟡";
+        msg += `  ✗ ${p} ${esc(t.title)}${dueTime}\n`;
       });
-      if (failedTasks.length > 3) msg += `  + ${failedTasks.length - 3} autres\n`;
+      if (failedTasks.length > 15) msg += `  <i>+ ${failedTasks.length - 15} autres tâches anciennes...</i>\n`;
       if (completionRate < 50) {
         msg += `  <i>Moins de la moitié fait. Qu'est-ce qui a bloqué ?</i>\n`;
       }
@@ -556,12 +558,20 @@ serve(async (_req: Request) => {
     }
 
     // ============================================
-    // OBJECTIFS — Prédictions + Progress bars
+    // OBJECTIFS — TOP 3 PRIORITAIRES
     // ============================================
     if (goalPredictions.length > 0) {
       msg += `${LINE}\n<b>🎯 OBJECTIFS</b>\n\n`;
 
-      for (const gp of goalPredictions) {
+      // Sort: off-track first, then by days left, limit to TOP 3
+      const top3Goals = [...goalPredictions]
+        .sort((a, b) => {
+          if (a.onTrack !== b.onTrack) return a.onTrack ? 1 : -1; // Off-track first
+          return a.daysLeft - b.daysLeft; // Then by urgency (deadline)
+        })
+        .slice(0, 3);
+
+      for (const gp of top3Goals) {
         const emoji = DOMAIN_EMOJIS[gp.domain] || "📌";
         const status = gp.onTrack ? "✅" : "⚠️";
         msg += `${emoji} <b>${esc(gp.title)}</b>\n`;
@@ -573,6 +583,12 @@ serve(async (_req: Request) => {
           msg += `  Actions du jour: ${gp.dailyActionsStatus}\n`;
         }
         msg += `\n`;
+      }
+
+      if (goalPredictions.length > 3) {
+        const remaining = goalPredictions.length - 3;
+        const onTrackCount = goalPredictions.slice(3).filter(g => g.onTrack).length;
+        msg += `<i>+ ${remaining} autres objectifs (${onTrackCount} on track)</i>\n\n`;
       }
     }
 
@@ -610,7 +626,7 @@ serve(async (_req: Request) => {
     } catch (metErr) { console.error("[Metrics] Save error:", metErr); }
 
     // ============================================
-    // TOMORROW PLAN
+    // TOMORROW PLAN — TIME-BLOCKING
     // ============================================
     const tomorrowDay = (day + 1) % 7;
     msg += `${LINE}\n`;
@@ -623,10 +639,10 @@ serve(async (_req: Request) => {
 
     // Get tasks for tomorrow + overdue + high priority unscheduled
     const [tmrwTasksRes, overdueTmrwRes] = await Promise.all([
-      supabase.from("tasks").select("id, title, priority, due_time, context, reschedule_count")
+      supabase.from("tasks").select("id, title, priority, due_time, context, reschedule_count, duration_minutes")
         .eq("due_date", tmrwStr).in("status", ["pending", "in_progress"])
-        .is("parent_task_id", null).order("priority"),
-      supabase.from("tasks").select("id, title, priority, due_date, reschedule_count, urgency_level")
+        .is("parent_task_id", null).order("due_time", { ascending: true, nullsFirst: false }),
+      supabase.from("tasks").select("id, title, priority, due_date, reschedule_count, urgency_level, duration_minutes")
         .in("status", ["pending", "in_progress"]).lt("due_date", tmrwStr)
         .is("parent_task_id", null).order("priority").limit(3),
     ]);
@@ -637,18 +653,26 @@ serve(async (_req: Request) => {
     const allTmrw = [
       ...overdueTmrw.map((t: any) => ({ ...t, isOverdue: true })),
       ...tmrwTasks,
-    ].slice(0, 6);
+    ].slice(0, 8);
 
     if (allTmrw.length > 0) {
+      // Calculate ONE win of the day (highest priority overdue or first scheduled)
+      const winTask = overdueTmrw.length > 0 ? overdueTmrw[0] : (tmrwTasks.length > 0 ? tmrwTasks[0] : null);
+
       allTmrw.forEach((t: any, i: number) => {
         const p = (t.priority || 3) <= 1 ? "🔴" : (t.priority || 3) === 2 ? "🟠" : (t.priority || 3) === 3 ? "🟡" : "🟢";
         const ctx = t.context ? ` ${DOMAIN_EMOJIS[t.context] || ""}` : "";
         const overdue = t.isOverdue ? " ⚠️" : "";
         const time = t.due_time ? `${t.due_time.substring(0, 5)} ` : "";
         const rInfo = (t.reschedule_count || 0) > 0 ? ` (x${t.reschedule_count})` : "";
-        msg += `${i + 1}. ${p} ${time}${esc(t.title)}${ctx}${overdue}${rInfo}\n`;
+        const dur = t.duration_minutes ? ` [${t.duration_minutes}min]` : "";
+        msg += `${i + 1}. ${p} ${time}${esc(t.title)}${dur}${ctx}${overdue}${rInfo}\n`;
       });
       msg += `\n`;
+
+      if (winTask) {
+        msg += `<b>🎯 WIN du jour:</b> ${esc(winTask.title)}\n`;
+      }
     } else {
       // Fall back to high priority pending tasks
       const urgentTasks = pendingTasks
@@ -702,17 +726,20 @@ serve(async (_req: Request) => {
 - Demain: ${TOMORROW_SCHEDULE[tomorrowDay]}`;
 
       const aiReflection = await callOpenAI(
-        `Tu es OREN, coach personnel d'Oren. Génère une réflexion de soirée en français (max 6 lignes):
-1. Score du jour : ce qui a été bien fait et ce qui manque
-2. Analyse des tendances 7 jours (progression ou régression ?)
-3. Objectifs en retard → action correctrice spécifique
-4. TOP 3 priorités CONCRÈTES pour demain (pas vagues)
-5. Message de motivation adapté au contexte (si bonne journée → félicite, si mauvaise → encourage sans culpabiliser)
+        `Tu es OREN, coach personnel d'Oren. Génère une réflexion de soirée ULTRA-CONCRÈTE en français (max 6 lignes courtes):
 
-IMPORTANT: Sois SPÉCIFIQUE. Pas de phrases génériques. Utilise les données pour être précis.
-Exemple bon: "Tu dépenses 180₪/jour en moyenne, il faut couper à 120₪ pour atteindre 20% d'épargne"
-Exemple mauvais: "Continue comme ça, tu es sur la bonne voie"
-Style: coach sportif français, direct, bienveillant. Emojis ok. Max 250 mots.`,
+1. **Score du jour** : Identifie LA cause racine précise (ex: "3/10 car aucun workout + 0 candidatures envoyées")
+2. **Tendance 7j** : Compare avec la moyenne (ex: "2.9 tâches/jour → en légère régression vs 3.5 la semaine dernière")
+3. **ROOT CAUSE des tâches non faites** : POURQUOI ces tâches n'ont pas été faites ? (ex: "Test Calendar bloqué depuis 3j car attends réponse client ?")
+4. **TOP 3 actions DEMAIN** : Sois chirurgical avec horaires précis (ex: "1. 10h → Appeler Etan. 2. 14h → Finir Test Calendar. 3. 17h → PUSH workout")
+5. **PAS DE MOTIVATION** : Remplace par UNE question de coaching (ex: "Qu'est-ce qui t'empêche de décrocher le tel avec Etan ?")
+
+RÈGLES STRICTES:
+- ZÉRO phrase générique ("tu peux le faire", "je crois en toi" → INTERDIT)
+- Utilise TOUJOURS les chiffres réels (montants ₪, kg, heures, %)
+- Si score < 5/10 → identifie LE blocage principal, pas une liste
+- Fin avec UNE question provocante pour débloquer l'action
+Style: coach ultra-direct, français, data-driven. Max 200 mots.`,
         aiContext
       );
 
@@ -741,7 +768,11 @@ Style: coach sportif français, direct, bienveillant. Emojis ok. Max 250 mots.`,
 
       // Detect weakest domain and signal it
       const domainScores: Record<string, number> = {};
-      domainScores["productivity"] = tasksDoneToday > 0 ? Math.round((tasksDoneToday / Math.max(tasksPending + tasksDoneToday, 1)) * 10) : 5;
+      // Use TODAY'S scheduled tasks only (not all 41 pending), fallback to basic task count scoring
+      const todayProductivityScore = todayTotalScheduled > 0
+        ? Math.round((tasksDoneToday / todayTotalScheduled) * 10)
+        : (tasksDoneToday >= 3 ? 8 : tasksDoneToday > 0 ? 5 : 2);
+      domainScores["productivity"] = todayProductivityScore;
       domainScores["health"] = workouts.length > 0 ? 8 : 2;
       domainScores["learning"] = totalStudyMin >= 30 ? 8 : (totalStudyMin > 0 ? 5 : 2);
       domainScores["finance"] = financeLogs.length > 0 ? 7 : 3;

@@ -2949,6 +2949,55 @@ async function handleCallbackQuery(callbackId: string, chatId: number, data: str
   } else if (data === "tasks_schedule") {
     await sendTelegramMessage(chatId, "Format: /mission titre heure [durée]\nEx: _Rdv dentiste 14:00 60_", "Markdown");
   }
+  // === CLEANUP CALLBACK ===
+  else if (data.startsWith("cleanup_archive_")) {
+    try {
+      // Archive old tasks by setting status to 'completed' with a special note
+      const twoWeeksAgo = new Date(Date.now() - 14 * 86400000).toISOString().split("T")[0];
+
+      const { data: oldTasks, error } = await supabase.from("tasks")
+        .select("id")
+        .in("status", ["pending", "in_progress"])
+        .or(`due_date.lt.${twoWeeksAgo},due_date.is.null`)
+        .order("created_at", { ascending: true })
+        .limit(50);
+
+      if (error || !oldTasks || oldTasks.length === 0) {
+        await sendTelegramMessage(chatId, "✅ Aucune tâche à archiver.");
+        return;
+      }
+
+      // Filter only truly old ones
+      const reallyOld = oldTasks.filter((t: any) => {
+        if (!t.due_date) {
+          // Check created_at via separate query is complex, so trust the initial filter
+          return true;
+        }
+        return t.due_date < twoWeeksAgo;
+      });
+
+      if (reallyOld.length === 0) {
+        await sendTelegramMessage(chatId, "✅ Aucune tâche à archiver.");
+        return;
+      }
+
+      const taskIds = reallyOld.map((t: any) => t.id);
+
+      // Archive by setting status to 'cancelled' (not completed, to not mess with stats)
+      const { error: updateError } = await supabase.from("tasks")
+        .update({ status: "cancelled", updated_at: new Date().toISOString() })
+        .in("id", taskIds);
+
+      if (updateError) {
+        await sendTelegramMessage(chatId, `❌ Erreur lors de l'archivage: ${String(updateError).substring(0, 100)}`);
+        return;
+      }
+
+      await sendTelegramMessage(chatId, `✅ *${taskIds.length} tâches archivées*\n\nElles ont été marquées comme annulées et ne pollueront plus ton score quotidien.`, "Markdown");
+    } catch (e) {
+      await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 100)}`);
+    }
+  }
   // === TASK MANAGEMENT V2 CALLBACKS ===
   // --- Inbox ---
   else if (data === "menu_inbox") {
@@ -4499,6 +4548,75 @@ async function handleFocus(chatId: number, args: string[]): Promise<void> {
   }
 }
 
+// ─── CLEANUP OLD TASKS ───────────────────────────────────────────────────
+async function handleCleanup(chatId: number): Promise<void> {
+  const supabase = getSupabaseClient();
+
+  try {
+    const today = todayStr();
+    const twoWeeksAgo = new Date(Date.now() - 14 * 86400000).toISOString().split("T")[0];
+
+    // Find old pending tasks: no due_date OR due_date < 14 days ago
+    const { data: oldTasks } = await supabase.from("tasks")
+      .select("id, title, created_at, due_date, priority")
+      .in("status", ["pending", "in_progress"])
+      .or(`due_date.lt.${twoWeeksAgo},due_date.is.null`)
+      .order("created_at", { ascending: true })
+      .limit(50);
+
+    if (!oldTasks || oldTasks.length === 0) {
+      await sendTelegramMessage(chatId, "✅ Aucune vieille tâche à nettoyer.\nToutes tes tâches sont récentes ou planifiées.");
+      return;
+    }
+
+    // Filter only truly old ones (created > 14 days ago if no due_date)
+    const reallyOld = oldTasks.filter((t: any) => {
+      if (t.due_date && t.due_date < twoWeeksAgo) return true;
+      if (!t.due_date && t.created_at < twoWeeksAgo + "T00:00:00") return true;
+      return false;
+    });
+
+    if (reallyOld.length === 0) {
+      await sendTelegramMessage(chatId, "✅ Aucune vieille tâche à nettoyer.");
+      return;
+    }
+
+    let text = `🧹 *NETTOYAGE — ${reallyOld.length} vieilles tâches*\n\n`;
+    text += `Ces tâches ont plus de 14 jours ou sont en retard depuis longtemps:\n\n`;
+
+    reallyOld.slice(0, 20).forEach((t: any, i: number) => {
+      const age = Math.floor((Date.now() - new Date(t.created_at).getTime()) / 86400000);
+      const p = (t.priority || 3) <= 1 ? "🔴" : (t.priority || 3) === 2 ? "🟠" : "🟡";
+      text += `${i + 1}. ${p} ${t.title.substring(0, 60)}\n`;
+      text += `   _Créée il y a ${age}j${t.due_date ? `, due: ${t.due_date}` : ""}_\n`;
+    });
+
+    if (reallyOld.length > 20) {
+      text += `\n_+ ${reallyOld.length - 20} autres tâches..._\n`;
+    }
+
+    text += `\n*Options:*\n`;
+    text += `• *Archiver tout* → elles disparaissent de ta liste\n`;
+    text += `• Annuler → garder comme elles sont`;
+
+    const taskIds = reallyOld.map((t: any) => t.id).join(",");
+    const buttons: InlineKeyboardMarkup = {
+      inline_keyboard: [
+        [
+          { text: "🗑️ Archiver tout", callback_data: `cleanup_archive_${taskIds.substring(0, 50)}` },
+          { text: "❌ Annuler", callback_data: "menu_main" },
+        ],
+      ],
+    };
+
+    await sendTelegramMessage(chatId, text, "Markdown", buttons);
+
+  } catch (e) {
+    console.error("Cleanup error:", e);
+    await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 100)}`);
+  }
+}
+
 async function handleGoals(chatId: number): Promise<void> {
   const supabase = getSupabaseClient();
 
@@ -5909,6 +6027,8 @@ serve(async (req: Request) => {
       await handleGoals(chatId);
     } else if (command === "/focus") {
       await handleFocus(chatId, args);
+    } else if (command === "/cleanup") {
+      await handleCleanup(chatId);
     }
     // === TASK MANAGEMENT V2 COMMANDS ===
     else if (command === "/inbox") {
