@@ -152,6 +152,7 @@ serve(async (_req: Request) => {
 
     // ─── 2. MISSED tasks (due 30-90 min ago, still pending) ───────
     // Suppressed entirely during focus mode
+    // DEDUP: only nudge once per task (mark nudge_sent to prevent double notifications)
     if (!focusActive) {
       const ago30 = timeStr(addMinutes(now, -90));
       const ago0 = timeStr(addMinutes(now, -30));
@@ -161,6 +162,7 @@ serve(async (_req: Request) => {
         .select("id, title, due_time, priority, reschedule_count, urgency_level")
         .eq("due_date", today)
         .in("status", ["pending", "in_progress"])
+        .or("reminder_sent.is.null,reminder_sent.eq.false")
         .gte("due_time", ago30)
         .lte("due_time", ago0)
         .order("due_time", { ascending: true })
@@ -188,6 +190,10 @@ serve(async (_req: Request) => {
         nudgeMsg += `\nQu'est-ce qui bloque ?`;
         await sendTG(nudgeMsg, buttons);
         reminderCount += missed.length;
+
+        // Mark missed tasks as reminded to prevent duplicate nudges
+        const missedIds = missed.map((t: any) => t.id);
+        await supabase.from("tasks").update({ reminder_sent: true }).in("id", missedIds);
       }
     }
 

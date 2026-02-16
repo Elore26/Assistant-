@@ -73,6 +73,28 @@ function getSupabaseClient() {
   );
 }
 
+// --- Night guard: block trading analysis between 22h-07h Israel time ---
+function isNightInIsrael(): boolean {
+  const now = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Jerusalem" }));
+  const hour = now.getHours();
+  return hour >= 22 || hour < 7;
+}
+
+// --- Notification dedup: prevent duplicate urgent messages within cooldown ---
+const _notifCooldown = new Map<string, number>(); // key → timestamp
+function shouldSendNotification(key: string, cooldownMinutes = 30): boolean {
+  const now = Date.now();
+  const last = _notifCooldown.get(key);
+  if (last && now - last < cooldownMinutes * 60_000) return false;
+  _notifCooldown.set(key, now);
+  // Cleanup old entries (keep map small)
+  if (_notifCooldown.size > 200) {
+    const cutoff = now - 60 * 60_000;
+    for (const [k, v] of _notifCooldown) { if (v < cutoff) _notifCooldown.delete(k); }
+  }
+  return true;
+}
+
 async function sendTelegramMessage(chatId: number, text: string, parseMode = 'Markdown', replyMarkup?: InlineKeyboardMarkup): Promise<void> {
   const token = Deno.env.get("TELEGRAM_BOT_TOKEN");
   if (!token) {
@@ -115,8 +137,9 @@ async function answerCallbackQuery(callbackId: string, text?: string): Promise<v
 // --- Inline Keyboard Helpers ---
 const MAIN_MENU: InlineKeyboardMarkup = {
   inline_keyboard: [
-    [{ text: "📋 Tasks", callback_data: "menu_tasks" }, { text: "💰 Budget", callback_data: "menu_budget" }, { text: "🏋️ Santé", callback_data: "menu_health" }, { text: "💼 Carrière", callback_data: "menu_jobs" }],
-    [{ text: "🚀 HiGrow", callback_data: "menu_leads" }, { text: "📈 Trading", callback_data: "menu_signals" }, { text: "🧠 Insights", callback_data: "menu_insights" }, { text: "🎯 Goals", callback_data: "menu_goals" }],
+    [{ text: "☀️ Briefing", callback_data: "morning_briefing" }, { text: "📋 Tasks", callback_data: "menu_tasks" }, { text: "💰 Budget", callback_data: "menu_budget" }],
+    [{ text: "🏋️ Santé", callback_data: "menu_health" }, { text: "💼 Carrière", callback_data: "menu_jobs" }, { text: "🚀 HiGrow", callback_data: "menu_leads" }],
+    [{ text: "📈 Trading", callback_data: "menu_signals" }, { text: "🧠 Insights", callback_data: "menu_insights" }, { text: "🎯 Goals", callback_data: "menu_goals" }],
     [{ text: "❓ Tuto — Guide complet", callback_data: "tuto_main" }],
   ],
 };
@@ -336,6 +359,7 @@ async function handleHelp(chatId: number): Promise<void> {
     `/focus [min] — mode silencieux\n` +
     `/focus off — reprendre notifs\n\n` +
     `AUTRES\n` +
+    `/morning — briefing du jour + coach santé\n` +
     `/today\n` +
     `/review\n` +
     `/signals\n` +
@@ -1469,6 +1493,225 @@ async function handleHealthProgram(chatId: number): Promise<void> {
   });
 }
 
+// --- MORNING BRIEFING (brief summary + health coach buttons) ---
+async function handleMorningBriefing(chatId: number): Promise<void> {
+  const supabase = getSupabaseClient();
+  try {
+    const now = getIsraelNow();
+    const today = todayStr();
+    const hour = now.getHours();
+    const day = now.getDay();
+    const dayNames = ["Dimanche", "Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi"];
+    const ws = WORKOUT_SCHEDULE_BOT[day];
+    const sched = SCHEDULE[day];
+
+    // Fetch data in parallel
+    const [tasksRes, expRes, weightRes, workoutRes, jobsRes] = await Promise.all([
+      supabase.from("tasks").select("id, title, priority, due_time")
+        .eq("due_date", today).in("status", ["pending", "in_progress"])
+        .order("priority", { ascending: true }).limit(5),
+      supabase.from("finance_logs").select("amount")
+        .eq("transaction_type", "expense")
+        .gte("transaction_date", `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-01`),
+      supabase.from("health_logs").select("value, log_date")
+        .eq("log_type", "weight").order("log_date", { ascending: false }).limit(1),
+      supabase.from("health_logs").select("workout_type, log_date")
+        .eq("log_type", "workout").order("log_date", { ascending: false }).limit(7),
+      supabase.from("job_listings").select("status")
+        .in("status", ["new", "applied", "interviewed"]),
+    ]);
+
+    const tasks = tasksRes.data || [];
+    const monthExpenses = (expRes.data || []).reduce((s: number, e: any) => s + e.amount, 0);
+    const weight = weightRes.data?.[0]?.value ?? "?";
+    const workoutDays = new Set((workoutRes.data || []).map((w: any) => w.log_date)).size;
+    const jobs = jobsRes.data || [];
+    const newJobs = jobs.filter((j: any) => j.status === "new").length;
+    const appliedJobs = jobs.filter((j: any) => j.status === "applied").length;
+
+    // Fasting status
+    const isFasting = hour >= 20 || hour < 12;
+    const fastingIcon = isFasting ? "🟢 Jeûne" : "🍽 Manger OK";
+
+    // Work schedule
+    let workInfo = "Repos";
+    if (sched && sched.depart) {
+      workInfo = `Départ ${sched.depart} · Fin ${sched.work_end}`;
+    }
+
+    // Workout info
+    const workoutName = ws.type.charAt(0).toUpperCase() + ws.type.slice(1);
+
+    // Build brief summary
+    let text = `☀️ *Bonjour Oren !*\n`;
+    text += `${dayNames[day]} · ${fastingIcon}\n\n`;
+
+    // Schedule
+    text += `📅 ${workInfo}\n`;
+
+    // Top 3 tasks
+    if (tasks.length > 0) {
+      text += `\n📋 *Priorités du jour:*\n`;
+      tasks.slice(0, 3).forEach((t: any) => {
+        const p = (t.priority || 3) <= 2 ? "●" : "○";
+        const time = t.due_time ? ` · ${t.due_time.substring(0, 5)}` : "";
+        text += `  ${p} ${t.title}${time}\n`;
+      });
+    }
+
+    // Quick stats line
+    text += `\n📊 Poids: *${weight}kg* · Sport: ${workoutDays}j/7 · Budget: ${Math.round(monthExpenses)}₪\n`;
+
+    // Career
+    if (newJobs > 0 || appliedJobs > 0) {
+      text += `💼 ${newJobs} nouvelles offres · ${appliedJobs} en cours\n`;
+    }
+
+    // Health coach teaser
+    text += `\n🏋️ Aujourd'hui: *${workoutName}* à ${ws.time}`;
+
+    await sendTelegramMessage(chatId, text, "Markdown", {
+      inline_keyboard: [
+        [{ text: "💪 Mon Sport", callback_data: "morning_sport" }, { text: "🍽 Ma Nutrition", callback_data: "morning_nutrition" }],
+        [{ text: "📋 Toutes mes tâches", callback_data: "menu_tasks" }, { text: "💼 Offres", callback_data: "menu_jobs" }],
+        [{ text: "📌 Menu complet", callback_data: "menu_main" }],
+      ],
+    });
+  } catch (e) {
+    console.error("MorningBriefing error:", e);
+    await sendTelegramMessage(chatId, `Erreur briefing: ${String(e).substring(0, 50)}`);
+  }
+}
+
+// --- MORNING SPORT COACH (detailed workout for today) ---
+async function handleMorningSport(chatId: number): Promise<void> {
+  const now = getIsraelNow();
+  const day = now.getDay();
+  const ws = WORKOUT_SCHEDULE_BOT[day];
+
+  const WARMUP = `*Échauffement (5 min):*\n  Jumping jacks 30s · Mobilité épaules · Rotations hanches\n`;
+
+  const EXERCISES: Record<string, string> = {
+    push: `${WARMUP}\n*💪 PUSH — ${ws.time}*\n\n` +
+      `1. Développé couché — 4×8-10 (90s repos)\n` +
+      `2. Développé incliné haltères — 3×10-12 (90s)\n` +
+      `3. Dips lestés — 3×8-10 (90s)\n` +
+      `4. Élévations latérales — 4×12-15 (60s)\n` +
+      `5. Développé militaire — 3×10 (90s)\n` +
+      `6. Écartés poulie — 3×12-15 (60s)\n` +
+      `7. Extensions triceps corde — 3×12-15 (60s)\n\n` +
+      `*Retour au calme:* Étirements pecs + épaules 5 min`,
+    pull: `${WARMUP}\n*💪 PULL — ${ws.time}*\n\n` +
+      `1. Tractions pronation — 4×6-8 (120s repos)\n` +
+      `2. Rowing barre — 4×8-10 (90s)\n` +
+      `3. Tirage vertical prise serrée — 3×10-12 (90s)\n` +
+      `4. Face pulls — 4×15 (60s)\n` +
+      `5. Curl barre EZ — 3×10-12 (60s)\n` +
+      `6. Curl marteau — 3×12 (60s)\n` +
+      `7. Rowing un bras haltère — 3×10 (90s)\n\n` +
+      `*Retour au calme:* Étirements dos + biceps 5 min`,
+    legs: `${WARMUP}\n*💪 LEGS — ${ws.time}*\n\n` +
+      `1. Squat barre — 4×6-8 (120s repos)\n` +
+      `2. Presse à cuisses — 4×10-12 (90s)\n` +
+      `3. Fentes marchées — 3×12/jambe (90s)\n` +
+      `4. Leg curl allongé — 4×10-12 (60s)\n` +
+      `5. Extensions mollets — 4×15-20 (60s)\n` +
+      `6. Hip thrust — 3×12 (90s)\n` +
+      `7. Leg extension — 3×12-15 (60s)\n\n` +
+      `*Retour au calme:* Étirements quadri + ischio 5 min`,
+    cardio: `${WARMUP}\n*🏃 CARDIO — ${ws.time}*\n\n` +
+      `Option A — HIIT (25 min):\n  8×(30s sprint / 60s récup)\n\n` +
+      `Option B — Zone 2 (35 min):\n  Course continue rythme conversation\n\n` +
+      `*Retour au calme:* 5 min marche + 10 min étirements`,
+    rest: `*💤 JOUR DE REPOS*\n\n` +
+      `La récupération fait le muscle.\n\n` +
+      `Suggestions:\n` +
+      `  • Marche 30 min (récup active)\n` +
+      `  • Foam rolling 15 min\n` +
+      `  • Étirements / yoga 20 min\n` +
+      `  • Hydratation: vise 3L aujourd'hui`,
+  };
+
+  const text = EXERCISES[ws.type] || `Workout: ${ws.type}`;
+  await sendTelegramMessage(chatId, text, "Markdown", {
+    inline_keyboard: [
+      [{ text: "🍽 Ma Nutrition", callback_data: "morning_nutrition" }, { text: "📋 Programme", callback_data: "health_program" }],
+      [{ text: "☀️ Retour briefing", callback_data: "morning_briefing" }, { text: "🔙 Menu", callback_data: "menu_main" }],
+    ],
+  });
+}
+
+// --- MORNING NUTRITION COACH (meals for today) ---
+async function handleMorningNutrition(chatId: number): Promise<void> {
+  const now = getIsraelNow();
+  const day = now.getDay();
+  const ws = WORKOUT_SCHEDULE_BOT[day];
+  const isTraining = ws.type !== "rest";
+  const hour = now.getHours();
+
+  // Fasting status
+  const isFasting = hour >= 20 || hour < 12;
+  const fastingRemaining = isFasting
+    ? (hour >= 20 ? `${12 + 24 - hour}h` : `${12 - hour}h`)
+    : "";
+
+  let text = "";
+
+  if (isTraining) {
+    const postWorkoutTime = ws.type === "cardio" ? "08:30" : "19:00";
+    text = `*🍽 NUTRITION — Jour ${ws.type.toUpperCase()}*\n\n`;
+    text += isFasting
+      ? `🟢 Jeûne en cours (encore ~${fastingRemaining})\n\n`
+      : `🍽 Fenêtre alimentaire ouverte (12h-20h)\n\n`;
+
+    text += `*12:00 — Déjeuner (casser le jeûne)*\n`;
+    text += `  Poulet grillé 200g + riz basmati 150g + légumes\n`;
+    text += `  ~550 cal · 45g protéines\n\n`;
+
+    text += `*15:30 — Collation pré-workout*\n`;
+    text += `  Banane + 20g whey + flocons avoine\n`;
+    text += `  ~350 cal · 25g protéines\n\n`;
+
+    text += `*${postWorkoutTime} — Post-workout*\n`;
+    text += `  Shake whey 30g + fruits rouges\n`;
+    text += `  ~200 cal · 30g protéines\n\n`;
+
+    text += `*19:30 — Dîner (dernier repas)*\n`;
+    text += `  Saumon 180g + patate douce + salade\n`;
+    text += `  ~600 cal · 40g protéines\n\n`;
+
+    text += `*Total: ~1700 cal · 140g+ protéines*\n`;
+    text += `Hydratation: 2.5L minimum`;
+  } else {
+    text = `*🍽 NUTRITION — Jour REPOS*\n\n`;
+    text += isFasting
+      ? `🟢 Jeûne en cours (encore ~${fastingRemaining})\n\n`
+      : `🍽 Fenêtre alimentaire ouverte (12h-20h)\n\n`;
+
+    text += `*12:00 — Déjeuner léger*\n`;
+    text += `  Salade composée + thon + avocat\n`;
+    text += `  ~450 cal · 35g protéines\n\n`;
+
+    text += `*16:00 — Collation*\n`;
+    text += `  Yaourt grec + noix + miel\n`;
+    text += `  ~250 cal · 20g protéines\n\n`;
+
+    text += `*19:00 — Dîner*\n`;
+    text += `  Omelette 3 oeufs + légumes sautés + pain complet\n`;
+    text += `  ~500 cal · 35g protéines\n\n`;
+
+    text += `*Total: ~1200 cal · 90g+ protéines*\n`;
+    text += `Hydratation: 2.5L minimum`;
+  }
+
+  await sendTelegramMessage(chatId, text, "Markdown", {
+    inline_keyboard: [
+      [{ text: "💪 Mon Sport", callback_data: "morning_sport" }, { text: "📋 Programme", callback_data: "health_program" }],
+      [{ text: "☀️ Retour briefing", callback_data: "morning_briefing" }, { text: "🔙 Menu", callback_data: "menu_main" }],
+    ],
+  });
+}
+
 // --- CAREER MAIN (with sub-menu) ---
 async function handleCareerMain(chatId: number): Promise<void> {
   const supabase = getSupabaseClient();
@@ -1676,6 +1919,14 @@ async function handleCallbackQuery(callbackId: string, chatId: number, data: str
     await sendTelegramMessage(chatId, "Dis-moi ta dépense.\nEx: _45 shekel café_\nPour du cash: _cash 30 restaurant_", "Markdown");
   } else if (data === "budget_add_income") {
     await sendTelegramMessage(chatId, "Dis-moi ton revenu.\nEx: _revenu 8000 salaire_", "Markdown");
+  }
+  // === MORNING BRIEFING ===
+  else if (data === "morning_briefing") {
+    await handleMorningBriefing(chatId);
+  } else if (data === "morning_sport") {
+    await handleMorningSport(chatId);
+  } else if (data === "morning_nutrition") {
+    await handleMorningNutrition(chatId);
   }
   // === HEALTH SUB-MENU ===
   else if (data === "health_meals") {
@@ -2119,11 +2370,17 @@ async function handleTradingMain(chatId: number): Promise<void> {
     const hour = now.getHours();
     const day = now.getDay();
     const dayNames = ["Dim", "Lun", "Mar", "Mer", "Jeu", "Ven", "Sam"];
+    const isNight = hour >= 22 || hour < 7;
 
     let text = `📈 *TRADING*\n\n`;
-    text += `${dayNames[day]} ${hour}h · `;
-    text += day >= 1 && day <= 3 ? "Signaux actifs" : day >= 4 && day <= 5 ? "Observation" : "Off\n";
-    text += `\n`;
+    if (isNight) {
+      text += `🌙 Mode nuit (${hour}h) — pas d'analyse\n`;
+      text += `Reprise à 07:00\n\n`;
+    } else {
+      text += `${dayNames[day]} ${hour}h · `;
+      text += day >= 1 && day <= 3 ? "Signaux actifs" : day >= 4 && day <= 5 ? "Observation" : "Off\n";
+      text += `\n`;
+    }
 
     if (data && data.length > 0) {
       text += `*Dernière analyse:*\n`;
@@ -2139,13 +2396,19 @@ async function handleTradingMain(chatId: number): Promise<void> {
       text += `Aucune analyse récente (24h)\n`;
     }
 
-    await sendTelegramMessage(chatId, text, "Markdown", {
-      inline_keyboard: [
-        [{ text: "📊 Dernière analyse", callback_data: "trading_last" }, { text: "🔄 Analyse fraîche", callback_data: "trading_fresh" }],
-        [{ text: "📋 Plans semaine", callback_data: "trading_plans" }, { text: "📈 Stats 7j", callback_data: "trading_stats" }],
-        [{ text: "⚙️ Gérer pairs", callback_data: "trading_pairs" }, { text: "🔙 Menu", callback_data: "menu_main" }],
-      ],
-    });
+    // At night: show read-only menu (no fresh analysis button)
+    const tradingButtons = isNight
+      ? [
+          [{ text: "📊 Dernière analyse", callback_data: "trading_last" }, { text: "📋 Plans semaine", callback_data: "trading_plans" }],
+          [{ text: "📈 Stats 7j", callback_data: "trading_stats" }, { text: "🔙 Menu", callback_data: "menu_main" }],
+        ]
+      : [
+          [{ text: "📊 Dernière analyse", callback_data: "trading_last" }, { text: "🔄 Analyse fraîche", callback_data: "trading_fresh" }],
+          [{ text: "📋 Plans semaine", callback_data: "trading_plans" }, { text: "📈 Stats 7j", callback_data: "trading_stats" }],
+          [{ text: "⚙️ Gérer pairs", callback_data: "trading_pairs" }, { text: "🔙 Menu", callback_data: "menu_main" }],
+        ];
+
+    await sendTelegramMessage(chatId, text, "Markdown", { inline_keyboard: tradingButtons });
   } catch (e) {
     console.error("TradingMain error:", e);
     await sendTelegramMessage(chatId, `Erreur trading: ${String(e).substring(0, 50)}`);
@@ -2213,6 +2476,14 @@ async function handleTradingLast(chatId: number): Promise<void> {
 
 // --- Trading: Trigger Fresh Analysis ---
 async function handleTradingFresh(chatId: number): Promise<void> {
+  // Block analysis at night (22h-07h Israel)
+  if (isNightInIsrael()) {
+    await sendTelegramMessage(chatId, "🌙 *Pas d'analyse la nuit* (22h-07h)\nLes marchés dorment, toi aussi.\nReviens demain matin!", "Markdown", {
+      inline_keyboard: [[{ text: "🔙 Trading", callback_data: "menu_signals" }]],
+    });
+    return;
+  }
+
   await sendTelegramMessage(chatId, "🔄 Analyse en cours... (30-60 sec)");
   try {
     const sbUrl = Deno.env.get("SUPABASE_URL") || "";
@@ -3695,18 +3966,7 @@ async function handleNaturalLanguage(chatId: number, text: string): Promise<void
         break;
 
       case "show_brief": {
-        const sbUrl = Deno.env.get("SUPABASE_URL") || "";
-        const sbKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
-        try {
-          await fetch(`${sbUrl}/functions/v1/morning-briefing`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json", "Authorization": `Bearer ${sbKey}` },
-            body: JSON.stringify({}),
-          });
-        } catch (e) {
-          console.error("Brief trigger error:", e);
-        }
-        await sendTelegramMessage(chatId, reply || "📋 Briefing en cours d'envoi...");
+        await handleMorningBriefing(chatId);
         break;
       }
 
@@ -4201,6 +4461,8 @@ serve(async (req: Request) => {
       await handleJobs(chatId);
     } else if (command === "/signals") {
       await handleTradingMain(chatId);
+    } else if (command === "/morning" || command === "/bonjour") {
+      await handleMorningBriefing(chatId);
     } else if (command === "/dashboard") {
       const sbUrl = Deno.env.get("SUPABASE_URL") || "";
       await sendTelegramMessage(chatId, `📊 *Dashboard OREN*\n\n${sbUrl}/functions/v1/dashboard`, "Markdown");
