@@ -152,6 +152,7 @@ serve(async (_req: Request) => {
 
     // ─── 2. MISSED tasks (due 30-90 min ago, still pending) ───────
     // Suppressed entirely during focus mode
+    // DEDUP: only nudge once per task (mark nudge_sent to prevent double notifications)
     if (!focusActive) {
       const ago30 = timeStr(addMinutes(now, -90));
       const ago0 = timeStr(addMinutes(now, -30));
@@ -161,6 +162,7 @@ serve(async (_req: Request) => {
         .select("id, title, due_time, priority, reschedule_count, urgency_level")
         .eq("due_date", today)
         .in("status", ["pending", "in_progress"])
+        .or("reminder_sent.is.null,reminder_sent.eq.false")
         .gte("due_time", ago30)
         .lte("due_time", ago0)
         .order("due_time", { ascending: true })
@@ -188,6 +190,10 @@ serve(async (_req: Request) => {
         nudgeMsg += `\nQu'est-ce qui bloque ?`;
         await sendTG(nudgeMsg, buttons);
         reminderCount += missed.length;
+
+        // Mark missed tasks as reminded to prevent duplicate nudges
+        const missedIds = missed.map((t: any) => t.id);
+        await supabase.from("tasks").update({ reminder_sent: true }).in("id", missedIds);
       }
     }
 
@@ -210,6 +216,7 @@ serve(async (_req: Request) => {
         .select("id, title, priority")
         .eq("due_date", today)
         .in("status", ["pending", "in_progress"])
+        .is("parent_task_id", null)
         .order("priority", { ascending: true })
         .limit(1);
 
@@ -226,12 +233,128 @@ serve(async (_req: Request) => {
           await sendTG(idleMsg, [
             [
               { text: "✅ J'y suis", callback_data: `tstart_${nextTask.id}` },
+              { text: "🍅 Pomodoro", callback_data: `pomo_start_${nextTask.id}` },
+            ],
+            [
               { text: "⏰ +1h", callback_data: `tsnz1h_${nextTask.id}` },
+              { text: "🔄 Reporter", callback_data: `reschedule_${nextTask.id}` },
             ],
           ]);
           reminderCount++;
         }
       }
+    }
+
+    // ─── 4. RECURRING TASKS SPAWNER ──────────────────────────────
+    // Check recurring tasks for tomorrow that don't have occurrences yet
+    if (hour === 21 && now.getMinutes() < 15) {
+      try {
+        const tomorrow = new Date(now);
+        tomorrow.setDate(tomorrow.getDate() + 1);
+        const tmrwStr = `${tomorrow.getFullYear()}-${String(tomorrow.getMonth() + 1).padStart(2, "0")}-${String(tomorrow.getDate()).padStart(2, "0")}`;
+        const tmrwDow = tomorrow.getDay();
+
+        // Get all recurring task templates
+        const { data: recurring } = await supabase.from("tasks")
+          .select("id, title, recurrence_rule, recurrence_source_id, due_time, duration_minutes, priority, context")
+          .not("recurrence_rule", "is", null)
+          .in("status", ["pending", "in_progress", "completed"]);
+
+        // Filter to templates (source = self or null)
+        const templates = (recurring || []).filter((t: any) =>
+          !t.recurrence_source_id || t.recurrence_source_id === t.id
+        );
+
+        for (const tmpl of templates) {
+          const rule = tmpl.recurrence_rule;
+          let shouldSpawn = false;
+
+          if (rule === "daily") shouldSpawn = true;
+          else if (rule === "weekdays") shouldSpawn = tmrwDow >= 1 && tmrwDow <= 5;
+          else if (rule.startsWith("weekly:")) shouldSpawn = tmrwDow === parseInt(rule.split(":")[1], 10);
+          else if (rule === "monthly") shouldSpawn = tomorrow.getDate() === new Date(tmpl.created_at || now).getDate();
+
+          if (!shouldSpawn) continue;
+
+          // Check if already exists
+          const { data: existing } = await supabase.from("tasks")
+            .select("id").eq("recurrence_source_id", tmpl.id)
+            .eq("due_date", tmrwStr).in("status", ["pending", "in_progress"]).limit(1);
+          if (existing && existing.length > 0) continue;
+
+          await supabase.from("tasks").insert({
+            title: tmpl.title,
+            status: "pending",
+            priority: tmpl.priority || 3,
+            due_date: tmrwStr,
+            due_time: tmpl.due_time || null,
+            duration_minutes: tmpl.duration_minutes || null,
+            context: tmpl.context || null,
+            recurrence_rule: tmpl.recurrence_rule,
+            recurrence_source_id: tmpl.id,
+            created_at: new Date().toISOString(),
+          });
+          reminderCount++;
+        }
+      } catch (recErr) { console.error("[Recurring] Spawn error:", recErr); }
+    }
+
+    // ─── 5. POMODORO CHECK — notify if active session expired ────
+    try {
+      const { data: activePomo } = await supabase.from("pomodoro_sessions")
+        .select("id, task_id, started_at, duration_minutes")
+        .is("ended_at", null).eq("completed", false)
+        .order("started_at", { ascending: false }).limit(1);
+
+      if (activePomo && activePomo.length > 0) {
+        const session = activePomo[0];
+        const startTime = new Date(session.started_at);
+        const elapsed = Math.floor((now.getTime() - startTime.getTime()) / 60000);
+        const dur = session.duration_minutes || 25;
+
+        if (elapsed >= dur && elapsed < dur + 15) { // Only notify within 15min after end
+          let taskName = "Session";
+          if (session.task_id) {
+            const { data: t } = await supabase.from("tasks").select("title").eq("id", session.task_id).single();
+            if (t) taskName = t.title;
+          }
+
+          await supabase.from("pomodoro_sessions").update({
+            ended_at: new Date().toISOString(), completed: true,
+          }).eq("id", session.id);
+
+          if (session.task_id) {
+            const { data: taskData } = await supabase.from("tasks").select("pomodoro_count").eq("id", session.task_id).single();
+            if (taskData) {
+              await supabase.from("tasks").update({ pomodoro_count: (taskData.pomodoro_count || 0) + 1 }).eq("id", session.task_id);
+            }
+          }
+
+          await sendTG(`🍅 <b>POMODORO TERMINÉ !</b>\n\n${esc(taskName)}\n☕ Pause 5 min.`, [
+            [
+              { text: "🍅 Encore un !", callback_data: session.task_id ? `pomo_start_${session.task_id}` : "pomo_start_free" },
+              { text: "✅ Tâche finie", callback_data: session.task_id ? `tdone_${session.task_id}` : "menu_tasks" },
+            ],
+          ]);
+          reminderCount++;
+        }
+      }
+    } catch (pomErr) { console.error("[Pomodoro] Check error:", pomErr); }
+
+    // ─── 6. INBOX REMINDER — Remind to triage inbox in the morning ─
+    if (hour === 9 && now.getMinutes() < 15 && dow !== 6) {
+      try {
+        const { count: inboxCount } = await supabase.from("tasks")
+          .select("id", { count: "exact", head: true })
+          .eq("is_inbox", true).in("status", ["pending", "in_progress"]);
+
+        if (inboxCount && inboxCount > 0) {
+          await sendTG(`📥 <b>${inboxCount} tâche(s) dans l'inbox</b>\nPrends 2 min pour trier.`, [
+            [{ text: "📥 Trier l'inbox", callback_data: "menu_inbox" }],
+          ]);
+          reminderCount++;
+        }
+      } catch (ibxErr) { console.error("[Inbox] Reminder error:", ibxErr); }
     }
 
     return new Response(

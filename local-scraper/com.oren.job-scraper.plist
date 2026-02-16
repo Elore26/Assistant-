@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Job Scraper — runs 2x/day: 7h30 and 18h00 (Israel time) -->
+    <key>Label</key>
+    <string>com.oren.job-scraper</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <!-- UPDATE this path to match your Node.js location -->
+        <string>/usr/local/bin/node</string>
+        <string>src/index.mjs</string>
+    </array>
+
+    <!-- UPDATE this to your local-scraper directory -->
+    <key>WorkingDirectory</key>
+    <string>/Users/oren/Assistant-/local-scraper</string>
+
+    <!-- Schedule: 7h30 and 18h00 local time -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Hour</key>
+            <integer>7</integer>
+            <key>Minute</key>
+            <integer>30</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>18</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+    </array>
+
+    <!-- Logs -->
+    <key>StandardOutPath</key>
+    <string>/tmp/oren-scraper-stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/oren-scraper-stderr.log</string>
+
+    <!-- Environment variables loaded from .env by dotenv, but PATH needs to be set -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+    </dict>
+
+    <!-- Don't restart on failure (wait for next scheduled time) -->
+    <key>KeepAlive</key>
+    <false/>
+
+    <!-- Run even if logged out -->
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

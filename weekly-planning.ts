@@ -310,6 +310,52 @@ serve(async (_req: Request) => {
       }
     }
 
+    // ─── SPRINT GOALS RECAP ────────────────────────────────────
+    try {
+      const { data: sprintGoals } = await supabase.from("sprint_goals")
+        .select("*").eq("week_start", weekStart).eq("status", "active");
+
+      if (sprintGoals && sprintGoals.length > 0) {
+        planMsg += `\n<b>🎯 SPRINT DE LA SEMAINE:</b>\n`;
+        let completedSprints = 0;
+
+        for (const sg of sprintGoals) {
+          const pct = sg.target_value > 0 ? Math.round((sg.current_value / sg.target_value) * 100) : 0;
+          const status = pct >= 100 ? "✅" : pct >= 60 ? "🟡" : "🔴";
+          planMsg += `${status} ${sg.title}: ${sg.current_value}/${sg.target_value} ${sg.metric_unit} (${pct}%)\n`;
+          if (pct >= 100) completedSprints++;
+
+          // Mark completed sprints
+          if (pct >= 100) {
+            await supabase.from("sprint_goals").update({ status: "completed", updated_at: new Date().toISOString() }).eq("id", sg.id);
+          } else {
+            await supabase.from("sprint_goals").update({ status: "failed", updated_at: new Date().toISOString() }).eq("id", sg.id);
+          }
+        }
+
+        planMsg += `\n${completedSprints}/${sprintGoals.length} sprints atteints\n`;
+      }
+    } catch (spErr) { console.error("[Sprint] Recap error:", spErr); }
+
+    // ─── VELOCITY WEEK SUMMARY ──────────────────────────────────
+    try {
+      const { data: weekMetrics } = await supabase.from("task_metrics")
+        .select("*").gte("metric_date", weekStart).lte("metric_date", weekEnd)
+        .order("metric_date");
+
+      if (weekMetrics && weekMetrics.length > 0) {
+        const totalPomo = weekMetrics.reduce((s: number, m: any) => s + (m.total_pomodoros || 0), 0);
+        const totalDeepWork = weekMetrics.reduce((s: number, m: any) => s + (m.deep_work_minutes || 0), 0);
+        const avgCompletion = weekMetrics.reduce((s: number, m: any) => s + (m.completion_rate || 0), 0) / weekMetrics.length;
+
+        if (totalPomo > 0 || totalDeepWork > 0) {
+          planMsg += `\n<b>📊 VÉLOCITÉ:</b>\n`;
+          planMsg += `🍅 ${totalPomo} pomodoros · ${Math.round(totalDeepWork / 60)}h deep work\n`;
+          planMsg += `Taux moyen: ${Math.round(avgCompletion)}%\n`;
+        }
+      }
+    } catch (velErr) { console.error("[Velocity] Week summary error:", velErr); }
+
     await sendTG(planMsg);
 
     // ─── AI COACH: WEEKLY INSIGHTS ───────────────────────────────
@@ -372,6 +418,10 @@ serve(async (_req: Request) => {
         [
           { text: "📋 Voir mes tâches", callback_data: "menu_tasks" },
           { text: "🎯 Objectifs", callback_data: "menu_goals" },
+        ],
+        [
+          { text: "🎯 Créer sprint", callback_data: "sprint_create" },
+          { text: "📊 Vélocité", callback_data: "menu_velocity" },
         ],
       ]
     );
