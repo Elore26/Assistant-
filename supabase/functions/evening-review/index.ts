@@ -62,11 +62,13 @@ async function callOpenAI(systemPrompt: string, userContent: string, maxTokens =
 }
 
 // --- Telegram ---
-async function sendTelegram(text: string): Promise<boolean> {
+async function sendTelegram(text: string, buttons?: any[][]): Promise<boolean> {
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+  const payload: any = { chat_id: TELEGRAM_CHAT_ID, text, parse_mode: "HTML", disable_web_page_preview: true };
+  if (buttons && buttons.length > 0) payload.reply_markup = { inline_keyboard: buttons };
   let r = await fetch(url, {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text, parse_mode: "HTML", disable_web_page_preview: true }),
+    body: JSON.stringify(payload),
   });
   if (r.ok) return true;
   // Fallback plain text
@@ -575,23 +577,103 @@ serve(async (_req: Request) => {
     }
 
     // ============================================
-    // TOMORROW
+    // VELOCITY METRICS
+    // ============================================
+    // Save daily velocity metrics
+    try {
+      const todayCreated = await supabase.from("tasks").select("id", { count: "exact", head: true })
+        .gte("created_at", todayStr + "T00:00:00").lte("created_at", todayStr + "T23:59:59");
+      const todayRescheduled = await supabase.from("tasks").select("id", { count: "exact", head: true })
+        .gt("reschedule_count", 0).gte("updated_at", todayStr + "T00:00:00");
+      const todayPomodoros = await supabase.from("pomodoro_sessions").select("id, duration_minutes")
+        .eq("completed", true).gte("started_at", todayStr + "T00:00:00");
+
+      const pomCount = todayPomodoros.data?.length || 0;
+      const deepWork = (todayPomodoros.data || []).reduce((s: number, p: any) => s + (p.duration_minutes || 25), 0);
+
+      // Find most rescheduled task
+      const { data: mostRescheduled } = await supabase.from("tasks")
+        .select("title, reschedule_count").gt("reschedule_count", 0)
+        .in("status", ["pending", "in_progress"])
+        .order("reschedule_count", { ascending: false }).limit(1);
+
+      await supabase.from("task_metrics").upsert({
+        metric_date: todayStr,
+        tasks_completed: tasksDoneToday,
+        tasks_created: todayCreated.count || 0,
+        tasks_rescheduled: todayRescheduled.count || 0,
+        total_pomodoros: pomCount,
+        deep_work_minutes: deepWork,
+        completion_rate: completionRate,
+        most_rescheduled_task: mostRescheduled?.[0]?.title || null,
+      }, { onConflict: "metric_date" });
+    } catch (metErr) { console.error("[Metrics] Save error:", metErr); }
+
+    // ============================================
+    // TOMORROW PLAN
     // ============================================
     const tomorrowDay = (day + 1) % 7;
     msg += `${LINE}\n`;
-    msg += `<b>Demain</b> — ${TOMORROW_SCHEDULE[tomorrowDay] || "?"}\n`;
+    msg += `<b>🌙 PLAN DEMAIN</b> — ${TOMORROW_SCHEDULE[tomorrowDay] || "?"}\n\n`;
 
-    // High priority pending tasks for tomorrow
-    const urgentTasks = pendingTasks
-      .filter((t: any) => t.priority <= 2 || (t.due_date && t.due_date <= daysAgo(-1)))
-      .slice(0, 3);
-    if (urgentTasks.length > 0) {
-      msg += `\n<b>⚡ Priorités demain:</b>\n`;
-      urgentTasks.forEach((t: any) => {
-        const domainEmoji = DOMAIN_EMOJIS[t.agent_type] || "📌";
-        msg += `  ${domainEmoji} ${esc(t.title)}\n`;
+    // Get tomorrow's date
+    const tomorrowDate = new Date(now);
+    tomorrowDate.setDate(tomorrowDate.getDate() + 1);
+    const tmrwStr = `${tomorrowDate.getFullYear()}-${String(tomorrowDate.getMonth() + 1).padStart(2, "0")}-${String(tomorrowDate.getDate()).padStart(2, "0")}`;
+
+    // Get tasks for tomorrow + overdue + high priority unscheduled
+    const [tmrwTasksRes, overdueTmrwRes] = await Promise.all([
+      supabase.from("tasks").select("id, title, priority, due_time, context, reschedule_count")
+        .eq("due_date", tmrwStr).in("status", ["pending", "in_progress"])
+        .is("parent_task_id", null).order("priority"),
+      supabase.from("tasks").select("id, title, priority, due_date, reschedule_count, urgency_level")
+        .in("status", ["pending", "in_progress"]).lt("due_date", tmrwStr)
+        .is("parent_task_id", null).order("priority").limit(3),
+    ]);
+
+    const tmrwTasks = tmrwTasksRes.data || [];
+    const overdueTmrw = overdueTmrwRes.data || [];
+
+    const allTmrw = [
+      ...overdueTmrw.map((t: any) => ({ ...t, isOverdue: true })),
+      ...tmrwTasks,
+    ].slice(0, 6);
+
+    if (allTmrw.length > 0) {
+      allTmrw.forEach((t: any, i: number) => {
+        const p = (t.priority || 3) <= 1 ? "🔴" : (t.priority || 3) === 2 ? "🟠" : (t.priority || 3) === 3 ? "🟡" : "🟢";
+        const ctx = t.context ? ` ${DOMAIN_EMOJIS[t.context] || ""}` : "";
+        const overdue = t.isOverdue ? " ⚠️" : "";
+        const time = t.due_time ? `${t.due_time.substring(0, 5)} ` : "";
+        const rInfo = (t.reschedule_count || 0) > 0 ? ` (x${t.reschedule_count})` : "";
+        msg += `${i + 1}. ${p} ${time}${esc(t.title)}${ctx}${overdue}${rInfo}\n`;
       });
+      msg += `\n`;
+    } else {
+      // Fall back to high priority pending tasks
+      const urgentTasks = pendingTasks
+        .filter((t: any) => t.priority <= 2 || (t.due_date && t.due_date <= daysAgo(-1)))
+        .slice(0, 3);
+      if (urgentTasks.length > 0) {
+        msg += `<b>⚡ Priorités:</b>\n`;
+        urgentTasks.forEach((t: any) => {
+          const domainEmoji = DOMAIN_EMOJIS[t.agent_type] || "📌";
+          msg += `  ${domainEmoji} ${esc(t.title)}\n`;
+        });
+      } else {
+        msg += `Aucune tâche planifiée.\n`;
+      }
     }
+
+    // Store tomorrow plan for morning briefing
+    try {
+      const taskIds = allTmrw.map((t: any) => t.id);
+      await supabase.from("tomorrow_plans").upsert({
+        plan_date: tmrwStr,
+        task_ids: taskIds,
+        validated: false,
+      }, { onConflict: "plan_date" });
+    } catch (_) {}
 
     // ============================================
     // AI EVENING COACH — With full context
@@ -689,7 +771,16 @@ Style: coach sportif français, direct, bienveillant. Emojis ok. Max 250 mots.`,
     // ============================================
     // SEND + SAVE
     // ============================================
-    const sent = await sendTelegram(msg);
+    const sent = await sendTelegram(msg, [
+      [
+        { text: "✅ Valider plan demain", callback_data: `plan_validate_${tmrwStr}` },
+        { text: "✏️ Modifier", callback_data: "menu_tasks" },
+      ],
+      [
+        { text: "📊 Vélocité", callback_data: "menu_velocity" },
+        { text: "🎯 Sprint", callback_data: "menu_sprint" },
+      ],
+    ]);
 
     try {
       await supabase.from("briefings").insert({
