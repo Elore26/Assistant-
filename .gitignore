@@ -1,0 +1,23 @@
+# Secrets — NEVER commit
+.env
+*.env.local
+.env.production
+
+# Dependencies
+node_modules/
+package-lock.json
+
+# Logs
+logs/
+*.log
+/tmp/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Playwright browsers
+**/browsers/
+
+# Build
+dist/
