@@ -210,37 +210,66 @@ serve(async (_req: Request) => {
         .gte("updated_at", twoHoursAgo)
         .limit(1);
 
-      // Check if there are pending tasks today
+      // Check if there are pending tasks today that are ACTIONABLE now
+      // Exclude tasks with a due_time more than 1h in the future (e.g. RDV at 19:00 shouldn't nudge at 10:00)
+      const in1h = timeStr(addMinutes(now, 60));
       const { data: pendingToday } = await supabase
         .from("tasks")
-        .select("id, title, priority")
+        .select("id, title, priority, due_time")
         .eq("due_date", today)
         .in("status", ["pending", "in_progress"])
         .is("parent_task_id", null)
         .order("priority", { ascending: true })
-        .limit(1);
+        .limit(10);
 
-      if ((!recentDone || recentDone.length === 0) && pendingToday && pendingToday.length > 0) {
+      // Filter: keep tasks with no due_time OR due_time within the next hour
+      const actionable = (pendingToday || []).filter((t: any) => {
+        if (!t.due_time) return true; // No specific time = actionable anytime
+        const taskTime = t.due_time.substring(0, 5);
+        return taskTime <= in1h; // Due now or within next hour
+      });
+
+      if ((!recentDone || recentDone.length === 0) && actionable.length > 0) {
         // Only send idle nudge once per 2h block (check minutes)
         const min = now.getMinutes();
         if (min >= 0 && min < 15) {
-          const nextTask = pendingToday[0];
-          let idleMsg = `<b>💪 NUDGE</b>\n`;
-          idleMsg += `Rien complété depuis 2h. Ta prochaine tâche :\n\n`;
-          idleMsg += `→ <b>${esc(nextTask.title)}</b>\n\n`;
-          idleMsg += `Commence par 5 minutes. C'est tout.`;
+          // DEDUP: check if we already sent an idle nudge in the last 2 hours
+          const twoHoursAgoISO = new Date(now.getTime() - 2 * 60 * 60 * 1000).toISOString();
+          const { data: recentNudge } = await supabase
+            .from("agent_executions")
+            .select("id")
+            .eq("agent_name", "task-reminder-idle")
+            .gte("executed_at", twoHoursAgoISO)
+            .limit(1);
 
-          await sendTG(idleMsg, [
-            [
-              { text: "✅ J'y suis", callback_data: `tstart_${nextTask.id}` },
-              { text: "🍅 Pomodoro", callback_data: `pomo_start_${nextTask.id}` },
-            ],
-            [
-              { text: "⏰ +1h", callback_data: `tsnz1h_${nextTask.id}` },
-              { text: "🔄 Reporter", callback_data: `reschedule_${nextTask.id}` },
-            ],
-          ]);
-          reminderCount++;
+          if (!recentNudge || recentNudge.length === 0) {
+            const nextTask = actionable[0];
+            let idleMsg = `<b>💪 NUDGE</b>\n`;
+            idleMsg += `Rien complété depuis 2h. Ta prochaine tâche :\n\n`;
+            idleMsg += `→ <b>${esc(nextTask.title)}</b>\n\n`;
+            idleMsg += `Commence par 5 minutes. C'est tout.`;
+
+            await sendTG(idleMsg, [
+              [
+                { text: "✅ J'y suis", callback_data: `tstart_${nextTask.id}` },
+                { text: "🍅 Pomodoro", callback_data: `pomo_start_${nextTask.id}` },
+              ],
+              [
+                { text: "⏰ +1h", callback_data: `tsnz1h_${nextTask.id}` },
+                { text: "🔄 Reporter", callback_data: `reschedule_${nextTask.id}` },
+              ],
+            ]);
+            reminderCount++;
+
+            // Log execution for dedup
+            try {
+              await supabase.from("agent_executions").insert({
+                agent_name: "task-reminder-idle",
+                executed_at: new Date().toISOString(),
+                result_summary: `Nudged: ${nextTask.title}`,
+              });
+            } catch (_) { /* dedup log non-critical */ }
+          }
         }
       }
     }
