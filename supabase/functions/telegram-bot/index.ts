@@ -5770,21 +5770,38 @@ async function analyzePhoto(chatId: number, fileId: string, caption?: string): P
   // Get DB context
   const context = await getAIContext();
 
-  const visionPrompt = `Tu es OREN, assistant personnel. Analyse cette image et réponds en JSON:
+  const visionPrompt = `Tu es OREN, assistant personnel. Analyse cette image avec précision et réponds en JSON.
+
+FORMAT DE RÉPONSE:
 {
-  "type": "receipt|document|screenshot|other",
-  "intent": "add_expense|add_task|add_job|chat",
+  "type": "receipt|bank_statement|document|screenshot|other",
+  "intent": "add_expenses|add_expense|add_task|add_job|chat",
+  "items": [
+    { "amount": number, "category": "string", "description": "string", "payment_method": "card|cash" }
+  ],
   "params": { ... },
   "reply": "description courte en français"
 }
 
-Si c'est un ticket/reçu: extrais montant, catégorie (restaurant|transport|shopping|health|entertainment|utilities|other), description.
-Si c'est une offre d'emploi: extrais titre, entreprise, URL si visible.
-Si c'est autre chose: décris simplement ce que tu vois.
-${caption ? `\nLégende de l'utilisateur: "${caption}"` : ""}
+INSTRUCTIONS:
+- Si c'est un relevé bancaire, ticket, liste de dépenses ou capture d'écran de transactions:
+  → intent = "add_expenses"
+  → Extrais CHAQUE dépense/transaction individuellement dans "items"
+  → Lis ATTENTIVEMENT chaque montant, ne les invente pas
+  → Catégories: restaurant, transport, shopping, health, entertainment, utilities, groceries, subscriptions, autre
+  → Inclus la description/marchand de chaque ligne
+  → Ne fusionne PAS les lignes entre elles, garde chaque transaction séparée
+
+- Si c'est un seul ticket/reçu simple avec un seul montant:
+  → intent = "add_expense"
+  → Mets les infos dans "params": { "amount", "category", "description", "payment_method" }
+
+- Si c'est une offre d'emploi: intent = "add_job", params: { title, company, url }
+- Si c'est autre chose: intent = "chat", reply = description
+${caption ? `\nMessage de l'utilisateur: "${caption}"` : ""}
 
 CONTEXTE: ${context}
-Réponds UNIQUEMENT en JSON.`;
+Réponds UNIQUEMENT en JSON valide. Sois PRÉCIS sur les montants.`;
 
   try {
     const response = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -5794,15 +5811,15 @@ Réponds UNIQUEMENT en JSON.`;
         "Authorization": `Bearer ${openaiKey}`,
       },
       body: JSON.stringify({
-        model: "gpt-4o-mini",
+        model: "gpt-4o",
         temperature: 0,
-        max_tokens: 1024,
+        max_tokens: 2048,
         messages: [
           {
             role: "user",
             content: [
               { type: "text", text: visionPrompt },
-              { type: "image_url", image_url: { url: dataUrl, detail: "low" } },
+              { type: "image_url", image_url: { url: dataUrl, detail: "high" } },
             ],
           },
         ],
@@ -5829,6 +5846,34 @@ Réponds UNIQUEMENT en JSON.`;
 
     // Route based on detected intent
     switch (result.intent) {
+      case "add_expenses": {
+        // Multiple expenses from bank statement / receipt list
+        const items = result.items || [];
+        if (items.length === 0) {
+          await sendTelegramMessage(chatId, result.reply || "Aucune dépense détectée sur l'image.");
+          break;
+        }
+        const supabase = getSupabaseClient();
+        const rows = items.map((item: { amount: number; category?: string; description?: string; payment_method?: string }) => ({
+          transaction_type: "expense",
+          amount: item.amount,
+          category: item.category || "autre",
+          description: item.description || "Depuis photo",
+          payment_method: item.payment_method || "card",
+          transaction_date: todayStr(),
+        }));
+        const { error } = await supabase.from("finance_logs").insert(rows);
+        if (error) throw error;
+
+        const total = items.reduce((sum: number, item: { amount: number }) => sum + item.amount, 0);
+        const lines = items.map((item: { amount: number; category?: string; description?: string }, i: number) =>
+          `${i + 1}. *${item.amount}₪* · ${item.category || "autre"}${item.description ? " — " + item.description : ""}`
+        );
+        await sendTelegramMessage(chatId,
+          `📸✅ *${items.length} dépenses* extraites et enregistrées:\n\n${lines.join("\n")}\n\n💰 Total: *${total}₪*`);
+        break;
+      }
+
       case "add_expense": {
         if (result.params?.amount) {
           const supabase = getSupabaseClient();
