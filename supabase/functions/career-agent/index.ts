@@ -745,6 +745,26 @@ serve(async (req: Request) => {
     }
 
     const supabase = createClient(supabaseUrl, supabaseKey);
+
+    // --- Deduplication: skip if already ran today ---
+    const todayDate = getISTDateString();
+    try {
+      const { data: alreadyRan } = await supabase.from("health_logs")
+        .select("id").eq("log_type", "career_agent_run").eq("log_date", todayDate).limit(1);
+      if (alreadyRan && alreadyRan.length > 0) {
+        console.log(`[Career] Already ran today (${todayDate}), skipping duplicate`);
+        return new Response(JSON.stringify({
+          success: true, type: "skipped_duplicate", timestamp: todayDate,
+        }), { headers: { "Content-Type": "application/json" } });
+      }
+    } catch (_) {}
+    // Mark as ran today
+    try {
+      await supabase.from("health_logs").insert({
+        log_type: "career_agent_run", log_date: todayDate, notes: "dedup marker",
+      });
+    } catch (_) {}
+
     const signals = getSignalBus("career");
 
     // 0. Scrape job boards first

@@ -1267,17 +1267,19 @@ function formatTradingAnalysis(a: AnalysisResult): string {
 // =============================================
 // TELEGRAM
 // =============================================
-async function sendTG(text: string): Promise<boolean> {
+async function sendTG(text: string, replyMarkup?: any): Promise<boolean> {
   if (!BOT_TOKEN) return false;
   const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
   try {
+    const payload: any = { chat_id: CHAT_ID, text, parse_mode: "HTML", disable_web_page_preview: true };
+    if (replyMarkup) payload.reply_markup = JSON.stringify(replyMarkup);
     let res = await robustFetch(url, {
       timeoutMs: 10000,
       retries: 2,
       init: {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chat_id: CHAT_ID, text, parse_mode: "HTML", disable_web_page_preview: true }),
+        body: JSON.stringify(payload),
       },
     });
     if (!res.ok) {
@@ -1297,6 +1299,12 @@ async function sendTG(text: string): Promise<boolean> {
     console.error("Telegram send error:", e);
     return false;
   }
+}
+
+function isNightInIsrael(): boolean {
+  const now = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Jerusalem" }));
+  const hour = now.getHours();
+  return hour >= 22 || hour < 7;
 }
 
 // =============================================
@@ -1578,7 +1586,31 @@ Style: direct, chiffres précis, pas de généralités. Emojis autorisés.`,
       }
     } catch (e) { console.error("Stats error:", e); }
 
-    await sendTG(fullMsg);
+    // --- Send notification with button instead of full analysis ---
+    // Night guard: no Telegram messages between 22h-07h Israel time
+    if (!isNightInIsrael()) {
+      // Build short summary for notification
+      const summaryParts = analyses.map(a => {
+        const dir = a.trend1D.direction === "HAUSSIER" ? "▲" : a.trend1D.direction === "BAISSIER" ? "▼" : "↔";
+        const sigText = a.signal ? `${a.signal.type} (${a.signal.confidence}%)` : "HOLD";
+        return `${a.symbol} ${dir} $${fmt(a.price)} — ${sigText}`;
+      });
+      const activeSignals = analyses.filter(a => a.signal).length;
+      const typeLabel = isSundayEvening ? "📊 Analyse Hebdo" : isTradingDay ? "📈 Analyse Trading" : "👁 Observation";
+      let notif = `<b>${typeLabel}</b>\n`;
+      notif += summaryParts.join("\n");
+      if (activeSignals > 0) notif += `\n\n🔔 <b>${activeSignals} signal(s) actif(s)</b>`;
+      else notif += `\nPas de signal`;
+
+      await sendTG(notif, {
+        inline_keyboard: [
+          [{ text: "📊 Voir l'analyse complète", callback_data: "trading_last" }],
+          [{ text: "📋 Plans semaine", callback_data: "trading_plans" }, { text: "🔙 Menu", callback_data: "menu_signals" }],
+        ],
+      });
+    } else {
+      console.log("[Trading] Night mode — analysis saved to DB, no Telegram notification");
+    }
 
     // =============================================
     // GOOGLE CALENDAR SYNC — Trading Signals + Weekly Plans
@@ -1608,21 +1640,25 @@ Style: direct, chiffres précis, pas de généralités. Emojis autorisés.`,
       }
     } catch (e) { console.error("GCal trading sync error:", e); }
 
-    // Save to DB
+    // Save to DB (include full message text for retrieval via trading_last button)
     const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
-    for (const a of analyses) {
+    for (let i = 0; i < analyses.length; i++) {
+      const a = analyses[i];
+      const notesObj: any = {
+        trend1D: a.trend1D.structure,
+        trend4H: a.trend4H.structure,
+        context: a.context,
+        confluence: a.confluence.score,
+        ema200: a.priceVsEma,
+        signal: a.signal,
+      };
+      // Store full analysis text on first entry for easy retrieval
+      if (i === 0) notesObj.full_message = fullMsg;
       await supabase.from("trading_signals").insert({
         symbol: a.symbol,
         signal_type: a.signal?.type || "HOLD",
         confidence: a.signal?.confidence || a.confluence.score * 10,
-        notes: JSON.stringify({
-          trend1D: a.trend1D.structure,
-          trend4H: a.trend4H.structure,
-          context: a.context,
-          confluence: a.confluence.score,
-          ema200: a.priceVsEma,
-          signal: a.signal,
-        }),
+        notes: JSON.stringify(notesObj),
         created_at: new Date().toISOString(),
       });
     }

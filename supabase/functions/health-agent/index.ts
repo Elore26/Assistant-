@@ -42,15 +42,17 @@ async function callOpenAI(systemPrompt: string, userContent: string, maxTokens =
 }
 
 // --- Telegram ---
-async function sendTelegram(text: string): Promise<boolean> {
+async function sendTelegram(text: string, replyMarkup?: any): Promise<boolean> {
   const token = Deno.env.get("TELEGRAM_BOT_TOKEN");
   const chatId = Deno.env.get("TELEGRAM_CHAT_ID") || "775360436";
   if (!token) return false;
   try {
+    const payload: any = { chat_id: chatId, text, parse_mode: "HTML" };
+    if (replyMarkup) payload.reply_markup = JSON.stringify(replyMarkup);
     const r = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML" }),
+      body: JSON.stringify(payload),
     });
     return r.ok;
   } catch (e) { console.error("TG error:", e); return false; }
@@ -561,7 +563,37 @@ serve(async (req: Request) => {
       console.error("[Signals] Health error:", sigErr);
     }
 
-    await sendTelegram(message);
+    // Send compact notification with 2 buttons (not the full wall of text)
+    let notif = `<b>🏋️ Coach Santé — ${todayStr()}</b>\n`;
+    if (plan.workout) {
+      notif += `${plan.workout.title}\n⏰ ${scheduleEntry.time} · ${plan.workout.duration} min\n`;
+    }
+    if (workoutDone) {
+      const w = todayWorkouts![0];
+      notif += `\n✅ Workout fait: ${w.workout_type} ${w.duration_minutes}min`;
+    } else {
+      notif += `\n⏳ Workout prévu: ${scheduleEntry.time}`;
+    }
+    if (aiAdvice) {
+      // Keep AI advice short — max 2 lines
+      const shortAdvice = aiAdvice.split("\n").slice(0, 2).join("\n");
+      notif += `\n\n💡 ${shortAdvice}`;
+    }
+
+    await sendTelegram(notif, {
+      inline_keyboard: [
+        [{ text: "💪 Mon Entraînement", callback_data: "morning_sport" }, { text: "🍽 Mon Alimentation", callback_data: "morning_nutrition" }],
+        [{ text: "🔙 Menu", callback_data: "menu_main" }],
+      ],
+    });
+
+    // Save full message to DB for retrieval via buttons
+    try {
+      await supabase.from("health_logs").insert({
+        log_type: "daily_message", log_date: todayStr(),
+        notes: message,
+      });
+    } catch (_) {}
 
     // 6. Weekly review on Sunday
     let weeklyMsg = "";
