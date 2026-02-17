@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  WAKE-UP MUSIC — launchd backup timer
+
+  Installation:
+    cp com.oren.wake-music.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.oren.wake-music.plist
+
+  Désactivation:
+    launchctl unload ~/Library/LaunchAgents/com.oren.wake-music.plist
+
+  Modifier l'heure:
+    Changer Hour/Minute ci-dessous puis reload
+-->
+<dict>
+    <key>Label</key>
+    <string>com.oren.wake-music</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>curl -s http://localhost:7600/wake-music || /bin/bash ~/Assistant-/wake-up-music.sh</string>
+    </array>
+
+    <!-- Heure du réveil: 06:45 Israel time (ajuster selon fuseau local du Mac) -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>6</integer>
+        <key>Minute</key>
+        <integer>45</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/oren-wake-music.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/oren-wake-music.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

@@ -2008,6 +2008,66 @@ async function handleSprintCreate(chatId: number, args: string[]): Promise<void>
 }
 
 // --- 10. TOMORROW PLANNING (Evening) ---
+// === WAKE-UP MUSIC ===
+async function handleWakeMusic(chatId: number, args: string[]): Promise<void> {
+  const SERVER_URL = Deno.env.get("OREN_SERVER_URL") || "http://localhost:7600";
+  const subCmd = args[0]?.toLowerCase();
+
+  try {
+    if (subCmd === "stop" || subCmd === "pause" || subCmd === "arreter") {
+      // Arrêter la musique
+      const res = await fetch(`${SERVER_URL}/wake-music/stop`);
+      if (res.ok) {
+        await sendTelegramMessage(chatId, "⏹ *Musique arrêtée*", "Markdown");
+      } else {
+        await sendTelegramMessage(chatId, "❌ Erreur — le serveur Mac est-il allumé ?");
+      }
+      return;
+    }
+
+    // Lancer la musique
+    const options: Record<string, any> = {};
+    if (subCmd && subCmd.startsWith("http")) {
+      options.playlist = args.join(" ");
+    }
+    if (subCmd && !isNaN(Number(subCmd))) {
+      options.volume = parseInt(subCmd);
+    }
+
+    const res = await fetch(`${SERVER_URL}/wake-music`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(options),
+    });
+
+    if (res.ok) {
+      const data = await res.json();
+      await sendTelegramMessage(
+        chatId,
+        `🎵 *Réveil musical lancé !*\n\n` +
+        `🔊 La musique joue sur ton Mac\n` +
+        `⏹ Pour arrêter: /music stop`,
+        "Markdown"
+      );
+    } else {
+      await sendTelegramMessage(
+        chatId,
+        "❌ *Impossible de lancer la musique*\n" +
+        "Vérifie que le serveur Mac (oren-server) tourne.\n" +
+        `\`curl ${SERVER_URL}/health\``,
+        "Markdown"
+      );
+    }
+  } catch (e) {
+    await sendTelegramMessage(
+      chatId,
+      `❌ *Erreur connexion serveur Mac*\n${String(e).substring(0, 200)}\n\n` +
+      "Le serveur oren-server est-il démarré ?",
+      "Markdown"
+    );
+  }
+}
+
 async function handleTomorrowPlan(chatId: number): Promise<void> {
   const supabase = getSupabaseClient();
   try {
@@ -5953,6 +6013,8 @@ serve(async (req: Request) => {
       } else {
         await sendTelegramMessage(chatId, `Contextes: ${TASK_CONTEXTS.map(c => `${CONTEXT_EMOJI[c]} ${c}`).join(', ')}\nEx: /ctx work`);
       }
+    } else if (command === "/music" || command === "/reveil" || command === "/wake") {
+      await handleWakeMusic(chatId, args);
     } else if (command === "/tuto" || command === "/tutorial" || command === "/guide") {
       const page = TUTO_PAGES["tuto_main"];
       await sendTelegramMessage(chatId, page.text, "HTML", page.buttons);

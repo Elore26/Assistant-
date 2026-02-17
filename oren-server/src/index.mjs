@@ -53,6 +53,48 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // ─── Wake-up Music endpoint ───
+  // Appelé par iPhone Shortcut quand le réveil sonne
+  // GET  /wake-music         → lance avec config par défaut
+  // POST /wake-music         → lance avec options custom { playlist, volume }
+  // GET  /wake-music/stop    → arrête la musique
+  if (url.pathname === "/wake-music") {
+    if (req.method === "GET") {
+      import("./jobs/wake-up-music.mjs").then(({ wakeUpMusic }) => {
+        wakeUpMusic((msg) => logger.info(`[wake-music] ${msg}`)).catch(() => {});
+      });
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "playing", message: "🎵 Réveil musical lancé!" }));
+      return;
+    }
+    if (req.method === "POST") {
+      let body = "";
+      req.on("data", (chunk) => (body += chunk));
+      req.on("end", async () => {
+        try {
+          const options = body ? JSON.parse(body) : {};
+          const { wakeUpMusic } = await import("./jobs/wake-up-music.mjs");
+          wakeUpMusic((msg) => logger.info(`[wake-music] ${msg}`), options).catch(() => {});
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ status: "playing", message: "🎵 Réveil musical lancé!", options }));
+        } catch (e) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      });
+      return;
+    }
+  }
+
+  if (url.pathname === "/wake-music/stop") {
+    import("./jobs/wake-up-music.mjs").then(({ stopMusic }) => {
+      stopMusic((msg) => logger.info(`[wake-music] ${msg}`)).catch(() => {});
+    });
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ status: "stopped", message: "⏹ Musique arrêtée" }));
+    return;
+  }
+
   if (url.pathname === "/run" && req.method === "POST") {
     let body = "";
     req.on("data", (chunk) => (body += chunk));
@@ -99,6 +141,14 @@ async function registerJobs() {
     cron: ["08:00", "13:30", "18:30", "20:00"],
     timezone: "Asia/Jerusalem",
     description: "Score & rank new job listings with AI",
+  });
+
+  // Wake-up Music: 06:45 Israel time (backup si iPhone shortcut ne se déclenche pas)
+  const { wakeUpMusic } = await import("./jobs/wake-up-music.mjs");
+  scheduler.register("wake-music", wakeUpMusic, {
+    cron: [process.env.WAKE_TIME || "06:45"],
+    timezone: "Asia/Jerusalem",
+    description: "🎵 Réveil musical — YouTube Music playlist",
   });
 
   // Health ping: every 30 minutes — log that server is alive
