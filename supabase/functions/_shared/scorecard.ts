@@ -1,7 +1,7 @@
 // ============================================
 // OREN AGENT SYSTEM — Shared Scorecard Module
 // EOS-inspired: 10 key metrics on 1 page
-// Reused by weekly-planning + telegram-bot /scorecard
+// Reused by evening-review (Sunday L10) + telegram-bot /scorecard
 // ============================================
 
 import { escHTML } from "./telegram.ts";

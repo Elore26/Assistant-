@@ -2,33 +2,14 @@ import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { GoogleCalendar, GCAL_COLORS, getGoogleCalendar } from "../_shared/google-calendar.ts";
 import { getSignalBus } from "../_shared/agent-signals.ts";
+import { robustFetch } from "../_shared/robust-fetch.ts";
+import { getIsraelNow, todayStr, daysAgo, DAYS_FR } from "../_shared/timezone.ts";
+import { callOpenAI } from "../_shared/openai.ts";
+import { sendTG, escHTML } from "../_shared/telegram.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") || "";
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
-const TELEGRAM_BOT_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN") || "";
-const TELEGRAM_CHAT_ID = Deno.env.get("TELEGRAM_CHAT_ID") || "775360436";
 const GMAPS_KEY = Deno.env.get("GOOGLE_MAPS_API_KEY") || "";
-
-// =============================================
-// AI ENHANCEMENT
-// =============================================
-async function callOpenAI(systemPrompt: string, userContent: string, maxTokens = 500): Promise<string> {
-  const apiKey = Deno.env.get("OPENAI_API_KEY");
-  if (!apiKey) return "";
-  try {
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
-      body: JSON.stringify({
-        model: "gpt-4o-mini", temperature: 0.7, max_tokens: maxTokens,
-        messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userContent }],
-      }),
-    });
-    if (!response.ok) return "";
-    const data = await response.json();
-    return data.choices?.[0]?.message?.content || "";
-  } catch (e) { console.error("OpenAI error:", e); return ""; }
-}
 
 // --- Commute config ---
 const HOME = "114 Marc Shagal, Ashdod, Israel";
@@ -37,14 +18,7 @@ const STATION_TLV = "Tel Aviv HaShalom Railway Station, Israel";
 const WORK = "Shaul Hamelech Street, Tel Aviv, Israel";
 const LIME_MIN = 10;
 
-// --- Timezone ---
-function getIsraelNow(): Date {
-  return new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Jerusalem" }));
-}
-function dateStr(): string {
-  const d = getIsraelNow();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-}
+// --- Timezone helpers (unique to morning-briefing) ---
 function istToUnix(h: number, m: number, daysOffset = 0): number {
   const now = new Date();
   const utcYear = now.getUTCFullYear();
@@ -56,7 +30,6 @@ function istToUnix(h: number, m: number, daysOffset = 0): number {
 }
 
 // --- Schedule ---
-const DAYS = ["Dimanche", "Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi"];
 interface Sched { type: string; ws: string; we: string; label: string; }
 function getSched(d: number): Sched {
   const s: Record<number, Sched> = {
@@ -172,12 +145,22 @@ async function getDriveMin(from: string, to: string, departureTs?: number): Prom
       params.departure_time = String(departureTs);
     }
     const p = new URLSearchParams(params);
-    const r = await fetch(`https://maps.googleapis.com/maps/api/directions/json?${p}`);
+    const r = await robustFetch(`https://maps.googleapis.com/maps/api/directions/json?${p}`, {
+      timeoutMs: 8000,
+      retries: 1,
+    });
+    if (!r.ok) {
+      console.error(`Drive API HTTP ${r.status}`);
+      return 12;
+    }
     const j = await r.json();
-    if (j.status === "OK") {
+    if (j.status === "OK" && j.routes?.length > 0 && j.routes[0].legs?.length > 0) {
       const leg = j.routes[0].legs[0];
       const seconds = leg.duration_in_traffic?.value || leg.duration?.value || 720;
       return Math.ceil(seconds / 60);
+    }
+    if (j.status !== "OK") {
+      console.warn(`Drive API status: ${j.status} — ${j.error_message || ""}`);
     }
   } catch (e) { console.error("Drive API error:", e); }
   return 12;
@@ -195,21 +178,40 @@ async function getTrainSchedule(
       origin: fromStation, destination: toStation, mode: "transit", transit_mode: "rail",
       [timeParam]: String(ts), language: "fr", key: GMAPS_KEY,
     });
-    const r = await fetch(`https://maps.googleapis.com/maps/api/directions/json?${p}`);
+    const r = await robustFetch(`https://maps.googleapis.com/maps/api/directions/json?${p}`, {
+      timeoutMs: 10000,
+      retries: 1,
+    });
+    if (!r.ok) {
+      console.error(`Train API HTTP ${r.status}`);
+      return null;
+    }
     const j = await r.json();
-    if (j.status !== "OK" || !j.routes?.length) return null;
-    const leg = j.routes[0].legs[0];
-    for (const step of leg.steps) {
-      if (step.travel_mode === "TRANSIT") {
-        const td = step.transit_details;
-        if (!td) continue;
-        return {
-          dep: td.departure_time?.text || "", arr: td.arrival_time?.text || "",
-          dur: step.duration?.text || "", line: td.line?.short_name || td.line?.name || "",
-          depTs: td.departure_time?.value || 0, arrTs: td.arrival_time?.value || 0,
-        };
+    if (j.status !== "OK" || !j.routes?.length) {
+      if (j.status !== "OK") {
+        console.warn(`Train API status: ${j.status} — ${j.error_message || ""}`);
+      }
+      return null;
+    }
+    const leg = j.routes[0]?.legs?.[0];
+    if (!leg) return null;
+
+    // Search for TRANSIT step (rail) in the route
+    if (leg.steps) {
+      for (const step of leg.steps) {
+        if (step.travel_mode === "TRANSIT") {
+          const td = step.transit_details;
+          if (!td) continue;
+          return {
+            dep: td.departure_time?.text || "", arr: td.arrival_time?.text || "",
+            dur: step.duration?.text || "", line: td.line?.short_name || td.line?.name || "",
+            depTs: td.departure_time?.value || 0, arrTs: td.arrival_time?.value || 0,
+          };
+        }
       }
     }
+
+    // Fallback: use the leg-level timing if no TRANSIT step found
     return {
       dep: leg.departure_time?.text || "", arr: leg.arrival_time?.text || "",
       dur: leg.duration?.text || "", line: "Israel Railways",
@@ -219,25 +221,7 @@ async function getTrainSchedule(
 }
 
 // =============================================
-// TELEGRAM
-// =============================================
-async function sendTG(text: string): Promise<boolean> {
-  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-  let r = await fetch(url, {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text, parse_mode: "HTML", disable_web_page_preview: true }),
-  });
-  if (r.ok) return true;
-  r = await fetch(url, {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: text.replace(/<[^>]*>/g, "") }),
-  });
-  return r.ok;
-}
-
-function esc(s: string): string {
-  return (s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
+// sendTG and escHTML imported from _shared/telegram.ts
 
 // =============================================
 // TIME HELPERS
@@ -420,10 +404,10 @@ function buildDayPlan(
 function formatPlan(blocks: PlanBlock[]): string {
   let text = "";
   for (const b of blocks) {
-    text += `<b>${b.start}</b>  ${esc(b.label)}\n`;
+    text += `<b>${b.start}</b>  ${escHTML(b.label)}\n`;
     if (b.details && b.details.length > 0) {
       for (const d of b.details) {
-        text += `        · ${esc(d)}\n`;
+        text += `        · ${escHTML(d)}\n`;
       }
     }
   }
@@ -497,8 +481,8 @@ serve(async (req: Request) => {
     const now = getIsraelNow();
     const actualDay = now.getDay();
     const day = forceDay !== null ? forceDay : actualDay;
-    const dayName = DAYS[day];
-    const today = dateStr();
+    const dayName = DAYS_FR[day];
+    const today = todayStr();
     const sched = getSched(day);
     const daysOffset = forceDay !== null ? ((forceDay - actualDay + 7) % 7) : 0;
 
@@ -638,17 +622,212 @@ serve(async (req: Request) => {
     } catch (e) { console.error("Goals:", e); }
 
     // =============================================
-    // READ BRAIN OUTPUT
+    // FETCH DAILY BRAIN DATA (merged from daily-brain)
+    // =============================================
+    const monthStart = `${today.substring(0, 7)}-01`;
+    const [
+      pipelineRes, leadsRes, financeRes, careerVelocityRes,
+      rejectionsRes, rocksRes, staleAppsRes, failPatternsRes,
+    ] = await Promise.all([
+      supabase.from("job_listings").select("status")
+        .in("status", ["new", "applied", "interview", "offer"]),
+      supabase.from("leads").select("status").gte("created_at", monthStart),
+      supabase.from("finance_logs").select("transaction_type, amount")
+        .gte("transaction_date", monthStart),
+      supabase.from("job_listings").select("applied_date")
+        .eq("status", "applied").gte("applied_date", daysAgo(7)),
+      supabase.from("job_listings").select("company, title")
+        .eq("status", "rejected")
+        .gte("updated_at", new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString()),
+      supabase.from("rocks").select("title, domain, measurable_target, current_status, quarter_end")
+        .in("current_status", ["on_track", "off_track"]),
+      supabase.from("job_listings").select("id, company, title, applied_date")
+        .eq("status", "applied").lte("applied_date", daysAgo(5)),
+      supabase.from("task_fail_reasons").select("reason, task_date")
+        .gte("task_date", daysAgo(30)),
+    ]);
+
+    const pipeline = pipelineRes.data || [];
+    const leads = leadsRes.data || [];
+    const finance = financeRes.data || [];
+    const recentApps = careerVelocityRes.data || [];
+    const rejections = rejectionsRes.data || [];
+    const rocks = rocksRes.data || [];
+    const staleApps = staleAppsRes.data || [];
+
+    const newJobs = pipeline.filter((j: any) => j.status === "new").length;
+    const appliedJobs = pipeline.filter((j: any) => j.status === "applied").length;
+    const interviews = pipeline.filter((j: any) => j.status === "interview").length;
+    const convertedLeads = leads.filter((l: any) => l.status === "converted").length;
+    const totalLeads = leads.length;
+    const monthIncome = finance.filter((f: any) => f.transaction_type === "income").reduce((s: number, e: any) => s + e.amount, 0);
+    const monthExpense = finance.filter((f: any) => f.transaction_type === "expense").reduce((s: number, e: any) => s + e.amount, 0);
+    const balance = monthIncome - monthExpense;
+    const appVelocity = (recentApps.length / 7).toFixed(1);
+
+    let requiredDailyApps = "N/A";
+    const careerGoal = activeGoals.find((g: any) => g.domain === "career");
+    if (careerGoal) {
+      const target = Number(careerGoal.metric_target) || 50;
+      const current = Number(careerGoal.metric_current) || 0;
+      const remaining = target - current;
+      const dLeft = careerGoal.deadline
+        ? Math.max(1, Math.ceil((new Date(careerGoal.deadline).getTime() - now.getTime()) / 86400000))
+        : 60;
+      requiredDailyApps = remaining > 0 ? (remaining / dLeft).toFixed(1) : "0";
+    }
+
+    // =============================================
+    // CONSUME OVERNIGHT SIGNALS
+    // =============================================
+    let overnightAlerts = "";
+    let highPriorityDay = false;
+    const overnightSignals = {
+      critical: [] as any[], weakDomain: null as string | null,
+      yesterdayScore: null as number | null, patterns: [] as string[],
+      skillGaps: [] as string[], interviewAlert: false,
+    };
+    try {
+      const overnight = await signals.consume({ markConsumed: true, limit: 30 });
+      for (const sig of overnight) {
+        if (sig.priority <= 2) { overnightSignals.critical.push(sig); highPriorityDay = true; }
+        if (sig.signal_type === "weak_domain") overnightSignals.weakDomain = sig.payload?.domain || null;
+        if (sig.signal_type === "daily_score") overnightSignals.yesterdayScore = sig.payload?.score ?? null;
+        if (sig.signal_type === "pattern_detected") overnightSignals.patterns.push(sig.message);
+        if (sig.signal_type === "skill_gap") overnightSignals.skillGaps.push(sig.message);
+        if (sig.signal_type === "interview_scheduled") overnightSignals.interviewAlert = true;
+      }
+      if (overnight.length > 0) {
+        const critical = overnight.filter((s: any) => s.priority <= 2);
+        const info = overnight.filter((s: any) => s.priority > 2);
+        if (critical.length > 0) {
+          overnightAlerts += `\n⚡ ALERTES:\n`;
+          for (const sig of critical) { overnightAlerts += `→ [${sig.source_agent}] ${sig.message}\n`; }
+        }
+        if (info.length > 0) {
+          overnightAlerts += `\n📡 Signaux (${info.length}):\n`;
+          for (const sig of info.slice(0, 5)) { overnightAlerts += `→ ${sig.message}\n`; }
+          if (info.length > 5) overnightAlerts += `  +${info.length - 5} autres\n`;
+        }
+        const lowSleep = overnight.find((s: any) => s.signal_type === "low_sleep");
+        if (lowSleep) overnightAlerts += `\n😴 Sommeil faible (${lowSleep.payload?.hours}h) → journée allégée\n`;
+        const recovery = overnight.find((s: any) => s.signal_type === "recovery_status");
+        if (recovery) overnightAlerts += `\n💪 ${recovery.payload?.recommendation === "deload" ? "Deload recommandé" : "Recovery OK"}\n`;
+        const streakRisk = overnight.find((s: any) => s.signal_type === "streak_at_risk");
+        if (streakRisk) overnightAlerts += `\n⚠️ ${streakRisk.message}\n`;
+      }
+    } catch (sigErr) { console.error("[Signals] Morning consume error:", sigErr); }
+
+    // =============================================
+    // GENERATE DAILY BRAIN (inline — replaces daily-brain function)
     // =============================================
     let brainText = "";
+    let priorityDomain = "career";
+    let dailyMode = "normal";
     try {
-      const { data: brain } = await supabase.from("daily_brain")
-        .select("briefing_text, priority_domain, daily_mode")
-        .eq("plan_date", today).limit(1);
-      if (brain && brain.length > 0) {
-        brainText = brain[0].briefing_text;
+      let goalsCtx = "";
+      for (const g of activeGoals) {
+        const dLeft = g.deadline ? Math.ceil((new Date(g.deadline).getTime() - now.getTime()) / 86400000) : null;
+        goalsCtx += `- ${g.domain}: ${g.title} (${g.metric_current}/${g.metric_target}${g.metric_unit || ""})`;
+        if (dLeft !== null) goalsCtx += ` [${dLeft}j]`;
+        goalsCtx += "\n";
       }
-    } catch (e) { console.error("Brain read:", e); }
+
+      const tasksCtx = allTasks.length > 0
+        ? allTasks.slice(0, 10).map((t: any) => `- P${t.priority}: ${t.title}${t.due_time ? ` @${t.due_time.substring(0, 5)}` : ""}`).join("\n")
+        : "Aucune tâche";
+
+      let rocksCtx = "";
+      const rocksOffTrack: string[] = [];
+      let signalsCtx = "";
+      for (const rock of rocks) {
+        const dLeft = Math.ceil((new Date(rock.quarter_end).getTime() - now.getTime()) / 86400000);
+        const status = rock.current_status === "on_track" ? "✅" : "⚠️ OFF";
+        rocksCtx += `- [${rock.domain}] ${rock.title} — ${status} (J-${dLeft})\n`;
+        if (rock.current_status === "off_track") rocksOffTrack.push(rock.title);
+        if (dLeft <= 14 && dLeft > 0) signalsCtx += `🔴 Rock "${rock.title}" — J-${dLeft}\n`;
+      }
+
+      if (overnightSignals.yesterdayScore !== null) signalsCtx += `Score hier: ${overnightSignals.yesterdayScore}/12\n`;
+      if (overnightSignals.weakDomain) signalsCtx += `⚠️ Faible hier: ${overnightSignals.weakDomain}\n`;
+      if (overnightSignals.interviewAlert) signalsCtx += `🔴 INTERVIEW — Priorité absolue\n`;
+
+      let anticipationsCtx = "";
+      if (staleApps.length > 0) {
+        anticipationsCtx += `RELANCES (>5j):\n`;
+        for (const app of staleApps.slice(0, 3)) {
+          const daysSince = Math.ceil((now.getTime() - new Date(app.applied_date).getTime()) / 86400000);
+          anticipationsCtx += `- ${app.company} "${app.title}" (${daysSince}j)\n`;
+        }
+      }
+
+      const failPatterns = failPatternsRes.data || [];
+      const todayFailReasons = failPatterns.filter((fr: any) => new Date(fr.task_date).getDay() === day);
+      if (todayFailReasons.length >= 3) {
+        const reasonCounts: Record<string, number> = {};
+        todayFailReasons.forEach((fr: any) => { reasonCounts[fr.reason] = (reasonCounts[fr.reason] || 0) + 1; });
+        const topReason = Object.entries(reasonCounts).sort((a, b) => b[1] - a[1])[0];
+        if (topReason) anticipationsCtx += `⚠️ ${dayName} jour faible (${topReason[0]} ${topReason[1]}x)\n`;
+      }
+
+      const brainContext = `${dayName} ${today}
+Rocks: ${rocksCtx || "aucun"}${rocksOffTrack.length > 0 ? ` | ⚠️ OFF: ${rocksOffTrack.join(", ")}` : ""}
+Career: ${newJobs} new, ${appliedJobs} applied, ${interviews} interviews · Vélocité ${appVelocity}/j (requis ${requiredDailyApps}/j) · ${rejections.length} rejets${interviews === 0 ? " ⚠️ 0 INTERVIEWS" : ""}
+HiGrow: ${convertedLeads}/${totalLeads || "?"} convertis · Finance: ${balance > 0 ? "+" : ""}${Math.round(balance)}₪
+Objectifs: ${goalsCtx || "aucun"}
+Tâches: ${tasksCtx}
+${signalsCtx ? `Signaux: ${signalsCtx}` : ""}${anticipationsCtx ? `Anticipations: ${anticipationsCtx}` : ""}`.trim();
+
+      brainText = await callOpenAI(
+        `Briefing matin Oren (HTML: <b>, <i>). Format strict:
+🔴/🟡/🟢 URGENCE — Domaine · ${dayName}
+💼 Career stats · 🚀 HiGrow · 📋 Tâches · 💰 Balance
+🪨 Rocks off-track en priorité
+${overnightSignals.weakDomain ? `⚠️ Faible hier: ${overnightSignals.weakDomain}` : ""}${overnightSignals.interviewAlert ? " 🔴 INTERVIEW PREP" : ""}
+⚡ UNE action concrète
+🔴=0 interviews/deadline<30j/off-track · 🟢=tout on-track
+Max 8 lignes, data-driven, actionnable.`,
+        brainContext,
+        350
+      );
+
+      // Priority domain (Rock-aware + signal-aware)
+      const offTrackRock = rocks.find((r: any) => r.current_status === "off_track");
+      if (overnightSignals.interviewAlert) priorityDomain = "career";
+      else if (offTrackRock) priorityDomain = offTrackRock.domain;
+      else if (interviews === 0 && appliedJobs < 5) priorityDomain = "career";
+      else if (convertedLeads === 0) priorityDomain = "higrow";
+      else if (overnightSignals.weakDomain) priorityDomain = overnightSignals.weakDomain;
+
+      // Daily mode
+      const velocityBehind = requiredDailyApps !== "N/A" && parseFloat(appVelocity) < parseFloat(requiredDailyApps);
+      if (interviews === 0 || convertedLeads === 0 || velocityBehind || rocksOffTrack.length > 0) dailyMode = "urgence";
+
+      // Auto-create follow-up tasks for stale applications
+      for (const app of staleApps.slice(0, 3)) {
+        try {
+          const { data: existing } = await supabase.from("tasks")
+            .select("id").eq("context", `followup_${app.id}`)
+            .in("status", ["pending", "in_progress"]).limit(1);
+          if (existing && existing.length > 0) continue;
+          const daysSince = Math.ceil((now.getTime() - new Date(app.applied_date).getTime()) / 86400000);
+          await supabase.from("tasks").insert({
+            title: `📧 Relance ${app.company} — "${app.title}" (${daysSince}j)`,
+            status: "pending", priority: 2, agent_type: "career",
+            context: `followup_${app.id}`, due_date: today,
+            duration_minutes: 10, created_at: new Date().toISOString(),
+          });
+        } catch (e) { console.error(`Follow-up task error:`, e); }
+      }
+
+      // Write to daily_brain for history
+      try {
+        await supabase.from("daily_brain").upsert({
+          plan_date: today, briefing_text: brainText,
+          priority_domain: priorityDomain, daily_mode: dailyMode,
+        }, { onConflict: "plan_date" });
+      } catch (_) {}
+    } catch (brainErr) { console.error("Brain generation error:", brainErr); }
 
     // Build the day plan (used for Calendar sync + message)
     const dayPlan = buildDayPlan(day, allerDepart, allerArrive, retourDepart, retourArrive, scheduledTasks);
@@ -720,63 +899,42 @@ serve(async (req: Request) => {
           }
         }
 
+        // 4. Trading signals (merged from sync-calendar)
+        try {
+          const fourHoursAgo = new Date(Date.now() - 4 * 60 * 60 * 1000).toISOString();
+          const { data: tradingSignals } = await supabase.from("trading_signals")
+            .select("symbol, signal_type, confidence, notes, created_at")
+            .gte("created_at", fourHoursAgo)
+            .in("signal_type", ["BUY", "SELL"])
+            .order("created_at", { ascending: false }).limit(5);
+
+          if (tradingSignals && tradingSignals.length > 0) {
+            for (const sig of tradingSignals) {
+              try {
+                const notes = JSON.parse(sig.notes || "{}");
+                const signal = notes.signal;
+                if (signal) {
+                  const icon = sig.signal_type === "BUY" ? "🟢 LONG" : "🔴 SHORT";
+                  const createdAt = new Date(sig.created_at);
+                  const startH = createdAt.getHours().toString().padStart(2, "0");
+                  const startM = createdAt.getMinutes().toString().padStart(2, "0");
+                  const endH = (createdAt.getHours() + 4).toString().padStart(2, "0");
+                  calEvents.push(gcal.buildEvent(
+                    `${PREFIX}${icon} ${sig.symbol} @ $${signal.entry}`,
+                    today, `${startH}:${startM}`, `${endH}:${startM}`,
+                    `Entry: $${signal.entry}\nSL: $${signal.sl}\nTP: $${signal.tp}\nR:R: ${signal.rr}\nConfiance: ${sig.confidence}%`,
+                    GCAL_COLORS.TRADING || "11"
+                  ));
+                }
+              } catch { /* skip invalid */ }
+            }
+          }
+        } catch (trErr) { console.error("Trading calendar error:", trErr); }
+
         const synced = await gcal.syncDayEvents(today, calEvents, PREFIX);
         console.log(`📅 Google Calendar: ${synced}/${calEvents.length} events synced`);
       }
     } catch (e) { console.error("Google Calendar sync error:", e); }
-
-    // =============================================
-    // CONSUME OVERNIGHT SIGNALS
-    // =============================================
-    let overnightAlerts = "";
-    let highPriorityDay = false;
-    try {
-      const overnight = await signals.consume({
-        markConsumed: true,
-        limit: 15,
-      });
-
-      if (overnight.length > 0) {
-        const critical = overnight.filter(s => s.priority <= 2);
-        const info = overnight.filter(s => s.priority > 2);
-
-        if (critical.length > 0) {
-          overnightAlerts += `\n⚡ ALERTES:\n`;
-          for (const sig of critical) {
-            overnightAlerts += `→ [${sig.source_agent}] ${sig.message}\n`;
-          }
-          highPriorityDay = true;
-        }
-
-        if (info.length > 0) {
-          overnightAlerts += `\n📡 Signaux (${info.length}):\n`;
-          for (const sig of info.slice(0, 5)) {
-            overnightAlerts += `→ ${sig.message}\n`;
-          }
-          if (info.length > 5) {
-            overnightAlerts += `  +${info.length - 5} autres\n`;
-          }
-        }
-
-        // Check specific signals for day planning adjustments
-        const lowSleep = overnight.find(s => s.signal_type === "low_sleep");
-        if (lowSleep) {
-          overnightAlerts += `\n😴 Sommeil faible (${lowSleep.payload?.hours}h) → journée allégée\n`;
-        }
-
-        const recovery = overnight.find(s => s.signal_type === "recovery_status");
-        if (recovery) {
-          overnightAlerts += `\n💪 ${recovery.payload?.recommendation === "deload" ? "Deload recommandé" : "Recovery OK"}\n`;
-        }
-
-        const streakRisk = overnight.find(s => s.signal_type === "streak_at_risk");
-        if (streakRisk) {
-          overnightAlerts += `\n⚠️ ${streakRisk.message}\n`;
-        }
-      }
-    } catch (sigErr) {
-      console.error("[Signals] Morning consume error:", sigErr);
-    }
 
     // =============================================
     // BUILD SHORT MESSAGE
@@ -808,7 +966,7 @@ serve(async (req: Request) => {
         const time = t.due_time || t.autoTime;
         const timeStr = time ? ` → <b>${time.substring(0, 5)}</b>` : "";
         const overdue = t.urgencyBoost > 0 ? " ⚠️" : "";
-        msg += `${num} ${esc(t.title)}${timeStr}${overdue}\n`;
+        msg += `${num} ${escHTML(t.title)}${timeStr}${overdue}\n`;
       });
       if (allTasks.length > 3) {
         msg += `<i>+${allTasks.length - 3} autres tâches</i>\n`;
@@ -818,7 +976,7 @@ serve(async (req: Request) => {
       allTasks.slice(0, 5).forEach((t: any) => {
         const p = t.priority <= 2 ? "●" : t.priority === 3 ? "◐" : "○";
         const time = t.due_time ? ` <b>${t.due_time}</b>` : "";
-        msg += `${p} ${esc(t.title)}${time}\n`;
+        msg += `${p} ${escHTML(t.title)}${time}\n`;
       });
     }
 

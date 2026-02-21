@@ -9,46 +9,12 @@ import { getSignalBus } from "../_shared/agent-signals.ts";
 import { getIsraelNow, todayStr, daysAgo, DAYS_FR } from "../_shared/timezone.ts";
 import { callOpenAI } from "../_shared/openai.ts";
 import { sendTG, escHTML } from "../_shared/telegram.ts";
+import { progressBar, trend, simpleProgressBar } from "../_shared/formatting.ts";
+import { DOMAIN_EMOJIS, TOMORROW_SCHEDULE, FAIL_REASON_LABELS } from "../_shared/config.ts";
+import { buildScorecard, formatScorecardHTML } from "../_shared/scorecard.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") || "";
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
-
-const DOMAIN_EMOJIS: Record<string, string> = {
-  career: "💼", finance: "💰", health: "🏋️", higrow: "🚀",
-  trading: "📈", learning: "📚", personal: "🏠",
-};
-
-const TOMORROW_SCHEDULE: Record<number, string> = {
-  0: "Dimanche — Journée longue (09:30-19:30) · Legs 06:30",
-  1: "Lundi — Journée courte (09:30-15:30) · Push 17:00",
-  2: "Mardi — Journée courte (09:30-15:30) · Pull 17:00",
-  3: "Mercredi — Journée courte (09:30-15:30) · Legs 17:00",
-  4: "Jeudi — Journée tardive (12:00-19:30) · Cardio 07:00",
-  5: "Vendredi — Variable · Push 09:00",
-  6: "Samedi — OFF · Repos actif",
-};
-
-// OpenAI, Telegram, escHTML imported from _shared modules above
-
-// --- Progress bar visual ---
-function progressBar(current: number, target: number, width = 10, start?: number, direction?: string): string {
-  let ratio: number;
-  if (direction === 'decrease' && start !== undefined && start > target) {
-    ratio = Math.max(0, Math.min(1, (start - current) / (start - target)));
-  } else {
-    ratio = Math.min(current / Math.max(target, 1), 1);
-  }
-  const filled = Math.round(ratio * width);
-  const empty = width - filled;
-  return "█".repeat(filled) + "░".repeat(empty) + ` ${Math.round(ratio * 100)}%`;
-}
-
-// --- Trend arrow ---
-function trend(today: number, weekAvg: number): string {
-  if (today > weekAvg * 1.1) return "↑";
-  if (today < weekAvg * 0.9) return "↓";
-  return "→";
-}
 
 // ============================================
 // MAIN HANDLER
@@ -92,7 +58,7 @@ serve(async (_req: Request) => {
       healthRes, health7dRes, learningRes, learning7dRes,
       signalsRes, leadsRes, leads7dRes, goalsRes,
       weekTasksRes, careerApps7dRes, careerRejectionsRes, careerAllPipelineRes,
-      failReasonsRes
+      failReasonsRes, rocksRes,
     ] = await Promise.all([
       // Today's completed tasks
       supabase.from("tasks").select("title, status, updated_at, agent_type")
@@ -146,6 +112,9 @@ serve(async (_req: Request) => {
       // Fail reason patterns (last 14 days)
       supabase.from("task_fail_reasons").select("reason, task_date")
         .gte("task_date", weekAgoStr),
+      // Active rocks (Tier 5)
+      supabase.from("rocks").select("title, domain, current_status, quarter_end, measurable_target")
+        .in("current_status", ["on_track", "off_track"]),
     ]);
 
     // Extract data
@@ -537,10 +506,7 @@ serve(async (_req: Request) => {
 
       // Show fail reason pattern if enough data
       if (topFailReason && failReasons7d.length >= 3) {
-        const REASON_LABELS: Record<string, string> = {
-          blocked: "Bloqué", forgot: "Oublié", toobig: "Trop grosse", energy: "Énergie", skip: "Pas prioritaire",
-        };
-        msg += `\n📊 <i>Pattern 7j: "${REASON_LABELS[topFailReason[0]] || topFailReason[0]}" = raison #1 (${topFailReason[1]}x)</i>\n`;
+          msg += `\n📊 <i>Pattern 7j: "${FAIL_REASON_LABELS[topFailReason[0]] || topFailReason[0]}" = raison #1 (${topFailReason[1]}x)</i>\n`;
       }
 
       if (completionRate < 50) {
@@ -665,6 +631,22 @@ serve(async (_req: Request) => {
     }
 
     // ============================================
+    // ROCKS — 90-DAY PRIORITIES (Tier 5)
+    // ============================================
+    const rocks = rocksRes.data || [];
+    if (rocks.length > 0) {
+      msg += `${LINE}\n<b>🪨 ROCKS</b>\n\n`;
+      for (const rock of rocks) {
+        const daysLeft = Math.ceil((new Date(rock.quarter_end).getTime() - now.getTime()) / 86400000);
+        const statusIcon = rock.current_status === "on_track" ? "✅" : "⚠️";
+        const emoji = DOMAIN_EMOJIS[rock.domain] || "📌";
+        msg += `${statusIcon} ${emoji} ${escHTML(rock.title)} — J-${daysLeft}\n`;
+      }
+      const onTrack = rocks.filter((r: any) => r.current_status === "on_track").length;
+      msg += `\n${onTrack}/${rocks.length} on track\n\n`;
+    }
+
+    // ============================================
     // OBJECTIFS — TOP 3 PRIORITAIRES
     // ============================================
     if (goalPredictions.length > 0) {
@@ -704,21 +686,20 @@ serve(async (_req: Request) => {
     // ============================================
     // Save daily velocity metrics
     try {
-      const todayCreated = await supabase.from("tasks").select("id", { count: "exact", head: true })
-        .gte("created_at", today + "T00:00:00").lte("created_at", today + "T23:59:59");
-      const todayRescheduled = await supabase.from("tasks").select("id", { count: "exact", head: true })
-        .gt("reschedule_count", 0).gte("updated_at", today + "T00:00:00");
-      const todayPomodoros = await supabase.from("pomodoro_sessions").select("id, duration_minutes")
-        .eq("completed", true).gte("started_at", today + "T00:00:00");
+      const [todayCreated, todayRescheduled, todayPomodoros, { data: mostRescheduled }] = await Promise.all([
+        supabase.from("tasks").select("id", { count: "exact", head: true })
+          .gte("created_at", today + "T00:00:00").lte("created_at", today + "T23:59:59"),
+        supabase.from("tasks").select("id", { count: "exact", head: true })
+          .gt("reschedule_count", 0).gte("updated_at", today + "T00:00:00"),
+        supabase.from("pomodoro_sessions").select("id, duration_minutes")
+          .eq("completed", true).gte("started_at", today + "T00:00:00"),
+        supabase.from("tasks").select("title, reschedule_count").gt("reschedule_count", 0)
+          .in("status", ["pending", "in_progress"])
+          .order("reschedule_count", { ascending: false }).limit(1),
+      ]);
 
       const pomCount = todayPomodoros.data?.length || 0;
       const deepWork = (todayPomodoros.data || []).reduce((s: number, p: any) => s + (p.duration_minutes || 25), 0);
-
-      // Find most rescheduled task
-      const { data: mostRescheduled } = await supabase.from("tasks")
-        .select("title, reschedule_count").gt("reschedule_count", 0)
-        .in("status", ["pending", "in_progress"])
-        .order("reschedule_count", { ascending: false }).limit(1);
 
       await supabase.from("task_metrics").upsert({
         metric_date: today,
@@ -816,40 +797,35 @@ serve(async (_req: Request) => {
 
       const streaksContext = `Workout streak: ${workoutStreak}j, Study streak: ${studyStreak}j`;
 
-      const aiContext = `BILAN DU JOUR (${dayName}):
-- Score: ${score}/${maxScore} (${scorePct}%)
-- Tâches: ${tasksDoneToday} complétées (moy 7j: ${tasksWeekAvg.toFixed(1)}/jour), ${tasksPending} en attente
-- Tâches non faites: ${failedTasks.slice(0, 3).map((t: any) => t.title).join(", ") || "aucune"}
-- Taux de complétion: ${completionRate}%
-- Pattern jour: ${dayPattern || "pas assez de données"}
-- Career vélocité: ${appVelocity7d.toFixed(1)} apps/jour (7j), ${careerRejections.length} rejets en 14j${avgRejectionDays ? ` (délai moyen ${avgRejectionDays}j)` : ""}
-- Dépenses: ${totalExpenses.toFixed(0)}₪ (moy 7j: ${avgExpDaily.toFixed(0)}₪/jour), Épargne: ${savingsRate7d}%
-- Workout: ${workouts.length > 0 ? workouts.map((w: any) => w.workout_type).join(", ") : "aucun"} (${workoutsThisWeek}/5 cette semaine)
-- Poids: ${latestWeight || "N/A"}kg${weightTrend ? ` (${weightTrend}kg sur 7j)` : ""} → objectif 70kg
-- Étude: ${totalStudyMin}min (${(totalStudy7d / 60).toFixed(1)}h cette semaine)
-- Leads: ${leadsContactedToday} contactés (moy 7j: ${avgLeadsDaily.toFixed(1)}/jour)
-- Signals trading: ${activeSignals.length} actifs
-- Streaks: ${streaksContext}
-- Objectifs: ${goalsContext}
-- Demain: ${TOMORROW_SCHEDULE[tomorrowDay]}
-- Pattern d'échec 7j: ${topFailReason ? `"${topFailReason[0]}" (${topFailReason[1]}x)` : "pas assez de données"}`;
+      // Rocks context for AI
+      const rocksContext = rocks.length > 0
+        ? rocks.map((r: any) => {
+            const daysLeft = Math.ceil((new Date(r.quarter_end).getTime() - now.getTime()) / 86400000);
+            return `${r.domain}: "${r.title}" (${r.current_status}, J-${daysLeft})`;
+          }).join(", ")
+        : "aucun Rock défini";
+
+      const aiContext = `${dayName} | Score: ${score}/${maxScore} (${scorePct}%)
+Tâches: ${tasksDoneToday} faites, ${failedCount} non faites (${completionRate}%) · Moy 7j: ${tasksWeekAvg.toFixed(1)}/j
+Non faites: ${failedTasks.slice(0, 3).map((t: any) => t.title).join(", ") || "aucune"}
+Rocks: ${rocksContext}
+Career: ${appVelocity7d.toFixed(1)} apps/j, ${careerRejections.length} rejets 14j
+Finance: ${totalExpenses.toFixed(0)}₪ (moy ${avgExpDaily.toFixed(0)}₪/j) · Épargne ${savingsRate7d}%
+Santé: ${workouts.length > 0 ? workouts.map((w: any) => w.workout_type).join("+") : "0 workout"} (${workoutsThisWeek}/5) · ${latestWeight || "?"}kg${weightTrend ? ` (${weightTrend}kg/7j)` : ""} → 70kg
+Étude: ${totalStudyMin}min · Leads: ${leadsContactedToday} · Streaks: ${streaksContext}
+${topFailReason ? `Échec pattern: "${topFailReason[0]}" ${topFailReason[1]}x` : ""}
+Demain: ${TOMORROW_SCHEDULE[tomorrowDay]}`;
 
       const aiReflection = await callOpenAI(
-        `Tu es OREN, coach personnel d'Oren. Génère une réflexion de soirée ULTRA-CONCRÈTE en français (max 6 lignes courtes):
-
-1. **Score du jour** : Identifie LA cause racine précise (ex: "3/10 car aucun workout + 0 candidatures envoyées")
-2. **Tendance 7j** : Compare avec la moyenne (ex: "2.9 tâches/jour → en légère régression vs 3.5 la semaine dernière")
-3. **ROOT CAUSE des tâches non faites** : POURQUOI ces tâches n'ont pas été faites ? (ex: "Test Calendar bloqué depuis 3j car attends réponse client ?")
-4. **TOP 3 actions DEMAIN** : Sois chirurgical avec horaires précis (ex: "1. 10h → Appeler Etan. 2. 14h → Finir Test Calendar. 3. 17h → PUSH workout")
-5. **PAS DE MOTIVATION** : Remplace par UNE question de coaching (ex: "Qu'est-ce qui t'empêche de décrocher le tel avec Etan ?")
-
-RÈGLES STRICTES:
-- ZÉRO phrase générique ("tu peux le faire", "je crois en toi" → INTERDIT)
-- Utilise TOUJOURS les chiffres réels (montants ₪, kg, heures, %)
-- Si score < 5/10 → identifie LE blocage principal, pas une liste
-- Fin avec UNE question provocante pour débloquer l'action
-Style: coach ultra-direct, français, data-driven. Max 200 mots.`,
-        aiContext
+        `Coach Oren. Réflexion soirée (6 lignes max, français):
+1. Cause racine du score (chiffres réels)
+2. Tendance 7j vs moyenne
+3. Pourquoi tâches non faites
+4. TOP 3 actions demain avec horaires
+5. UNE question de coaching provocante
+Zéro motivation générique. Data-driven. Max 150 mots.`,
+        aiContext,
+        300
       );
 
       if (aiReflection) {
@@ -950,6 +926,251 @@ Style: coach ultra-direct, français, data-driven. Max 200 mots.`,
         }),
       }).then(() => {}).catch(() => {});
     } catch (_) {}
+
+    // ============================================
+    // SUNDAY: L10 WEEKLY REVIEW (merged from weekly-planning)
+    // ============================================
+    if (day === 0) {
+      try {
+        const weekStart = new Date(now); weekStart.setDate(weekStart.getDate() - 7);
+        const weekStartStr = `${weekStart.getFullYear()}-${String(weekStart.getMonth() + 1).padStart(2, "0")}-${String(weekStart.getDate()).padStart(2, "0")}`;
+        const weekEndStr = new Date(now.getTime() - 86400000).toISOString().split("T")[0];
+        const nextWeekEnd = new Date(now.getTime() + 6 * 86400000).toISOString().split("T")[0];
+        const LINE_L10 = "━━━━━━━━━━━━━━━━━━━━";
+        const dayNameShort = (ds: string) => ["Dim", "Lun", "Mar", "Mer", "Jeu", "Ven", "Sam"][new Date(ds + "T12:00:00").getDay()];
+
+        // MESSAGE 1: EOS SCORECARD
+        const scorecardData = await buildScorecard(supabase, weekStartStr, weekEndStr);
+        const scorecardMsg = formatScorecardHTML(scorecardData);
+        await sendTG(`<b>📋 L10 WEEKLY</b> — Dimanche ${today}\n${LINE_L10}\n\n${scorecardMsg}`);
+
+        try {
+          await supabase.from("scorecard_snapshots").upsert({
+            week_start: weekStartStr, week_end: weekEndStr, metrics: scorecardData.metrics,
+          }, { onConflict: "week_start" });
+        } catch (_) {}
+
+        // Fetch week tasks for breakdown
+        const [{ data: weekAllTasks }, { data: weekDoneTasks }, { data: weekExpenses }, { data: weekHealth },
+          { data: overdueRaw }, { data: rocksData }, { data: weekFailReasons }, { data: nextWeekTasks }] = await Promise.all([
+          supabase.from("tasks").select("id, title, status, priority, due_date")
+            .gte("due_date", weekStartStr).lte("due_date", weekEndStr),
+          supabase.from("tasks").select("id, title, priority, due_date, updated_at, agent_type")
+            .eq("status", "completed").gte("updated_at", `${weekStartStr}T00:00:00`),
+          supabase.from("finance_logs").select("amount, category, transaction_type, payment_method")
+            .eq("transaction_type", "expense").gte("transaction_date", weekStartStr).lte("transaction_date", weekEndStr),
+          supabase.from("health_logs").select("log_type, workout_type, duration_minutes, value, log_date")
+            .gte("log_date", weekStartStr).lte("log_date", weekEndStr),
+          supabase.from("tasks").select("id, title, priority, due_date")
+            .in("status", ["pending", "in_progress"]).lt("due_date", today)
+            .order("priority", { ascending: true }),
+          supabase.from("rocks").select("*").in("current_status", ["on_track", "off_track"]),
+          supabase.from("task_fail_reasons").select("reason, task_date")
+            .gte("task_date", weekStartStr).lte("task_date", weekEndStr),
+          supabase.from("tasks").select("id, title, priority, due_date, status")
+            .gte("due_date", today).lte("due_date", nextWeekEnd)
+            .in("status", ["pending", "in_progress"]).order("due_date"),
+        ]);
+
+        const wAllTasks = weekAllTasks || [];
+        const wDoneTasks = weekDoneTasks || [];
+        const wFailedTasks = wAllTasks.filter((t: any) => t.status !== "completed");
+        const wCompletionRate = wAllTasks.length > 0 ? Math.round((wDoneTasks.length / wAllTasks.length) * 100) : 0;
+        const wP1p2 = wAllTasks.filter((t: any) => (t.priority || 3) <= 2);
+        const wP1p2Done = wP1p2.filter((t: any) => t.status === "completed").length;
+        const wP1p2Rate = wP1p2.length > 0 ? Math.round((wP1p2Done / wP1p2.length) * 100) : 100;
+
+        // Day breakdown
+        const wDayStats: Record<string, { done: number; total: number }> = {};
+        for (const t of wAllTasks) {
+          const d = dayNameShort(t.due_date);
+          if (!wDayStats[d]) wDayStats[d] = { done: 0, total: 0 };
+          wDayStats[d].total++;
+          if (t.status === "completed") wDayStats[d].done++;
+        }
+        let bestDay = "", worstDay = "", bestRate = -1, worstRate = 101;
+        for (const [d, s] of Object.entries(wDayStats)) {
+          if (s.total === 0) continue;
+          const rate = Math.round((s.done / s.total) * 100);
+          if (rate > bestRate) { bestRate = rate; bestDay = d; }
+          if (rate < worstRate) { worstRate = rate; worstDay = d; }
+        }
+
+        // Finance
+        const wExpenses = weekExpenses || [];
+        const wTotalSpent = wExpenses.reduce((s: number, e: any) => s + (e.amount || 0), 0);
+        const wTopCats = Object.entries(wExpenses.reduce((acc: Record<string, number>, e: any) => {
+          acc[e.category || "autre"] = (acc[e.category || "autre"] || 0) + (e.amount || 0); return acc;
+        }, {})).sort((a, b) => b[1] - a[1]).slice(0, 3);
+        const wCash = wExpenses.filter((e: any) => e.payment_method === "cash").reduce((s: number, e: any) => s + (e.amount || 0), 0);
+
+        // Health
+        const wHealthLogs = weekHealth || [];
+        const wWorkouts = wHealthLogs.filter((h: any) => h.log_type === "workout");
+        const wWorkoutMin = wWorkouts.reduce((s: number, w: any) => s + (w.duration_minutes || 0), 0);
+        const wSleepLogs = wHealthLogs.filter((h: any) => h.log_type === "sleep" && h.value);
+        const wAvgSleep = wSleepLogs.length > 0
+          ? (wSleepLogs.reduce((s: number, l: any) => s + (l.value || 0), 0) / wSleepLogs.length).toFixed(1) : "?";
+
+        // Fail patterns
+        const wFailReasons = weekFailReasons || [];
+        const wFailCounts: Record<string, number> = {};
+        wFailReasons.forEach((fr: any) => { wFailCounts[fr.reason] = (wFailCounts[fr.reason] || 0) + 1; });
+        const wTopFail = Object.entries(wFailCounts).sort((a, b) => b[1] - a[1])[0];
+
+        // MESSAGE 2: ROCK REVIEW + TASK BREAKDOWN
+        const wRocks = rocksData || [];
+        let rockMsg = `\n<b>🪨 ROCK REVIEW</b>\n${LINE_L10}\n`;
+        if (wRocks.length > 0) {
+          for (const rock of wRocks) {
+            const dLeft = Math.ceil((new Date(rock.quarter_end).getTime() - now.getTime()) / 86400000);
+            const sIcon = rock.current_status === "on_track" ? "✅" : "⚠️";
+            const emoji = DOMAIN_EMOJIS[rock.domain] || "📌";
+            rockMsg += `${sIcon} ${emoji} ${escHTML(rock.title)} — <b>${rock.current_status.replace("_", " ").toUpperCase()}</b>\n`;
+            rockMsg += `   J-${dLeft} · ${escHTML(rock.measurable_target)}\n`;
+            if (rock.progress_notes) rockMsg += `   <i>${escHTML(rock.progress_notes)}</i>\n`;
+            rockMsg += `\n`;
+          }
+          const onT = wRocks.filter((r: any) => r.current_status === "on_track").length;
+          const offT = wRocks.filter((r: any) => r.current_status === "off_track").length;
+          rockMsg += `${onT} on track · ${offT} off track\n`;
+        } else {
+          rockMsg += `Aucun Rock défini.\n`;
+        }
+
+        rockMsg += `\n<b>📋 TÂCHES</b>\n`;
+        rockMsg += `${simpleProgressBar(wCompletionRate)} ${wCompletionRate}%\n`;
+        rockMsg += `✅ ${wDoneTasks.length} faites · ❌ ${wFailedTasks.length} non faites\n`;
+        if (wP1p2.length > 0) rockMsg += `🎯 P1/P2: ${wP1p2Done}/${wP1p2.length} (${wP1p2Rate}%)\n`;
+
+        rockMsg += `\n<b>📅 Par jour:</b>\n`;
+        for (const d of ["Dim", "Lun", "Mar", "Mer", "Jeu", "Ven", "Sam"]) {
+          const s = wDayStats[d];
+          if (!s || s.total === 0) continue;
+          const rate = Math.round((s.done / s.total) * 100);
+          const icon = rate >= 80 ? "🟢" : rate >= 50 ? "🟡" : "🔴";
+          rockMsg += `${icon} ${d}: ${s.done}/${s.total} (${rate}%)\n`;
+        }
+        if (bestDay) rockMsg += `\n💪 Meilleur: <b>${bestDay}</b> (${bestRate}%)`;
+        if (worstDay && worstDay !== bestDay) rockMsg += ` · ⚠️ Faible: <b>${worstDay}</b> (${worstRate}%)`;
+        rockMsg += `\n\n<b>💰 DÉPENSES</b> · ₪${Math.round(wTotalSpent)}`;
+        if (wCash > 0) rockMsg += ` (₪${Math.round(wCash)} cash)`;
+        rockMsg += `\n`;
+        for (const [cat, amt] of wTopCats) { rockMsg += `  · ${cat}: ₪${Math.round(amt as number)}\n`; }
+        rockMsg += `\n<b>🏋️ SANTÉ</b> · ${new Set(wWorkouts.map((w: any) => w.log_date)).size}j · ${wWorkoutMin}min · Sommeil: ${wAvgSleep}h\n`;
+        if (wTopFail && wFailReasons.length >= 3) {
+          rockMsg += `\n📊 <i>Pattern échecs: "${FAIL_REASON_LABELS[wTopFail[0]] || wTopFail[0]}" = raison #1 (${wTopFail[1]}x)</i>\n`;
+        }
+        await sendTG(rockMsg);
+
+        // MESSAGE 3: IDS ISSUES (AI-generated)
+        const idsContext = {
+          completionRate: wCompletionRate, totalDone: wDoneTasks.length,
+          totalFailed: wFailedTasks.length, p1p2Rate: wP1p2Rate,
+          bestDay, worstDay, totalSpent: Math.round(wTotalSpent),
+          workoutDays: new Set(wWorkouts.map((w: any) => w.log_date)).size, avgSleep: wAvgSleep,
+          overdueCount: (overdueRaw || []).length,
+          rocksOffTrack: wRocks.filter((r: any) => r.current_status === "off_track").map((r: any) => r.title),
+          rocksOnTrack: wRocks.filter((r: any) => r.current_status === "on_track").map((r: any) => r.title),
+          topFailReason: wTopFail ? `${wTopFail[0]} (${wTopFail[1]}x)` : "N/A",
+        };
+
+        const idsInsight = await callOpenAI(
+          `Coach EOS. Section IDS du L10 weekly (3 issues max, HTML <b>/<i>):
+🔴/🟡 <b>ISSUE:</b> [court] → <b>ROOT CAUSE:</b> [pourquoi] → <b>SOLVE:</b> [action mesurable]
+Prio: Rocks off-track > métriques off-track > patterns échec. Rock off-track = toujours issue.
+Faits + solutions seulement. Max 150 mots.`,
+          JSON.stringify(idsContext), 400
+        );
+        if (idsInsight) {
+          await sendTG(`\n<b>⚠️ IDS — Identify, Discuss, Solve</b>\n${LINE_L10}\n\n${idsInsight.trim()}`);
+        }
+
+        // MESSAGE 4: NEXT WEEK PLAN
+        let planMsg = `\n<b>📝 PLAN SEMAINE PROCHAINE</b>\n${LINE_L10}\n`;
+        const overdue = overdueRaw || [];
+        if (overdue.length > 0) {
+          planMsg += `\n<b>⚠️ REPORT (${overdue.length} en retard):</b>\n`;
+          for (const t of overdue.slice(0, 5)) {
+            const pIcon = (t.priority || 3) <= 2 ? "🔴" : "🟡";
+            const days = Math.round((new Date(today).getTime() - new Date(t.due_date).getTime()) / 86400000);
+            planMsg += `${pIcon} ${escHTML(t.title)} <i>(${days}j)</i>\n`;
+          }
+        }
+        const nextWeek = nextWeekTasks || [];
+        if (nextWeek.length > 0) {
+          planMsg += `\n<b>📌 PLANIFIÉ (${nextWeek.length}):</b>\n`;
+          const byDay: Record<string, string[]> = {};
+          for (const t of nextWeek) {
+            const d = `${dayNameShort(t.due_date)} ${t.due_date.substring(5)}`;
+            if (!byDay[d]) byDay[d] = [];
+            byDay[d].push(`${(t.priority || 3) <= 2 ? "●" : "○"} ${escHTML(t.title)}`);
+          }
+          for (const [d, tasks] of Object.entries(byDay)) {
+            planMsg += `\n<b>${d}:</b>\n`;
+            for (const task of tasks.slice(0, 3)) { planMsg += `  ${task}\n`; }
+            if (tasks.length > 3) planMsg += `  +${tasks.length - 3}\n`;
+          }
+        } else {
+          planMsg += `\nAucune tâche planifiée.\n`;
+        }
+
+        // Velocity
+        try {
+          const { data: weekMetrics } = await supabase.from("task_metrics")
+            .select("*").gte("metric_date", weekStartStr).lte("metric_date", weekEndStr);
+          if (weekMetrics && weekMetrics.length > 0) {
+            const totalPomo = weekMetrics.reduce((s: number, m: any) => s + (m.total_pomodoros || 0), 0);
+            const totalDeepWork = weekMetrics.reduce((s: number, m: any) => s + (m.deep_work_minutes || 0), 0);
+            if (totalPomo > 0 || totalDeepWork > 0) {
+              const avgComp = weekMetrics.reduce((s: number, m: any) => s + (m.completion_rate || 0), 0) / weekMetrics.length;
+              planMsg += `\n<b>📊 VÉLOCITÉ:</b>\n`;
+              planMsg += `🍅 ${totalPomo} pomodoros · ${Math.round(totalDeepWork / 60)}h deep work · Taux: ${Math.round(avgComp)}%\n`;
+            }
+          }
+        } catch (_) {}
+        await sendTG(planMsg);
+
+        // Auto carry-over critical overdue tasks
+        const overdueCritical = overdue.filter((t: any) => (t.priority || 3) <= 2);
+        const tomorrow = new Date(now); tomorrow.setDate(tomorrow.getDate() + 1);
+        const tomorrowStr = `${tomorrow.getFullYear()}-${String(tomorrow.getMonth() + 1).padStart(2, "0")}-${String(tomorrow.getDate()).padStart(2, "0")}`;
+        let carryCount = 0;
+        for (const t of overdueCritical.slice(0, 5)) {
+          try {
+            await supabase.from("tasks").update({ due_date: tomorrowStr, reminder_sent: false }).eq("id", t.id);
+            carryCount++;
+          } catch (_) {}
+        }
+        if (carryCount > 0) {
+          await sendTG(`✅ ${carryCount} tâche(s) prioritaire(s) reportée(s) à demain.`);
+        }
+
+        await sendTG(
+          `<b>✨ Bonne semaine Oren !</b>\nFocus sur les Rocks. 3 tâches max par jour.`,
+          { buttons: [[
+            { text: "🪨 Rocks", callback_data: "menu_rocks" },
+            { text: "📊 Scorecard", callback_data: "menu_scorecard" },
+          ], [
+            { text: "📋 Tâches", callback_data: "menu_tasks" },
+            { text: "🎯 Sprint", callback_data: "sprint_create" },
+          ]] }
+        );
+
+        // Save weekly briefing record
+        try {
+          await supabase.from("briefings").insert({
+            briefing_type: "weekly", briefing_date: today,
+            content: `L10 Weekly: ${wDoneTasks.length}/${wAllTasks.length} tasks (${wCompletionRate}%), ${wRocks.length} rocks, ₪${Math.round(wTotalSpent)}`,
+            sent_at: new Date().toISOString(),
+          });
+        } catch (_) {}
+
+        console.log(`[Evening Review] Sunday L10 complete: ${wCompletionRate}% completion`);
+      } catch (l10Err) {
+        console.error("[L10 Weekly] Error:", l10Err);
+      }
+    }
 
     return new Response(JSON.stringify({
       success: sent, score, scorePct, date: today,

@@ -84,8 +84,6 @@ export const SCORECARD_GOALS = {
 export const AGENT_NAMES = {
   morningBriefing: "morning-briefing",
   eveningReview: "evening-review",
-  dailyBrain: "daily-brain",
-  weeklyPlanning: "weekly-planning",
   taskReminder: "task-reminder",
   taskReminderIdle: "task-reminder-idle",
   taskReminderCareer: "task-reminder-career",
