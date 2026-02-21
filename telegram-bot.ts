@@ -2141,32 +2141,19 @@ async function handleTasksMainV2(chatId: number): Promise<void> {
       });
     });
 
-    // New sub-menu buttons
+    // Sub-menu buttons (simplified)
     buttons.push([
       { text: "📥 Inbox", callback_data: "menu_inbox" },
-      { text: "📅 Planifier", callback_data: "tasks_schedule" },
+      { text: "🍅 Pomodoro", callback_data: "menu_pomodoro" },
       { text: "✓ Terminées", callback_data: "tasks_completed" },
     ]);
-    buttons.push([
-      { text: "🍅 Pomodoro", callback_data: "menu_pomodoro" },
-      { text: "📊 Vélocité", callback_data: "menu_velocity" },
-    ]);
-    buttons.push([
-      { text: "🔄 Récurrentes", callback_data: "menu_recurring" },
-      { text: "🎯 Sprint", callback_data: "menu_sprint" },
-      { text: "🌙 Demain", callback_data: "menu_tomorrow" },
-    ]);
-
-    // Context filter buttons
     buttons.push([
       { text: "💼", callback_data: "ctx_work" },
       { text: "🏠", callback_data: "ctx_home" },
       { text: "🛒", callback_data: "ctx_errands" },
       { text: "🏋️", callback_data: "ctx_health" },
-      { text: "📚", callback_data: "ctx_learning" },
+      { text: "🔙 Menu", callback_data: "menu_main" },
     ]);
-
-    buttons.push([{ text: "🔙 Menu", callback_data: "menu_main" }]);
 
     await sendTelegramMessage(chatId, text, "Markdown", { inline_keyboard: buttons });
   } catch (e) {
@@ -2258,8 +2245,7 @@ async function handleBudgetMain(chatId: number): Promise<void> {
 
     await sendTelegramMessage(chatId, text, "Markdown", {
       inline_keyboard: [
-        [{ text: "📊 Analyse", callback_data: "budget_analyse" }, { text: "📈 Tendances", callback_data: "budget_trends" }],
-        [{ text: "➕ Dépense", callback_data: "budget_add_expense" }, { text: "➕ Revenu", callback_data: "budget_add_income" }],
+        [{ text: "📊 Analyse IA", callback_data: "budget_analyse" }, { text: "➕ Dépense", callback_data: "budget_add_expense" }],
         [{ text: "🔙 Menu", callback_data: "menu_main" }],
       ],
     });
@@ -2314,8 +2300,8 @@ async function handleBudgetAnalyse(chatId: number): Promise<void> {
 
     await sendTelegramMessage(chatId, text, "Markdown", {
       inline_keyboard: [
-        [{ text: "📈 Tendances", callback_data: "budget_trends" }],
-        [{ text: "💰 Budget", callback_data: "menu_budget" }, { text: "🔙 Menu", callback_data: "menu_main" }],
+        [{ text: "📈 vs mois dernier", callback_data: "budget_trends" }, { text: "💰 Budget", callback_data: "menu_budget" }],
+        [{ text: "🔙 Menu", callback_data: "menu_main" }],
       ],
     });
   } catch (e) {
@@ -2430,8 +2416,7 @@ async function handleHealthMain(chatId: number): Promise<void> {
 
     await sendTelegramMessage(chatId, text, "Markdown", {
       inline_keyboard: [
-        [{ text: "🍽 Repas", callback_data: "health_meals" }, { text: "💪 Workout", callback_data: "health_workout" }],
-        [{ text: "📋 Programme", callback_data: "health_program" }],
+        [{ text: "💪 Workout", callback_data: "health_workout" }, { text: "🍽 Repas", callback_data: "health_meals" }],
         [{ text: "🔙 Menu", callback_data: "menu_main" }],
       ],
     });
@@ -2511,28 +2496,17 @@ async function handleHealthWorkout(chatId: number): Promise<void> {
       `• Sommeil priorité`,
   };
 
-  const text = EXERCISES[ws.type] || `Workout: ${ws.type}`;
-  await sendTelegramMessage(chatId, text, "Markdown", {
-    inline_keyboard: [[{ text: "🏋️ Santé", callback_data: "menu_health" }, { text: "🔙 Menu", callback_data: "menu_main" }]],
-  });
-}
-
-// --- HEALTH PROGRAM (weekly view) ---
-async function handleHealthProgram(chatId: number): Promise<void> {
+  // Append weekly programme summary
   const dayLabels = ["Dim", "Lun", "Mar", "Mer", "Jeu", "Ven", "Sam"];
-  const now = getIsraelNow();
-  const today = now.getDay();
-
-  let text = `*📋 PROGRAMME SEMAINE*\n\n`;
+  const todayIdx = getIsraelNow().getDay();
+  let fullText = (EXERCISES[ws.type] || `Workout: ${ws.type}`) + `\n\n*📋 SEMAINE:*\n`;
   for (let i = 0; i < 7; i++) {
-    const ws = WORKOUT_SCHEDULE_BOT[i];
-    const marker = i === today ? "👉 " : "   ";
-    const name = ws.type.charAt(0).toUpperCase() + ws.type.slice(1);
-    text += `${marker}${dayLabels[i]}  *${name}*  ${ws.time}\n`;
+    const w = WORKOUT_SCHEDULE_BOT[i];
+    const marker = i === todayIdx ? "👉" : "  ";
+    fullText += `${marker} ${dayLabels[i]} ${w.type.charAt(0).toUpperCase() + w.type.slice(1)} ${w.time}\n`;
   }
-  text += `\nJeûne 16:8 — Fenêtre 12h-20h`;
 
-  await sendTelegramMessage(chatId, text, "Markdown", {
+  await sendTelegramMessage(chatId, fullText, "Markdown", {
     inline_keyboard: [[{ text: "🏋️ Santé", callback_data: "menu_health" }, { text: "🔙 Menu", callback_data: "menu_main" }]],
   });
 }
@@ -2616,9 +2590,8 @@ async function handleMorningBriefing(chatId: number): Promise<void> {
 
     await sendTelegramMessage(chatId, text, "Markdown", {
       inline_keyboard: [
-        [{ text: "💪 Mon Sport", callback_data: "morning_sport" }, { text: "🍽 Ma Nutrition", callback_data: "morning_nutrition" }],
-        [{ text: "📋 Toutes mes tâches", callback_data: "menu_tasks" }, { text: "💼 Offres", callback_data: "menu_jobs" }],
-        [{ text: "📌 Menu complet", callback_data: "menu_main" }],
+        [{ text: "💪 Workout", callback_data: "health_workout" }, { text: "📋 Tasks", callback_data: "menu_tasks" }],
+        [{ text: "🔙 Menu", callback_data: "menu_main" }],
       ],
     });
   } catch (e) {
@@ -2760,22 +2733,25 @@ async function handleMorningNutrition(chatId: number): Promise<void> {
 async function handleCareerMain(chatId: number): Promise<void> {
   const supabase = getSupabaseClient();
   try {
-    const { data: jobs } = await supabase.from("job_listings").select("status")
-      .in("status", ["new", "saved", "applied", "interviewed", "offer", "rejected"])
-      .limit(500);
-    const all = jobs || [];
+    const fiveDaysAgo = new Date(Date.now() - 5 * 86400000).toISOString().split("T")[0];
+    const [jobsRes, goalRes, staleRes] = await Promise.all([
+      supabase.from("job_listings").select("status")
+        .in("status", ["new", "saved", "applied", "interviewed", "offer", "rejected"]).limit(500),
+      supabase.from("goals").select("deadline")
+        .eq("domain", "career").eq("status", "active").limit(1),
+      supabase.from("job_listings").select("title, company")
+        .eq("status", "applied").lte("applied_date", fiveDaysAgo).limit(3),
+    ]);
+    const all = jobsRes.data || [];
+    const stale = staleRes.data || [];
 
     const newCount = all.filter((j: any) => j.status === "new" || j.status === "saved").length;
     const applied = all.filter((j: any) => j.status === "applied").length;
     const interviews = all.filter((j: any) => j.status === "interviewed").length;
     const offers = all.filter((j: any) => j.status === "offer").length;
 
-    // Deadline from goals
-    const { data: careerGoal } = await supabase.from("goals").select("deadline")
-      .eq("domain", "career").eq("status", "active").limit(1);
-    const deadline = careerGoal?.[0]?.deadline;
+    const deadline = goalRes.data?.[0]?.deadline;
     const daysLeft = deadline ? Math.ceil((new Date(deadline).getTime() - Date.now()) / 86400000) : null;
-
     const urgency = interviews === 0 && daysLeft !== null && daysLeft < 120 ? "🔴" : interviews > 0 ? "🟢" : "🟡";
 
     let text = `💼 *CARRIÈRE*\n\n`;
@@ -2785,13 +2761,17 @@ async function handleCareerMain(chatId: number): Promise<void> {
     text += `  🎯 ${interviews} interviews · ✅ ${offers} offres\n`;
 
     if (interviews === 0 && daysLeft !== null && daysLeft < 120) {
-      text += `\n⚠️ *0 interviews planifiées — action requise*`;
+      text += `\n⚠️ *0 interviews — action requise*`;
+    }
+
+    if (stale.length > 0) {
+      text += `\n\n*📞 À relancer (>5j):*\n`;
+      stale.forEach((j: any) => { text += `  ${j.title} @ ${j.company}\n`; });
     }
 
     await sendTelegramMessage(chatId, text, "Markdown", {
       inline_keyboard: [
-        [{ text: "📋 Offres détail", callback_data: "career_pipeline" }, { text: "📅 Actions", callback_data: "career_actions" }],
-        [{ text: "➕ Ajouter offre", callback_data: "career_add_job" }],
+        [{ text: "📋 Pipeline", callback_data: "career_pipeline" }, { text: "➕ Offre", callback_data: "career_add_job" }],
         [{ text: "🔙 Menu", callback_data: "menu_main" }],
       ],
     });
@@ -2951,20 +2931,13 @@ async function handleCallbackQuery(callbackId: string, chatId: number, data: str
   }
   // === DASHBOARD SUB-MENU (Insights + Goals + Vélocité) ===
   else if (data === "menu_dashboard") {
-    await sendTelegramMessage(chatId, "📊 *DASHBOARD*", "Markdown", {
-      inline_keyboard: [
-        [{ text: "🧠 Insights", callback_data: "menu_insights" }, { text: "🎯 Goals", callback_data: "menu_goals" }],
-        [{ text: "📊 Vélocité", callback_data: "menu_velocity" }, { text: "🌙 Plan demain", callback_data: "menu_tomorrow" }],
-        [{ text: "🔙 Menu", callback_data: "menu_main" }],
-      ],
-    });
+    await handleDashboard(chatId);
   }
   // === EOS SUB-MENU (Rocks + Scorecard + CIRs) ===
   else if (data === "menu_eos") {
     await sendTelegramMessage(chatId, "🎯 *EOS — Chief of Staff*", "Markdown", {
       inline_keyboard: [
-        [{ text: "🪨 Rocks", callback_data: "menu_rocks" }, { text: "📊 Scorecard", callback_data: "menu_scorecard" }],
-        [{ text: "🚨 CIRs", callback_data: "menu_cirs" }],
+        [{ text: "🪨 Rocks", callback_data: "menu_rocks" }, { text: "📊 Scorecard", callback_data: "menu_scorecard" }, { text: "🚨 CIRs", callback_data: "menu_cirs" }],
         [{ text: "🔙 Menu", callback_data: "menu_main" }],
       ],
     });
@@ -4185,16 +4158,15 @@ async function handleTradingMain(chatId: number): Promise<void> {
       text += `Aucune analyse récente (24h)\n`;
     }
 
-    // At night: show read-only menu (no fresh analysis button)
+    // Simplified trading buttons
     const tradingButtons = isNight
       ? [
-          [{ text: "📊 Dernière analyse", callback_data: "trading_last" }, { text: "📋 Plans semaine", callback_data: "trading_plans" }],
-          [{ text: "📈 Stats 7j", callback_data: "trading_stats" }, { text: "🔙 Menu", callback_data: "menu_main" }],
+          [{ text: "📊 Détails", callback_data: "trading_last" }, { text: "📈 Stats", callback_data: "trading_stats" }],
+          [{ text: "🔙 Menu", callback_data: "menu_main" }],
         ]
       : [
-          [{ text: "📊 Dernière analyse", callback_data: "trading_last" }, { text: "🔄 Analyse fraîche", callback_data: "trading_fresh" }],
-          [{ text: "📋 Plans semaine", callback_data: "trading_plans" }, { text: "📈 Stats 7j", callback_data: "trading_stats" }],
-          [{ text: "⚙️ Gérer pairs", callback_data: "trading_pairs" }, { text: "🔙 Menu", callback_data: "menu_main" }],
+          [{ text: "📊 Détails", callback_data: "trading_last" }, { text: "🔄 Analyser", callback_data: "trading_fresh" }],
+          [{ text: "📈 Stats", callback_data: "trading_stats" }, { text: "🔙 Menu", callback_data: "menu_main" }],
         ];
 
     await sendTelegramMessage(chatId, text, "Markdown", { inline_keyboard: tradingButtons });
@@ -5227,9 +5199,8 @@ async function handleDashboard(chatId: number): Promise<void> {
 
     await sendTelegramMessage(chatId, msg, "Markdown", {
       inline_keyboard: [
-        [{ text: "💼 Carrière", callback_data: "menu_jobs" }, { text: "🚀 HiGrow", callback_data: "menu_leads" }, { text: "💰 Budget", callback_data: "menu_budget" }],
-        [{ text: "📋 Tasks", callback_data: "menu_tasks" }, { text: "🏋️ Santé", callback_data: "menu_health" }, { text: "🎯 Goals", callback_data: "menu_goals" }],
-        [{ text: "🔄 Rafraîchir", callback_data: "dashboard" }, { text: "📌 Menu", callback_data: "menu_main" }],
+        [{ text: "🧠 Insights", callback_data: "menu_insights" }, { text: "🎯 Goals", callback_data: "menu_goals" }, { text: "📊 Vélocité", callback_data: "menu_velocity" }],
+        [{ text: "🔄 Rafraîchir", callback_data: "dashboard" }, { text: "🔙 Menu", callback_data: "menu_main" }],
       ],
     });
   } catch (e) {
@@ -5330,8 +5301,8 @@ async function handleInsights(chatId: number): Promise<void> {
     const line4 = `🚀 HiGrow: ${higrowEmoji} ${converted}/${target} clients · ${daysRemaining}j restants · proj: ${velocity}`;
 
     const text = `🧠 *INSIGHTS*\n\n${line1}\n${line2}\n${line3}\n${line4}`;
-    await sendTelegramMessage(chatId, text, {
-      inline_keyboard: [[{ text: "🔙 Menu", callback_data: "start" }]],
+    await sendTelegramMessage(chatId, text, "Markdown", {
+      inline_keyboard: [[{ text: "📊 Dashboard", callback_data: "menu_dashboard" }, { text: "🔙 Menu", callback_data: "menu_main" }]],
     });
   } catch (e) {
     console.error("Insights error:", e);
