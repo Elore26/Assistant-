@@ -152,11 +152,9 @@ async function answerCallbackQuery(callbackId: string, text?: string): Promise<v
 const MAIN_MENU: InlineKeyboardMarkup = {
   inline_keyboard: [
     [{ text: "☀️ Briefing", callback_data: "morning_briefing" }, { text: "📋 Tasks", callback_data: "menu_tasks" }, { text: "💰 Budget", callback_data: "menu_budget" }],
-    [{ text: "🏋️ Santé", callback_data: "menu_health" }, { text: "💼 Carrière", callback_data: "menu_jobs" }, { text: "🚀 HiGrow", callback_data: "menu_leads" }],
-    [{ text: "📈 Trading", callback_data: "menu_signals" }, { text: "🧠 Insights", callback_data: "menu_insights" }, { text: "🎯 Goals", callback_data: "menu_goals" }],
-    [{ text: "🌙 Plan demain", callback_data: "menu_tomorrow" }, { text: "🍅 Pomodoro", callback_data: "menu_pomodoro" }, { text: "📊 Vélocité", callback_data: "menu_velocity" }],
-    [{ text: "🪨 Rocks", callback_data: "menu_rocks" }, { text: "📊 Scorecard", callback_data: "menu_scorecard" }, { text: "🚨 CIRs", callback_data: "menu_cirs" }],
-    [{ text: "❓ Tuto — Guide complet", callback_data: "tuto_main" }],
+    [{ text: "💼 Carrière", callback_data: "menu_jobs" }, { text: "🚀 HiGrow", callback_data: "menu_leads" }, { text: "🏋️ Santé", callback_data: "menu_health" }],
+    [{ text: "📈 Trading", callback_data: "menu_signals" }, { text: "📊 Dashboard", callback_data: "menu_dashboard" }, { text: "🎯 EOS", callback_data: "menu_eos" }],
+    [{ text: "❓ Tuto", callback_data: "tuto_main" }],
   ],
 };
 
@@ -2155,6 +2153,7 @@ async function handleTasksMainV2(chatId: number): Promise<void> {
     buttons.push([
       { text: "🔄 Récurrentes", callback_data: "menu_recurring" },
       { text: "🎯 Sprint", callback_data: "menu_sprint" },
+      { text: "🌙 Demain", callback_data: "menu_tomorrow" },
     ]);
 
     // Context filter buttons
@@ -2948,6 +2947,26 @@ async function handleCallbackQuery(callbackId: string, chatId: number, data: str
     await handleInsights(chatId);
   } else if (data === "menu_goals") {
     await handleGoals(chatId);
+  }
+  // === DASHBOARD SUB-MENU (Insights + Goals + Vélocité) ===
+  else if (data === "menu_dashboard") {
+    await sendTelegramMessage(chatId, "📊 *DASHBOARD*", "Markdown", {
+      inline_keyboard: [
+        [{ text: "🧠 Insights", callback_data: "menu_insights" }, { text: "🎯 Goals", callback_data: "menu_goals" }],
+        [{ text: "📊 Vélocité", callback_data: "menu_velocity" }, { text: "🌙 Plan demain", callback_data: "menu_tomorrow" }],
+        [{ text: "🔙 Menu", callback_data: "menu_main" }],
+      ],
+    });
+  }
+  // === EOS SUB-MENU (Rocks + Scorecard + CIRs) ===
+  else if (data === "menu_eos") {
+    await sendTelegramMessage(chatId, "🎯 *EOS — Chief of Staff*", "Markdown", {
+      inline_keyboard: [
+        [{ text: "🪨 Rocks", callback_data: "menu_rocks" }, { text: "📊 Scorecard", callback_data: "menu_scorecard" }],
+        [{ text: "🚨 CIRs", callback_data: "menu_cirs" }],
+        [{ text: "🔙 Menu", callback_data: "menu_main" }],
+      ],
+    });
   }
   // === TASKS SUB-MENU ===
   else if (data === "tasks_completed") {

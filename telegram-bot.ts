@@ -152,10 +152,9 @@ async function answerCallbackQuery(callbackId: string, text?: string): Promise<v
 const MAIN_MENU: InlineKeyboardMarkup = {
   inline_keyboard: [
     [{ text: "☀️ Briefing", callback_data: "morning_briefing" }, { text: "📋 Tasks", callback_data: "menu_tasks" }, { text: "💰 Budget", callback_data: "menu_budget" }],
-    [{ text: "🏋️ Santé", callback_data: "menu_health" }, { text: "💼 Carrière", callback_data: "menu_jobs" }, { text: "🚀 HiGrow", callback_data: "menu_leads" }],
-    [{ text: "📈 Trading", callback_data: "menu_signals" }, { text: "🧠 Insights", callback_data: "menu_insights" }, { text: "🎯 Goals", callback_data: "menu_goals" }],
-    [{ text: "🌙 Plan demain", callback_data: "menu_tomorrow" }, { text: "🍅 Pomodoro", callback_data: "menu_pomodoro" }, { text: "📊 Vélocité", callback_data: "menu_velocity" }],
-    [{ text: "❓ Tuto — Guide complet", callback_data: "tuto_main" }],
+    [{ text: "💼 Carrière", callback_data: "menu_jobs" }, { text: "🚀 HiGrow", callback_data: "menu_leads" }, { text: "🏋️ Santé", callback_data: "menu_health" }],
+    [{ text: "📈 Trading", callback_data: "menu_signals" }, { text: "📊 Dashboard", callback_data: "menu_dashboard" }, { text: "🎯 EOS", callback_data: "menu_eos" }],
+    [{ text: "❓ Tuto", callback_data: "tuto_main" }],
   ],
 };
 
@@ -452,7 +451,8 @@ async function handleTaskList(chatId: number): Promise<void> {
       .from("tasks")
       .select("*")
       .in("status", ["pending", "in_progress"])
-      .order("priority", { ascending: true });
+      .order("priority", { ascending: true })
+      .limit(50);
 
     if (error) throw error;
 
@@ -515,7 +515,8 @@ async function handleTaskDone(chatId: number, args: string[]): Promise<void> {
       .from("tasks")
       .select("id, title")
       .in("status", ["pending", "in_progress"])
-      .order("created_at", { ascending: true });
+      .order("created_at", { ascending: true })
+      .limit(50);
 
     if (selectError) throw selectError;
     if (!data || num > data.length) {
@@ -849,7 +850,8 @@ async function handleLead(chatId: number, args: string[]): Promise<void> {
       const { data, error } = await supabase
         .from("leads")
         .select("*")
-        .order("created_at", { ascending: false });
+        .order("created_at", { ascending: false })
+        .limit(50);
 
       if (error) throw error;
 
@@ -1803,7 +1805,8 @@ async function handleTimeBlock(chatId: number): Promise<void> {
     const { data: tasks } = await supabase.from("tasks")
       .select("id, title, priority, duration_minutes, energy_level, due_time, context")
       .eq("due_date", today).in("status", ["pending", "in_progress"])
-      .order("priority", { ascending: true });
+      .order("priority", { ascending: true })
+      .limit(20);
 
     const unscheduled = (tasks || []).filter((t: any) => !t.due_time);
     const scheduled = (tasks || []).filter((t: any) => t.due_time);
@@ -2150,6 +2153,7 @@ async function handleTasksMainV2(chatId: number): Promise<void> {
     buttons.push([
       { text: "🔄 Récurrentes", callback_data: "menu_recurring" },
       { text: "🎯 Sprint", callback_data: "menu_sprint" },
+      { text: "🌙 Demain", callback_data: "menu_tomorrow" },
     ]);
 
     // Context filter buttons
@@ -2756,7 +2760,8 @@ async function handleCareerMain(chatId: number): Promise<void> {
   const supabase = getSupabaseClient();
   try {
     const { data: jobs } = await supabase.from("job_listings").select("status")
-      .in("status", ["new", "saved", "applied", "interviewed", "offer", "rejected"]);
+      .in("status", ["new", "saved", "applied", "interviewed", "offer", "rejected"])
+      .limit(500);
     const all = jobs || [];
 
     const newCount = all.filter((j: any) => j.status === "new" || j.status === "saved").length;
@@ -2942,6 +2947,26 @@ async function handleCallbackQuery(callbackId: string, chatId: number, data: str
     await handleInsights(chatId);
   } else if (data === "menu_goals") {
     await handleGoals(chatId);
+  }
+  // === DASHBOARD SUB-MENU (Insights + Goals + Vélocité) ===
+  else if (data === "menu_dashboard") {
+    await sendTelegramMessage(chatId, "📊 *DASHBOARD*", "Markdown", {
+      inline_keyboard: [
+        [{ text: "🧠 Insights", callback_data: "menu_insights" }, { text: "🎯 Goals", callback_data: "menu_goals" }],
+        [{ text: "📊 Vélocité", callback_data: "menu_velocity" }, { text: "🌙 Plan demain", callback_data: "menu_tomorrow" }],
+        [{ text: "🔙 Menu", callback_data: "menu_main" }],
+      ],
+    });
+  }
+  // === EOS SUB-MENU (Rocks + Scorecard + CIRs) ===
+  else if (data === "menu_eos") {
+    await sendTelegramMessage(chatId, "🎯 *EOS — Chief of Staff*", "Markdown", {
+      inline_keyboard: [
+        [{ text: "🪨 Rocks", callback_data: "menu_rocks" }, { text: "📊 Scorecard", callback_data: "menu_scorecard" }],
+        [{ text: "🚨 CIRs", callback_data: "menu_cirs" }],
+        [{ text: "🔙 Menu", callback_data: "menu_main" }],
+      ],
+    });
   }
   // === TASKS SUB-MENU ===
   else if (data === "tasks_completed") {
@@ -3698,6 +3723,57 @@ async function handleCallbackQuery(callbackId: string, chatId: number, data: str
       await sendTelegramMessage(chatId, `🔔 *Focus mode désactivé*\nLes notifications reprennent.`, "Markdown");
     } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
   }
+  // === ROCKS CALLBACKS ===
+  else if (data === "menu_rocks") {
+    await handleRock(chatId, []);
+  }
+  else if (data.startsWith("rock_done_")) {
+    const rockId = data.replace("rock_done_", "");
+    try {
+      await supabase.from("rocks").update({
+        current_status: "done", completed_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+      }).eq("id", rockId);
+      await sendTelegramMessage(chatId, `✅ Rock marqué comme *DONE* !`, "Markdown");
+    } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
+  }
+  else if (data.startsWith("rock_off_")) {
+    const rockId = data.replace("rock_off_", "");
+    try {
+      await supabase.from("rocks").update({
+        current_status: "off_track", updated_at: new Date().toISOString(),
+      }).eq("id", rockId);
+      await sendTelegramMessage(chatId, `⚠️ Rock marqué *OFF TRACK*`, "Markdown");
+    } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
+  }
+  else if (data.startsWith("rock_on_")) {
+    const rockId = data.replace("rock_on_", "");
+    try {
+      await supabase.from("rocks").update({
+        current_status: "on_track", updated_at: new Date().toISOString(),
+      }).eq("id", rockId);
+      await sendTelegramMessage(chatId, `✅ Rock marqué *ON TRACK*`, "Markdown");
+    } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
+  }
+  // === SCORECARD CALLBACK ===
+  else if (data === "menu_scorecard") {
+    await handleScorecard(chatId);
+  }
+  // === CIR CALLBACKS ===
+  else if (data === "menu_cirs") {
+    await handleCIR(chatId, []);
+  }
+  else if (data.startsWith("cir_toggle_")) {
+    const cirId = data.replace("cir_toggle_", "");
+    try {
+      const { data: cir } = await supabase.from("critical_info_requirements")
+        .select("active").eq("id", cirId).single();
+      if (cir) {
+        await supabase.from("critical_info_requirements")
+          .update({ active: !cir.active }).eq("id", cirId);
+        await sendTelegramMessage(chatId, cir.active ? `🔕 CIR désactivé` : `🔔 CIR activé`);
+      }
+    } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
+  }
   else if (data.startsWith("focus_extend_")) {
     const extraMin = parseInt(data.replace("focus_extend_", ""), 10) || 30;
     try {
@@ -3725,6 +3801,235 @@ async function handleCallbackQuery(callbackId: string, chatId: number, data: str
   }
 
   await answerCallbackQuery(callbackId);
+}
+
+// ============================================
+// TIER 5 — ROCKS, SCORECARD, CIR HANDLERS
+// ============================================
+
+async function handleRock(chatId: number, args: string[]): Promise<void> {
+  const supabase = getSupabaseClient();
+
+  // /rock add "title" domain
+  if (args[0] === "add" && args.length >= 3) {
+    const domain = args[args.length - 1];
+    const title = args.slice(1, -1).join(" ").replace(/"/g, "");
+    const now = new Date();
+    // Quarter: current 90-day window
+    const quarterStart = new Date(now.getFullYear(), Math.floor(now.getMonth() / 3) * 3, 1);
+    const quarterEnd = new Date(quarterStart.getFullYear(), quarterStart.getMonth() + 3, 0);
+
+    const { error } = await supabase.from("rocks").insert({
+      title,
+      domain,
+      measurable_target: title,
+      quarter_start: quarterStart.toISOString().split("T")[0],
+      quarter_end: quarterEnd.toISOString().split("T")[0],
+    });
+
+    if (error) {
+      await sendTelegramMessage(chatId, `Erreur: ${error.message}`);
+    } else {
+      await sendTelegramMessage(chatId,
+        `🪨 *Rock ajouté !*\n\n${escapeMarkdown(title)}\nDomaine: ${domain}\nTrimestre: ${quarterStart.toISOString().split("T")[0]} → ${quarterEnd.toISOString().split("T")[0]}`,
+        "Markdown");
+    }
+    return;
+  }
+
+  // /rock update <id_prefix> done|off_track|on_track
+  if (args[0] === "update" && args.length >= 3) {
+    const idPrefix = args[1];
+    const newStatus = args[2];
+    if (!["done", "off_track", "on_track"].includes(newStatus)) {
+      await sendTelegramMessage(chatId, "Status: done | off\\_track | on\\_track", "Markdown");
+      return;
+    }
+
+    const { data: rocks } = await supabase.from("rocks")
+      .select("id").in("current_status", ["on_track", "off_track"])
+      .order("created_at", { ascending: false }).limit(10);
+    const rock = (rocks || []).find((r: any) => r.id.startsWith(idPrefix));
+
+    if (!rock) {
+      await sendTelegramMessage(chatId, `Rock introuvable.`);
+      return;
+    }
+
+    await supabase.from("rocks").update({
+      current_status: newStatus,
+      updated_at: new Date().toISOString(),
+      ...(newStatus === "done" ? { completed_at: new Date().toISOString() } : {}),
+    }).eq("id", rock.id);
+
+    const statusEmoji = newStatus === "done" ? "✅" : newStatus === "off_track" ? "⚠️" : "🟢";
+    await sendTelegramMessage(chatId, `${statusEmoji} Rock mis à jour: *${newStatus}*`, "Markdown");
+    return;
+  }
+
+  // Default: /rock list
+  const { data: rocks } = await supabase.from("rocks")
+    .select("*")
+    .in("current_status", ["on_track", "off_track"])
+    .order("created_at", { ascending: true });
+
+  if (!rocks || rocks.length === 0) {
+    await sendTelegramMessage(chatId,
+      `🪨 *ROCKS* — Aucun Rock actif\n\nAjoute un Rock:\n/rock add "Obtenir 3 interviews" career\n\nDomaines: career, health, finance, learning, higrow`,
+      "Markdown");
+    return;
+  }
+
+  const now = new Date();
+  let msg = `🪨 *ROCKS — Q${Math.floor(now.getMonth() / 3) + 1} ${now.getFullYear()}*\n━━━━━━━━━━━━━━━━━━━━\n\n`;
+  const buttons: any[][] = [];
+
+  for (const r of rocks) {
+    const daysLeft = Math.ceil((new Date(r.quarter_end).getTime() - now.getTime()) / 86400000);
+    const statusIcon = r.current_status === "on_track" ? "🟢" : "⚠️";
+    const domainEmoji = { career: "💼", health: "🏋️", finance: "💰", learning: "📚", higrow: "🚀" }[r.domain] || "📌";
+
+    msg += `${statusIcon} ${domainEmoji} *${escapeMarkdown(r.title)}*\n`;
+    msg += `   J-${daysLeft} · ${r.current_status.replace("_", " ")}\n\n`;
+
+    const shortId = r.id.substring(0, 8);
+    buttons.push([
+      { text: `✅ Done ${shortId}`, callback_data: `rock_done_${r.id}` },
+      { text: `⚠️ Off`, callback_data: `rock_off_${r.id}` },
+      { text: `🟢 On`, callback_data: `rock_on_${r.id}` },
+    ]);
+  }
+
+  msg += `\n/rock add "titre" domaine — Ajouter\n/rock update <id> done|off\\_track — Modifier`;
+
+  await sendTelegramMessage(chatId, msg, "Markdown", { inline_keyboard: buttons });
+}
+
+async function handleScorecard(chatId: number): Promise<void> {
+  const supabase = getSupabaseClient();
+
+  // Calculate week dates (Sunday to Saturday)
+  const now = new Date();
+  const dayOfWeek = now.getDay();
+  const weekStartDate = new Date(now);
+  weekStartDate.setDate(now.getDate() - dayOfWeek);
+  const weekEndDate = new Date(weekStartDate);
+  weekEndDate.setDate(weekStartDate.getDate() + 6);
+
+  const weekStart = `${weekStartDate.getFullYear()}-${String(weekStartDate.getMonth() + 1).padStart(2, "0")}-${String(weekStartDate.getDate()).padStart(2, "0")}`;
+  const weekEnd = `${weekEndDate.getFullYear()}-${String(weekEndDate.getMonth() + 1).padStart(2, "0")}-${String(weekEndDate.getDate()).padStart(2, "0")}`;
+
+  // Fetch all data in parallel for scorecard
+  const [
+    jobAppsRes, jobInterviewsRes, leadsRes, leadsConvertedRes,
+    tasksRes, tasksDoneRes, workoutsRes, studyRes,
+    financeExpRes, financeIncRes, healthWeightRes,
+  ] = await Promise.all([
+    supabase.from("job_listings").select("id").eq("status", "applied").gte("applied_date", weekStart).lte("applied_date", weekEnd),
+    supabase.from("job_listings").select("id").eq("status", "interview"),
+    supabase.from("leads").select("id").gte("last_contact_date", weekStart + "T00:00:00").lte("last_contact_date", weekEnd + "T23:59:59"),
+    supabase.from("leads").select("id").eq("status", "converted"),
+    supabase.from("tasks").select("id, status").gte("due_date", weekStart).lte("due_date", weekEnd),
+    supabase.from("tasks").select("id").eq("status", "completed").gte("updated_at", weekStart + "T00:00:00"),
+    supabase.from("health_logs").select("log_date").eq("log_type", "workout").gte("log_date", weekStart).lte("log_date", weekEnd),
+    supabase.from("study_sessions").select("duration_minutes").gte("session_date", weekStart).lte("session_date", weekEnd),
+    supabase.from("finance_logs").select("amount").eq("transaction_type", "expense").gte("transaction_date", weekStart).lte("transaction_date", weekEnd),
+    supabase.from("finance_logs").select("amount").eq("transaction_type", "income").gte("transaction_date", weekStart).lte("transaction_date", weekEnd),
+    supabase.from("health_logs").select("value").eq("log_type", "weight").order("log_date", { ascending: false }).limit(1),
+  ]);
+
+  const jobApps = jobAppsRes.data?.length || 0;
+  const jobInterviews = jobInterviewsRes.data?.length || 0;
+  const leadsContacted = leadsRes.data?.length || 0;
+  const leadsConverted = leadsConvertedRes.data?.length || 0;
+  const totalTasks = Math.max((tasksRes.data || []).length, 1);
+  const tasksDone = tasksDoneRes.data?.length || 0;
+  const completionRate = Math.round((tasksDone / totalTasks) * 100);
+  const workoutDays = new Set((workoutsRes.data || []).map((w: any) => w.log_date)).size;
+  const studyHours = ((studyRes.data || []).reduce((s: number, l: any) => s + (l.duration_minutes || 0), 0) / 60);
+  const totalExp = (financeExpRes.data || []).reduce((s: number, f: any) => s + Number(f.amount), 0);
+  const totalInc = (financeIncRes.data || []).reduce((s: number, f: any) => s + Number(f.amount), 0);
+  const savingsRate = totalInc > 0 ? Math.round(((totalInc - totalExp) / totalInc) * 100) : 0;
+  const latestWeight = healthWeightRes.data?.[0]?.value ? Number(healthWeightRes.data[0].value) : null;
+
+  function sc(actual: number, goal: number, dir: "up" | "down" = "up"): string {
+    if (dir === "down") return actual <= goal ? "🟢" : actual <= goal * 1.2 ? "🟡" : "🔴";
+    return actual >= goal ? "🟢" : actual >= goal * 0.7 ? "🟡" : "🔴";
+  }
+
+  let msg = `📊 *SCORECARD* — Semaine du ${weekStart.substring(5)}\n━━━━━━━━━━━━━━━━━━━━\n\n`;
+  msg += `💼 Candidatures     ${jobApps}     /5    ${sc(jobApps, 5)}\n`;
+  msg += `💼 Interviews       ${jobInterviews}     /1    ${sc(jobInterviews, 1)}\n`;
+  msg += `🚀 Leads contactés  ${leadsContacted}    /10   ${sc(leadsContacted, 10)}\n`;
+  msg += `🚀 Clients          ${leadsConverted}     /2    ${sc(leadsConverted, 2)}\n`;
+  msg += `📋 Complétion       ${completionRate}%   /80%  ${sc(completionRate, 80)}\n`;
+  msg += `🏋️ Workouts         ${workoutDays}     /5    ${sc(workoutDays, 5)}\n`;
+  msg += `📚 Étude            ${studyHours.toFixed(1)}h  /5h   ${sc(studyHours, 5)}\n`;
+  msg += `💰 Épargne          ${savingsRate}%   /20%  ${sc(savingsRate, 20)}\n`;
+  msg += `⚖️ Poids            ${latestWeight || "?"}   /70   ${latestWeight ? sc(latestWeight, 70, "down") : "🟡"}\n`;
+
+  const greens = [
+    sc(jobApps, 5), sc(jobInterviews, 1), sc(leadsContacted, 10), sc(leadsConverted, 2),
+    sc(completionRate, 80), sc(workoutDays, 5), sc(studyHours, 5), sc(savingsRate, 20),
+  ].filter(s => s === "🟢").length;
+  const reds = [
+    sc(jobApps, 5), sc(jobInterviews, 1), sc(leadsContacted, 10), sc(leadsConverted, 2),
+    sc(completionRate, 80), sc(workoutDays, 5), sc(studyHours, 5), sc(savingsRate, 20),
+  ].filter(s => s === "🔴").length;
+
+  msg += `\n${greens}/9 on track · ${reds} off track`;
+
+  await sendTelegramMessage(chatId, msg, "Markdown");
+}
+
+async function handleCIR(chatId: number, args: string[]): Promise<void> {
+  const supabase = getSupabaseClient();
+
+  // /cir add "title" condition_type
+  if (args[0] === "add" && args.length >= 3) {
+    const condType = args[args.length - 1];
+    const title = args.slice(1, -1).join(" ").replace(/"/g, "");
+
+    const { error } = await supabase.from("critical_info_requirements").insert({
+      title,
+      condition_type: condType,
+      condition_config: {},
+      alert_priority: 1,
+    });
+
+    if (error) {
+      await sendTelegramMessage(chatId, `Erreur: ${error.message}`);
+    } else {
+      await sendTelegramMessage(chatId, `🚨 CIR ajouté: *${escapeMarkdown(title)}*`, "Markdown");
+    }
+    return;
+  }
+
+  // Default: list CIRs
+  const { data: cirs } = await supabase.from("critical_info_requirements")
+    .select("*").order("alert_priority", { ascending: true });
+
+  if (!cirs || cirs.length === 0) {
+    await sendTelegramMessage(chatId, `🚨 *CIRs* — Aucun configuré\n\nLes CIRs définissent quelles alertes passent en temps réel.`, "Markdown");
+    return;
+  }
+
+  let msg = `🚨 *CRITICAL INFORMATION REQUIREMENTS*\n━━━━━━━━━━━━━━━━━━━━\n\n`;
+  const buttons: any[][] = [];
+
+  for (const cir of cirs) {
+    const activeIcon = cir.active ? "🔔" : "🔕";
+    const prioIcon = cir.alert_priority === 1 ? "🔴 Immédiat" : "🟡 Briefing";
+    msg += `${activeIcon} *${escapeMarkdown(cir.title)}*\n`;
+    msg += `   ${prioIcon} · ${cir.condition_type}\n\n`;
+
+    buttons.push([
+      { text: `${cir.active ? "🔕 Désactiver" : "🔔 Activer"} ${cir.title.substring(0, 20)}`, callback_data: `cir_toggle_${cir.id}` },
+    ]);
+  }
+
+  msg += `\nClique pour activer/désactiver.`;
+  await sendTelegramMessage(chatId, msg, "Markdown", { inline_keyboard: buttons });
 }
 
 // --- Job URL Manual Capture ---
@@ -6376,6 +6681,12 @@ serve(async (req: Request) => {
       } else {
         await sendTelegramMessage(chatId, `Contextes: ${TASK_CONTEXTS.map(c => `${CONTEXT_EMOJI[c]} ${c}`).join(', ')}\nEx: /ctx work`);
       }
+    } else if (command === "/rock" || command === "/rocks") {
+      await handleRock(chatId, args);
+    } else if (command === "/scorecard" || command === "/sc") {
+      await handleScorecard(chatId);
+    } else if (command === "/cir" || command === "/cirs") {
+      await handleCIR(chatId, args);
     } else if (command === "/tuto" || command === "/tutorial" || command === "/guide") {
       const page = TUTO_PAGES["tuto_main"];
       await sendTelegramMessage(chatId, page.text, "HTML", page.buttons);
