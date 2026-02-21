@@ -337,6 +337,107 @@ serve(async (_req: Request) => {
       } catch (prevErr) { console.error("[Preview] Error:", prevErr); }
     }
 
+    // ─── 3d. CIR-BASED ALERTS (Critical Information Requirements) ──
+    // Check CIRs once per hour (at minute 0-14)
+    if (!focusActive && dow !== 6 && hour >= 8 && hour <= 21 && now.getMinutes() < 15) {
+      try {
+        // Dedup: only check CIRs once per hour
+        const { data: cirNudge } = await supabase.from("agent_executions")
+          .select("id").eq("agent_name", "task-reminder-cir")
+          .gte("executed_at", new Date(now.getTime() - 60 * 60 * 1000).toISOString())
+          .limit(1);
+
+        if (!cirNudge || cirNudge.length === 0) {
+          const { data: activeCIRs } = await supabase.from("critical_info_requirements")
+            .select("*").eq("active", true).eq("alert_priority", 1);
+
+          for (const cir of activeCIRs || []) {
+            let triggered = false;
+            let alertMsg = "";
+
+            if (cir.condition_type === "job_status_change" && cir.condition_config?.value === "interview") {
+              // Check if any job moved to interview status today
+              const { data: newInterviews } = await supabase.from("job_listings")
+                .select("company, title")
+                .eq("status", "interview")
+                .gte("updated_at", today + "T00:00:00")
+                .limit(3);
+              if (newInterviews && newInterviews.length > 0) {
+                triggered = true;
+                alertMsg = `🔴 <b>CIR: ${escHTML(cir.title)}</b>\n\n`;
+                for (const job of newInterviews) {
+                  alertMsg += `→ ${escHTML(job.company)} — ${escHTML(job.title)}\n`;
+                }
+                alertMsg += `\nPrépare-toi immédiatement !`;
+              }
+            }
+
+            if (triggered && alertMsg) {
+              await sendTG(alertMsg, {
+                buttons: [[
+                  { text: "📋 Voir pipeline", callback_data: "menu_jobs" },
+                  { text: "🪨 Rocks", callback_data: "menu_rocks" },
+                ]],
+              });
+              reminderCount++;
+            }
+          }
+
+          // Log execution for dedup
+          await supabase.from("agent_executions").insert({
+            agent_name: "task-reminder-cir",
+            executed_at: new Date().toISOString(),
+            result_summary: `CIR check done`,
+          });
+        }
+      } catch (cirErr) { console.error("[CIR] Error:", cirErr); }
+    }
+
+    // ─── 3e. ROCK DEADLINE ANTICIPATORY ALERTS ───────────────────
+    // Once daily at 10:00 — check if any Rock deadline < 14 days
+    if (!focusActive && dow !== 6 && hour === 10 && now.getMinutes() < 15) {
+      try {
+        const { data: rockAlert } = await supabase.from("agent_executions")
+          .select("id").eq("agent_name", "task-reminder-rock")
+          .gte("executed_at", today + "T00:00:00").limit(1);
+
+        if (!rockAlert || rockAlert.length === 0) {
+          const { data: urgentRocks } = await supabase.from("rocks")
+            .select("title, domain, quarter_end, current_status")
+            .in("current_status", ["on_track", "off_track"]);
+
+          const warnings: string[] = [];
+          for (const rock of urgentRocks || []) {
+            const daysLeft = Math.ceil((new Date(rock.quarter_end).getTime() - now.getTime()) / 86400000);
+            if (daysLeft <= 14 && daysLeft > 0) {
+              const emoji = rock.current_status === "off_track" ? "🔴" : "🟡";
+              warnings.push(`${emoji} ${escHTML(rock.title)} — J-${daysLeft} (${rock.current_status.replace("_", " ")})`);
+            }
+          }
+
+          if (warnings.length > 0) {
+            let rockMsg = `<b>🪨 ROCK DEADLINE ALERT</b>\n━━━━━━━━━━━━━━━━━━━━\n\n`;
+            rockMsg += warnings.join("\n");
+            rockMsg += `\n\nConcentre-toi sur ces priorités.`;
+
+            await sendTG(rockMsg, {
+              buttons: [[
+                { text: "🪨 Voir Rocks", callback_data: "menu_rocks" },
+                { text: "📊 Scorecard", callback_data: "menu_scorecard" },
+              ]],
+            });
+            reminderCount++;
+          }
+
+          await supabase.from("agent_executions").insert({
+            agent_name: "task-reminder-rock",
+            executed_at: new Date().toISOString(),
+            result_summary: `Rock check: ${warnings.length} alerts`,
+          });
+        }
+      } catch (rockErr) { console.error("[Rock alert] Error:", rockErr); }
+    }
+
     // ─── 4. RECURRING TASKS SPAWNER ──────────────────────────────
     // Check recurring tasks for tomorrow that don't have occurrences yet
     if (hour === 21 && now.getMinutes() < 15) {

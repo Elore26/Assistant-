@@ -92,7 +92,7 @@ serve(async (_req: Request) => {
       healthRes, health7dRes, learningRes, learning7dRes,
       signalsRes, leadsRes, leads7dRes, goalsRes,
       weekTasksRes, careerApps7dRes, careerRejectionsRes, careerAllPipelineRes,
-      failReasonsRes
+      failReasonsRes, rocksRes,
     ] = await Promise.all([
       // Today's completed tasks
       supabase.from("tasks").select("title, status, updated_at, agent_type")
@@ -146,6 +146,9 @@ serve(async (_req: Request) => {
       // Fail reason patterns (last 14 days)
       supabase.from("task_fail_reasons").select("reason, task_date")
         .gte("task_date", weekAgoStr),
+      // Active rocks (Tier 5)
+      supabase.from("rocks").select("title, domain, current_status, quarter_end, measurable_target")
+        .in("current_status", ["on_track", "off_track"]),
     ]);
 
     // Extract data
@@ -665,6 +668,22 @@ serve(async (_req: Request) => {
     }
 
     // ============================================
+    // ROCKS — 90-DAY PRIORITIES (Tier 5)
+    // ============================================
+    const rocks = rocksRes.data || [];
+    if (rocks.length > 0) {
+      msg += `${LINE}\n<b>🪨 ROCKS</b>\n\n`;
+      for (const rock of rocks) {
+        const daysLeft = Math.ceil((new Date(rock.quarter_end).getTime() - now.getTime()) / 86400000);
+        const statusIcon = rock.current_status === "on_track" ? "✅" : "⚠️";
+        const emoji = DOMAIN_EMOJIS[rock.domain] || "📌";
+        msg += `${statusIcon} ${emoji} ${escHTML(rock.title)} — J-${daysLeft}\n`;
+      }
+      const onTrack = rocks.filter((r: any) => r.current_status === "on_track").length;
+      msg += `\n${onTrack}/${rocks.length} on track\n\n`;
+    }
+
+    // ============================================
     // OBJECTIFS — TOP 3 PRIORITAIRES
     // ============================================
     if (goalPredictions.length > 0) {
@@ -816,12 +835,21 @@ serve(async (_req: Request) => {
 
       const streaksContext = `Workout streak: ${workoutStreak}j, Study streak: ${studyStreak}j`;
 
+      // Rocks context for AI
+      const rocksContext = rocks.length > 0
+        ? rocks.map((r: any) => {
+            const daysLeft = Math.ceil((new Date(r.quarter_end).getTime() - now.getTime()) / 86400000);
+            return `${r.domain}: "${r.title}" (${r.current_status}, J-${daysLeft})`;
+          }).join(", ")
+        : "aucun Rock défini";
+
       const aiContext = `BILAN DU JOUR (${dayName}):
 - Score: ${score}/${maxScore} (${scorePct}%)
 - Tâches: ${tasksDoneToday} complétées (moy 7j: ${tasksWeekAvg.toFixed(1)}/jour), ${tasksPending} en attente
 - Tâches non faites: ${failedTasks.slice(0, 3).map((t: any) => t.title).join(", ") || "aucune"}
 - Taux de complétion: ${completionRate}%
 - Pattern jour: ${dayPattern || "pas assez de données"}
+- 🪨 ROCKS: ${rocksContext}
 - Career vélocité: ${appVelocity7d.toFixed(1)} apps/jour (7j), ${careerRejections.length} rejets en 14j${avgRejectionDays ? ` (délai moyen ${avgRejectionDays}j)` : ""}
 - Dépenses: ${totalExpenses.toFixed(0)}₪ (moy 7j: ${avgExpDaily.toFixed(0)}₪/jour), Épargne: ${savingsRate7d}%
 - Workout: ${workouts.length > 0 ? workouts.map((w: any) => w.workout_type).join(", ") : "aucun"} (${workoutsThisWeek}/5 cette semaine)

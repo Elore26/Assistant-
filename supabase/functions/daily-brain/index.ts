@@ -56,6 +56,7 @@ serve(async (_req: Request) => {
     const [
       yesterdayScoreRes, goalsRes, pipelineRes, leadsRes,
       pendingTasksRes, financeRes, careerVelocityRes, rejectionsRes,
+      rocksRes, staleAppsRes, failPatternsRes,
     ] = await Promise.all([
       // Yesterday's evening review score
       supabase.from("briefings").select("content")
@@ -83,6 +84,16 @@ serve(async (_req: Request) => {
       supabase.from("job_listings").select("company, title")
         .eq("status", "rejected")
         .gte("updated_at", new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString()),
+      // Active rocks (Tier 5)
+      supabase.from("rocks").select("title, domain, measurable_target, current_status, quarter_end")
+        .in("current_status", ["on_track", "off_track"]),
+      // Stale applications (>5 days, no follow-up) for anticipatory nudges
+      supabase.from("job_listings").select("id, company, title, applied_date")
+        .eq("status", "applied")
+        .lte("applied_date", daysAgo(5)),
+      // Fail patterns by day of week (last 30 days)
+      supabase.from("task_fail_reasons").select("reason, task_date")
+        .gte("task_date", daysAgo(30)),
     ]);
 
     // ─── Build context string ────────────────────────────────────
@@ -154,9 +165,53 @@ serve(async (_req: Request) => {
       signalsContext += `Alertes critiques: ${overnightSignals.critical.map(s => s.message).join("; ")}\n`;
     }
 
+    // ─── Rocks context (Tier 5) ──────────────────────────────────
+    const rocks = rocksRes.data || [];
+    let rocksContext = "";
+    const rocksOffTrack: string[] = [];
+    for (const rock of rocks) {
+      const daysLeft = Math.ceil((new Date(rock.quarter_end).getTime() - now.getTime()) / 86400000);
+      const status = rock.current_status === "on_track" ? "✅" : "⚠️ OFF TRACK";
+      rocksContext += `- [${rock.domain}] ${rock.title} — ${status} (J-${daysLeft})\n`;
+      if (rock.current_status === "off_track") rocksOffTrack.push(rock.title);
+      // Anticipation: Rock deadline < 14 days
+      if (daysLeft <= 14 && daysLeft > 0) {
+        signalsContext += `🔴 Rock "${rock.title}" — J-${daysLeft} deadline imminente!\n`;
+      }
+    }
+
+    // ─── Anticipatory Intelligence (Tier 5) ─────────────────────
+    const staleApps = staleAppsRes.data || [];
+    let anticipationsContext = "";
+    if (staleApps.length > 0) {
+      const topStale = staleApps.slice(0, 3);
+      anticipationsContext += `RELANCES SUGGÉRÉES (candidatures > 5j sans réponse):\n`;
+      for (const app of topStale) {
+        const daysSince = Math.ceil((now.getTime() - new Date(app.applied_date).getTime()) / 86400000);
+        anticipationsContext += `- ${app.company} "${app.title}" (${daysSince}j)\n`;
+      }
+    }
+
+    // Day-of-week fail pattern
+    const failPatterns = failPatternsRes.data || [];
+    const todayDow = day; // 0=Sun, 1=Mon, etc.
+    const todayFailReasons = failPatterns.filter((fr: any) => new Date(fr.task_date).getDay() === todayDow);
+    if (todayFailReasons.length >= 3) {
+      const reasonCounts: Record<string, number> = {};
+      todayFailReasons.forEach((fr: any) => { reasonCounts[fr.reason] = (reasonCounts[fr.reason] || 0) + 1; });
+      const topReason = Object.entries(reasonCounts).sort((a, b) => b[1] - a[1])[0];
+      if (topReason) {
+        anticipationsContext += `⚠️ ${dayName} est historiquement ton jour faible (raison #1: ${topReason[0]}, ${topReason[1]}x). Planifie léger.\n`;
+      }
+    }
+
     const context = `
 Date: ${dayName} ${today}
 Heure: ${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}
+
+🪨 ROCKS (priorités 90 jours):
+${rocksContext || "Aucun Rock défini"}
+${rocksOffTrack.length > 0 ? `⚠️ ${rocksOffTrack.length} Rock(s) OFF TRACK: ${rocksOffTrack.join(", ")}` : ""}
 
 OBJECTIFS ACTIFS:
 ${goalsContext || "Aucun objectif"}
@@ -181,6 +236,8 @@ ${tasksContext}
 SIGNAUX AGENTS (overnight):
 ${signalsContext || "Aucun signal critique"}
 
+${anticipationsContext ? `ANTICIPATIONS:\n${anticipationsContext}` : ""}
+
 BILAN HIER: ${yesterdayScoreRes.data?.[0]?.content ? "Disponible" : "Non disponible"}
 `.trim();
 
@@ -195,19 +252,23 @@ FORMAT STRICT (utilise exactement ce format):
 🚀 A/B clients, Cj restants
 📋 N tâches · WORKOUT_TYPE · 💰 +BALANCE₪
 
+🪨 Si Rocks off-track: mentionner en priorité
 ${overnightSignals.weakDomain ? `⚠️ Hier faible en ${overnightSignals.weakDomain} — corrige aujourd'hui` : ""}
 ${overnightSignals.interviewAlert ? "🔴 INTERVIEW: prep = priorité #1" : ""}
+${anticipationsContext ? "📌 Anticipations: inclure les relances/alertes dans les recommandations" : ""}
 
 ⚡ UNE PHRASE d'action concrète orientée mission.
 
 RÈGLES:
-- 🔴 si 0 interviews OU deadline < 30j OU 0 clients HiGrow OU vélocité < requis
+- 🔴 si 0 interviews OU deadline < 30j OU 0 clients HiGrow OU vélocité < requis OU Rock off-track
 - 🟡 si des progrès mais insuffisants
-- 🟢 si tout est on-track
+- 🟢 si tout est on-track ET tous les Rocks on-track
 - Si vélocité candidatures < requis, le dire explicitement ("Envoie X candidatures aujourd'hui pour rattraper")
 - Si des signaux overnight existent, les intégrer dans la recommandation
+- Si une candidature est en attente > 5j, mentionner la relance
+- Si c'est le jour faible de l'utilisateur, recommander de planifier léger
 - La phrase ⚡ doit être SPÉCIFIQUE et ACTIONNABLE (pas "travaille dur")
-- Max 8 lignes total, compact, data-driven`,
+- Max 10 lignes total, compact, data-driven`,
       context,
       400
     );
@@ -217,10 +278,14 @@ RÈGLES:
       return new Response(JSON.stringify({ success: false, error: "empty_ai" }));
     }
 
-    // Determine priority domain (signal-aware)
+    // Determine priority domain (Rock-aware + signal-aware)
     let priorityDomain = "career";
+    // Check if any Rock is off-track — that domain gets priority
+    const offTrackRock = rocks.find((r: any) => r.current_status === "off_track");
     if (overnightSignals.interviewAlert) {
       priorityDomain = "career"; // interview prep is absolute priority
+    } else if (offTrackRock) {
+      priorityDomain = offTrackRock.domain; // Rock off-track domain gets priority
     } else if (interviews === 0 && appliedJobs < 5) {
       priorityDomain = "career";
     } else if (convertedLeads === 0) {
@@ -229,10 +294,33 @@ RÈGLES:
       priorityDomain = overnightSignals.weakDomain; // correct yesterday's weak domain
     }
 
-    // Determine daily mode (velocity-aware)
+    // Determine daily mode (velocity-aware + Rock-aware)
     let dailyMode = "normal";
     const velocityBehind = requiredDailyApps !== "N/A" && parseFloat(appVelocity) < parseFloat(requiredDailyApps);
-    if (interviews === 0 || convertedLeads === 0 || velocityBehind) dailyMode = "urgence";
+    if (interviews === 0 || convertedLeads === 0 || velocityBehind || rocksOffTrack.length > 0) dailyMode = "urgence";
+
+    // ─── Auto-create follow-up tasks for stale applications (anticipatory) ─
+    if (staleApps.length > 0) {
+      for (const app of staleApps.slice(0, 3)) {
+        // Check if follow-up task already exists
+        const { data: existing } = await supabase.from("tasks")
+          .select("id").eq("context", `followup_${app.id}`)
+          .in("status", ["pending", "in_progress"]).limit(1);
+        if (existing && existing.length > 0) continue;
+
+        const daysSince = Math.ceil((now.getTime() - new Date(app.applied_date).getTime()) / 86400000);
+        await supabase.from("tasks").insert({
+          title: `📧 Relance ${app.company} — "${app.title}" (${daysSince}j)`,
+          status: "pending",
+          priority: 2,
+          agent_type: "career",
+          context: `followup_${app.id}`,
+          due_date: today,
+          duration_minutes: 10,
+          created_at: new Date().toISOString(),
+        });
+      }
+    }
 
     // ─── Write to daily_brain ────────────────────────────────────
     await supabase.from("daily_brain").insert({
