@@ -231,6 +231,112 @@ serve(async (_req: Request) => {
       }
     }
 
+    // ─── 3b. MID-DAY CAREER CHECK — if 0 apps today, alert ──────
+    if (!focusActive && dow !== 6 && hour >= 14 && hour <= 16 && now.getMinutes() < 15) {
+      try {
+        // Check if career nudge already sent today
+        const { data: careerNudge } = await supabase.from("agent_executions")
+          .select("id").eq("agent_name", "task-reminder-career")
+          .gte("executed_at", today + "T00:00:00").limit(1);
+
+        if (!careerNudge || careerNudge.length === 0) {
+          // Count today's career task completions
+          const { data: careerDoneToday } = await supabase.from("tasks")
+            .select("id").eq("status", "completed")
+            .eq("agent_type", "career")
+            .gte("completed_at", today + "T00:00:00").limit(1);
+
+          // Count today's new applications
+          const { data: appliedToday } = await supabase.from("job_listings")
+            .select("id").eq("status", "applied").eq("applied_date", today).limit(1);
+
+          const hasCareerAction = (careerDoneToday && careerDoneToday.length > 0) ||
+            (appliedToday && appliedToday.length > 0);
+
+          if (!hasCareerAction) {
+            // Get a recommended job to apply to
+            const { data: topJob } = await supabase.from("job_listings")
+              .select("id, title, company, job_url")
+              .eq("status", "new")
+              .order("date_posted", { ascending: false })
+              .limit(1);
+
+            let careerMsg = `<b>💼 CAREER CHECK</b> — ${nowTime}\n${LINE}\n`;
+            careerMsg += `0 candidatures aujourd'hui.\n\n`;
+
+            if (topJob && topJob.length > 0) {
+              const job = topJob[0];
+              careerMsg += `Offre recommandée:\n→ <b>${escHTML(job.title)}</b> @ ${escHTML(job.company)}\n`;
+              if (job.job_url) careerMsg += `${job.job_url}\n`;
+
+              await sendTG(careerMsg, {
+                buttons: [[
+                  { text: `✅ Postulé`, callback_data: `job_applied_${job.id}` },
+                  { text: `📝 Lettre`, callback_data: `job_cover_${job.id}` },
+                  { text: `📋 Toutes`, callback_data: `menu_jobs` },
+                ]],
+              });
+            } else {
+              careerMsg += `Aucune offre en attente. Ajoute des offres manuellement.`;
+              await sendTG(careerMsg);
+            }
+
+            reminderCount++;
+            await supabase.from("agent_executions").insert({
+              agent_name: "task-reminder-career",
+              executed_at: new Date().toISOString(),
+              result_summary: "Career nudge sent",
+            });
+          }
+        }
+      } catch (careerErr) { console.error("[Career nudge] Error:", careerErr); }
+    }
+
+    // ─── 3c. EVENING SCORE PREVIEW — 19:00 push if score low ──
+    if (!focusActive && dow !== 6 && hour === 19 && now.getMinutes() < 15) {
+      try {
+        const { data: previewNudge } = await supabase.from("agent_executions")
+          .select("id").eq("agent_name", "task-reminder-preview")
+          .gte("executed_at", today + "T00:00:00").limit(1);
+
+        if (!previewNudge || previewNudge.length === 0) {
+          // Quick score calculation
+          const { count: doneCount } = await supabase.from("tasks")
+            .select("id", { count: "exact", head: true })
+            .eq("status", "completed").gte("updated_at", today + "T00:00:00");
+
+          const { count: workoutCount } = await supabase.from("health_logs")
+            .select("id", { count: "exact", head: true })
+            .eq("log_type", "workout").eq("log_date", today);
+
+          const { count: studyCount } = await supabase.from("study_sessions")
+            .select("id", { count: "exact", head: true })
+            .eq("session_date", today);
+
+          const quickScore = Math.min(3, doneCount || 0) +
+            ((workoutCount || 0) > 0 ? 2 : 0) +
+            ((studyCount || 0) > 0 ? 1 : 0);
+
+          if (quickScore < 4) {
+            let previewMsg = `<b>⚡ SCORE PREVIEW</b> — ${quickScore}/6\n${LINE}\n`;
+            previewMsg += `Il te reste ~2h avant le bilan.\n\n`;
+            if ((workoutCount || 0) === 0) previewMsg += `🏋️ Pas de workout → +2 points\n`;
+            if ((studyCount || 0) === 0) previewMsg += `📚 Pas d'étude → +1 point\n`;
+            if ((doneCount || 0) < 3) previewMsg += `📋 ${doneCount || 0}/3 tâches → fais-en ${3 - (doneCount || 0)} de plus\n`;
+
+            await sendTG(previewMsg);
+            reminderCount++;
+
+            await supabase.from("agent_executions").insert({
+              agent_name: "task-reminder-preview",
+              executed_at: new Date().toISOString(),
+              result_summary: `Score preview: ${quickScore}/6`,
+            });
+          }
+        }
+      } catch (prevErr) { console.error("[Preview] Error:", prevErr); }
+    }
+
     // ─── 4. RECURRING TASKS SPAWNER ──────────────────────────────
     // Check recurring tasks for tomorrow that don't have occurrences yet
     if (hour === 21 && now.getMinutes() < 15) {

@@ -834,15 +834,36 @@ serve(async (req: Request) => {
         const top3 = scored.slice(0, 3);
 
         let recMsg = `<b>🎯 POSTULE AUJOURD'HUI</b>\n━━━━━━━━━━━━━━━━━━━━\n`;
-        top3.forEach((job: any, i: number) => {
+        const applyButtons: any[][] = [];
+        for (let i = 0; i < top3.length; i++) {
+          const job = top3[i];
           const num = ["1️⃣", "2️⃣", "3️⃣"][i];
           const loc = job.location ? ` · ${job.location}` : "";
           recMsg += `${num} <b>${job.title}</b> @ ${job.company}${loc}\n`;
           if (job.job_url) recMsg += `    → ${job.job_url}\n`;
-        });
-        recMsg += `\n<i>${newJobs.length - 3 > 0 ? `+${newJobs.length - 3} autres offres en attente` : "Postule maintenant, chaque candidature compte."}</i>`;
+          // Auto-generate cover letter snippet if not already cached
+          if (!job.cover_letter_snippet) {
+            try {
+              const snippet = await generateCoverLetterSnippet(job);
+              if (snippet) {
+                await supabase.from("job_listings").update({ cover_letter_snippet: snippet }).eq("id", job.id);
+                recMsg += `    <i>📝 ${snippet.substring(0, 150)}...</i>\n`;
+              }
+            } catch (_) {}
+          } else {
+            recMsg += `    <i>📝 ${job.cover_letter_snippet.substring(0, 150)}...</i>\n`;
+          }
+          recMsg += `\n`;
+          // Add 1-click buttons: Apply + Skip
+          applyButtons.push([
+            { text: `✅ Postulé ${job.company.substring(0, 12)}`, callback_data: `job_applied_${job.id}` },
+            { text: `⏭ Skip`, callback_data: `job_skip_${job.id}` },
+            { text: `📝 Lettre`, callback_data: `job_cover_${job.id}` },
+          ]);
+        }
+        recMsg += `<i>${newJobs.length - 3 > 0 ? `+${newJobs.length - 3} autres offres en attente` : "Postule maintenant, chaque candidature compte."}</i>`;
 
-        await sendTG(recMsg);
+        await sendTG(recMsg, { buttons: applyButtons });
         alertsSent.push("apply_recommendations");
       }
     } catch (e) { console.error("Apply recommendations error:", e); }

@@ -3279,6 +3279,68 @@ async function handleCallbackQuery(callbackId: string, chatId: number, data: str
   } else if (data === "career_add_job") {
     await sendTelegramMessage(chatId, "Format: /job url [titre]\nEx: _/job https://linkedin.com/jobs/view/123 AE Wiz_", "Markdown");
   }
+  // ─── 1-CLICK APPLY FLOW ───
+  else if (data.startsWith("job_applied_")) {
+    const jobId = data.replace("job_applied_", "");
+    try {
+      await supabase.from("job_listings").update({
+        status: "applied",
+        applied_date: todayStr(),
+      }).eq("id", jobId);
+      const { data: job } = await supabase.from("job_listings")
+        .select("title, company").eq("id", jobId).single();
+      if (job) {
+        await sendTelegramMessage(chatId, `✅ *${escapeMarkdown(job.title)}* @ ${escapeMarkdown(job.company)} — Marqué comme postulé !`, "Markdown");
+      }
+    } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
+  }
+  else if (data.startsWith("job_skip_")) {
+    const jobId = data.replace("job_skip_", "");
+    try {
+      await supabase.from("job_listings").update({ status: "rejected", notes: "Skipped from daily recommendations" }).eq("id", jobId);
+      await sendTelegramMessage(chatId, `⏭ Offre ignorée.`);
+    } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
+  }
+  else if (data.startsWith("job_cover_")) {
+    const jobId = data.replace("job_cover_", "");
+    try {
+      const { data: job } = await supabase.from("job_listings")
+        .select("title, company, location, cover_letter_snippet, job_url").eq("id", jobId).single();
+      if (!job) { await sendTelegramMessage(chatId, "Offre introuvable."); }
+      else {
+        // Generate full cover letter with callOpenAI
+        const OPENAI_KEY = Deno.env.get("OPENAI_API_KEY") || "";
+        const coverPrompt = `Tu es expert en candidature AE/SDR tech/SaaS. Oren est Account Executive bilingue FR/EN basé en Israël, avec expérience en vente B2B SaaS. Génère une lettre de motivation percutante et personnalisée (10-12 lignes) pour ce poste. Style: direct, orienté résultats, avec des métriques concrètes. Finis par un call-to-action fort.`;
+        const coverContent = `Poste: ${job.title} chez ${job.company} (${job.location || ""})`;
+
+        const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${OPENAI_KEY}` },
+          body: JSON.stringify({
+            model: "gpt-4o-mini",
+            messages: [
+              { role: "system", content: coverPrompt },
+              { role: "user", content: coverContent },
+            ],
+            max_tokens: 500,
+          }),
+        });
+        const json = await resp.json();
+        const letter = json?.choices?.[0]?.message?.content || "Erreur de génération.";
+
+        let msg = `📝 *LETTRE DE MOTIVATION*\n`;
+        msg += `${escapeMarkdown(job.title)} @ ${escapeMarkdown(job.company)}\n━━━━━━━━━━━━━━━━━━━━\n\n`;
+        msg += escapeMarkdown(letter);
+
+        await sendTelegramMessage(chatId, msg, "Markdown", [
+          [{ text: `✅ Postulé ${job.company.substring(0, 15)}`, callback_data: `job_applied_${jobId}` }],
+        ]);
+
+        // Cache for future use
+        await supabase.from("job_listings").update({ cover_letter_snippet: letter.substring(0, 500) }).eq("id", jobId);
+      }
+    } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 100)}`); }
+  }
   // === HIGROW SUB-MENU ===
   else if (data === "higrow_followup") {
     await handleHigrowFollowup(chatId);
@@ -3562,6 +3624,58 @@ async function handleCallbackQuery(callbackId: string, chatId: number, data: str
       else if (action === "tcancel") {
         await supabase.from("tasks").update({ status: "cancelled" }).eq("id", matchedTask.id);
         await sendTelegramMessage(chatId, `🗑 *${escapeMarkdown(matchedTask.title)}* — Annulée`, "Markdown");
+      }
+    } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
+  }
+  // ─── FAIL REASON CALLBACKS ───
+  // When user explains WHY a task wasn't done: fail_{reason}_{taskId}
+  else if (data.startsWith("fail_")) {
+    const parts = data.replace("fail_", "").split("_");
+    const reason = parts[0]; // blocked, forgot, toobig, energy, other
+    const taskId = parts.slice(1).join("_");
+
+    const REASON_LABELS: Record<string, string> = {
+      blocked: "🚧 Bloqué (dépendance externe)",
+      forgot: "🧠 Oublié",
+      toobig: "🏔 Trop grosse tâche",
+      energy: "🔋 Pas d'énergie",
+      skip: "⏭ Pas prioritaire",
+    };
+
+    try {
+      const label = REASON_LABELS[reason] || reason;
+
+      // Save to task_fail_reasons
+      await supabase.from("task_fail_reasons").insert({
+        task_id: taskId,
+        reason,
+        task_date: todayStr(),
+      });
+
+      // Update task with fail_reason and increment fail_count
+      const { data: taskData } = await supabase.from("tasks")
+        .select("title, fail_count").eq("id", taskId).single();
+
+      if (taskData) {
+        await supabase.from("tasks").update({
+          fail_reason: reason,
+          fail_count: (taskData.fail_count || 0) + 1,
+        }).eq("id", taskId);
+
+        let response = `📝 Noté: ${label}\n`;
+
+        // Smart follow-up based on reason
+        if (reason === "toobig") {
+          response += `\n💡 Essaie de la découper: /subtask ${taskId.substring(0, 8)} <sous-tâche>`;
+        } else if (reason === "blocked") {
+          response += `\nQui/quoi te bloque ? Tape ta réponse et je noterai.`;
+        } else if (reason === "energy") {
+          response += `\n💡 Je la déplacerai à un moment où tu as plus d'énergie.`;
+        }
+
+        await sendTelegramMessage(chatId, response);
+      } else {
+        await sendTelegramMessage(chatId, `Tâche introuvable.`);
       }
     } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
   }

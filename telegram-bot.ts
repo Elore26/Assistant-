@@ -2008,66 +2008,6 @@ async function handleSprintCreate(chatId: number, args: string[]): Promise<void>
 }
 
 // --- 10. TOMORROW PLANNING (Evening) ---
-// === WAKE-UP MUSIC ===
-async function handleWakeMusic(chatId: number, args: string[]): Promise<void> {
-  const SERVER_URL = Deno.env.get("OREN_SERVER_URL") || "http://localhost:7600";
-  const subCmd = args[0]?.toLowerCase();
-
-  try {
-    if (subCmd === "stop" || subCmd === "pause" || subCmd === "arreter") {
-      // Arrêter la musique
-      const res = await fetch(`${SERVER_URL}/wake-music/stop`);
-      if (res.ok) {
-        await sendTelegramMessage(chatId, "⏹ *Musique arrêtée*", "Markdown");
-      } else {
-        await sendTelegramMessage(chatId, "❌ Erreur — le serveur Mac est-il allumé ?");
-      }
-      return;
-    }
-
-    // Lancer la musique
-    const options: Record<string, any> = {};
-    if (subCmd && subCmd.startsWith("http")) {
-      options.playlist = args.join(" ");
-    }
-    if (subCmd && !isNaN(Number(subCmd))) {
-      options.volume = parseInt(subCmd);
-    }
-
-    const res = await fetch(`${SERVER_URL}/wake-music`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(options),
-    });
-
-    if (res.ok) {
-      const data = await res.json();
-      await sendTelegramMessage(
-        chatId,
-        `🎵 *Réveil musical lancé !*\n\n` +
-        `🔊 La musique joue sur ton Mac\n` +
-        `⏹ Pour arrêter: /music stop`,
-        "Markdown"
-      );
-    } else {
-      await sendTelegramMessage(
-        chatId,
-        "❌ *Impossible de lancer la musique*\n" +
-        "Vérifie que le serveur Mac (oren-server) tourne.\n" +
-        `\`curl ${SERVER_URL}/health\``,
-        "Markdown"
-      );
-    }
-  } catch (e) {
-    await sendTelegramMessage(
-      chatId,
-      `❌ *Erreur connexion serveur Mac*\n${String(e).substring(0, 200)}\n\n` +
-      "Le serveur oren-server est-il démarré ?",
-      "Markdown"
-    );
-  }
-}
-
 async function handleTomorrowPlan(chatId: number): Promise<void> {
   const supabase = getSupabaseClient();
   try {
@@ -2984,6 +2924,8 @@ async function handleCallbackQuery(callbackId: string, chatId: number, data: str
   // === MAIN MENU BUTTONS ===
   if (data === "menu_main") {
     await sendTelegramMessage(chatId, "📌 *OREN*", "Markdown", MAIN_MENU);
+  } else if (data === "dashboard") {
+    await handleDashboard(chatId);
   } else if (data === "menu_tasks") {
     await handleTasksMainV2(chatId);
   } else if (data === "menu_budget") {
@@ -3008,6 +2950,55 @@ async function handleCallbackQuery(callbackId: string, chatId: number, data: str
     await sendTelegramMessage(chatId, "Dis-moi ta tâche en message.\nEx: _Appeler le comptable demain 14h_", "Markdown");
   } else if (data === "tasks_schedule") {
     await sendTelegramMessage(chatId, "Format: /mission titre heure [durée]\nEx: _Rdv dentiste 14:00 60_", "Markdown");
+  }
+  // === CLEANUP CALLBACK ===
+  else if (data.startsWith("cleanup_archive_")) {
+    try {
+      // Archive old tasks by setting status to 'completed' with a special note
+      const twoWeeksAgo = new Date(Date.now() - 14 * 86400000).toISOString().split("T")[0];
+
+      const { data: oldTasks, error } = await supabase.from("tasks")
+        .select("id")
+        .in("status", ["pending", "in_progress"])
+        .or(`due_date.lt.${twoWeeksAgo},due_date.is.null`)
+        .order("created_at", { ascending: true })
+        .limit(50);
+
+      if (error || !oldTasks || oldTasks.length === 0) {
+        await sendTelegramMessage(chatId, "✅ Aucune tâche à archiver.");
+        return;
+      }
+
+      // Filter only truly old ones
+      const reallyOld = oldTasks.filter((t: any) => {
+        if (!t.due_date) {
+          // Check created_at via separate query is complex, so trust the initial filter
+          return true;
+        }
+        return t.due_date < twoWeeksAgo;
+      });
+
+      if (reallyOld.length === 0) {
+        await sendTelegramMessage(chatId, "✅ Aucune tâche à archiver.");
+        return;
+      }
+
+      const taskIds = reallyOld.map((t: any) => t.id);
+
+      // Archive by setting status to 'cancelled' (not completed, to not mess with stats)
+      const { error: updateError } = await supabase.from("tasks")
+        .update({ status: "cancelled", updated_at: new Date().toISOString() })
+        .in("id", taskIds);
+
+      if (updateError) {
+        await sendTelegramMessage(chatId, `❌ Erreur lors de l'archivage: ${String(updateError).substring(0, 100)}`);
+        return;
+      }
+
+      await sendTelegramMessage(chatId, `✅ *${taskIds.length} tâches archivées*\n\nElles ont été marquées comme annulées et ne pollueront plus ton score quotidien.`, "Markdown");
+    } catch (e) {
+      await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 100)}`);
+    }
   }
   // === TASK MANAGEMENT V2 CALLBACKS ===
   // --- Inbox ---
@@ -3287,6 +3278,68 @@ async function handleCallbackQuery(callbackId: string, chatId: number, data: str
     await handleCareerActions(chatId);
   } else if (data === "career_add_job") {
     await sendTelegramMessage(chatId, "Format: /job url [titre]\nEx: _/job https://linkedin.com/jobs/view/123 AE Wiz_", "Markdown");
+  }
+  // ─── 1-CLICK APPLY FLOW ───
+  else if (data.startsWith("job_applied_")) {
+    const jobId = data.replace("job_applied_", "");
+    try {
+      await supabase.from("job_listings").update({
+        status: "applied",
+        applied_date: todayStr(),
+      }).eq("id", jobId);
+      const { data: job } = await supabase.from("job_listings")
+        .select("title, company").eq("id", jobId).single();
+      if (job) {
+        await sendTelegramMessage(chatId, `✅ *${escapeMarkdown(job.title)}* @ ${escapeMarkdown(job.company)} — Marqué comme postulé !`, "Markdown");
+      }
+    } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
+  }
+  else if (data.startsWith("job_skip_")) {
+    const jobId = data.replace("job_skip_", "");
+    try {
+      await supabase.from("job_listings").update({ status: "rejected", notes: "Skipped from daily recommendations" }).eq("id", jobId);
+      await sendTelegramMessage(chatId, `⏭ Offre ignorée.`);
+    } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
+  }
+  else if (data.startsWith("job_cover_")) {
+    const jobId = data.replace("job_cover_", "");
+    try {
+      const { data: job } = await supabase.from("job_listings")
+        .select("title, company, location, cover_letter_snippet, job_url").eq("id", jobId).single();
+      if (!job) { await sendTelegramMessage(chatId, "Offre introuvable."); }
+      else {
+        // Generate full cover letter with callOpenAI
+        const OPENAI_KEY = Deno.env.get("OPENAI_API_KEY") || "";
+        const coverPrompt = `Tu es expert en candidature AE/SDR tech/SaaS. Oren est Account Executive bilingue FR/EN basé en Israël, avec expérience en vente B2B SaaS. Génère une lettre de motivation percutante et personnalisée (10-12 lignes) pour ce poste. Style: direct, orienté résultats, avec des métriques concrètes. Finis par un call-to-action fort.`;
+        const coverContent = `Poste: ${job.title} chez ${job.company} (${job.location || ""})`;
+
+        const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${OPENAI_KEY}` },
+          body: JSON.stringify({
+            model: "gpt-4o-mini",
+            messages: [
+              { role: "system", content: coverPrompt },
+              { role: "user", content: coverContent },
+            ],
+            max_tokens: 500,
+          }),
+        });
+        const json = await resp.json();
+        const letter = json?.choices?.[0]?.message?.content || "Erreur de génération.";
+
+        let msg = `📝 *LETTRE DE MOTIVATION*\n`;
+        msg += `${escapeMarkdown(job.title)} @ ${escapeMarkdown(job.company)}\n━━━━━━━━━━━━━━━━━━━━\n\n`;
+        msg += escapeMarkdown(letter);
+
+        await sendTelegramMessage(chatId, msg, "Markdown", [
+          [{ text: `✅ Postulé ${job.company.substring(0, 15)}`, callback_data: `job_applied_${jobId}` }],
+        ]);
+
+        // Cache for future use
+        await supabase.from("job_listings").update({ cover_letter_snippet: letter.substring(0, 500) }).eq("id", jobId);
+      }
+    } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 100)}`); }
   }
   // === HIGROW SUB-MENU ===
   else if (data === "higrow_followup") {
@@ -3571,6 +3624,58 @@ async function handleCallbackQuery(callbackId: string, chatId: number, data: str
       else if (action === "tcancel") {
         await supabase.from("tasks").update({ status: "cancelled" }).eq("id", matchedTask.id);
         await sendTelegramMessage(chatId, `🗑 *${escapeMarkdown(matchedTask.title)}* — Annulée`, "Markdown");
+      }
+    } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
+  }
+  // ─── FAIL REASON CALLBACKS ───
+  // When user explains WHY a task wasn't done: fail_{reason}_{taskId}
+  else if (data.startsWith("fail_")) {
+    const parts = data.replace("fail_", "").split("_");
+    const reason = parts[0]; // blocked, forgot, toobig, energy, other
+    const taskId = parts.slice(1).join("_");
+
+    const REASON_LABELS: Record<string, string> = {
+      blocked: "🚧 Bloqué (dépendance externe)",
+      forgot: "🧠 Oublié",
+      toobig: "🏔 Trop grosse tâche",
+      energy: "🔋 Pas d'énergie",
+      skip: "⏭ Pas prioritaire",
+    };
+
+    try {
+      const label = REASON_LABELS[reason] || reason;
+
+      // Save to task_fail_reasons
+      await supabase.from("task_fail_reasons").insert({
+        task_id: taskId,
+        reason,
+        task_date: todayStr(),
+      });
+
+      // Update task with fail_reason and increment fail_count
+      const { data: taskData } = await supabase.from("tasks")
+        .select("title, fail_count").eq("id", taskId).single();
+
+      if (taskData) {
+        await supabase.from("tasks").update({
+          fail_reason: reason,
+          fail_count: (taskData.fail_count || 0) + 1,
+        }).eq("id", taskId);
+
+        let response = `📝 Noté: ${label}\n`;
+
+        // Smart follow-up based on reason
+        if (reason === "toobig") {
+          response += `\n💡 Essaie de la découper: /subtask ${taskId.substring(0, 8)} <sous-tâche>`;
+        } else if (reason === "blocked") {
+          response += `\nQui/quoi te bloque ? Tape ta réponse et je noterai.`;
+        } else if (reason === "energy") {
+          response += `\n💡 Je la déplacerai à un moment où tu as plus d'énergie.`;
+        }
+
+        await sendTelegramMessage(chatId, response);
+      } else {
+        await sendTelegramMessage(chatId, `Tâche introuvable.`);
       }
     } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
   }
@@ -4559,6 +4664,75 @@ async function handleFocus(chatId: number, args: string[]): Promise<void> {
   }
 }
 
+// ─── CLEANUP OLD TASKS ───────────────────────────────────────────────────
+async function handleCleanup(chatId: number): Promise<void> {
+  const supabase = getSupabaseClient();
+
+  try {
+    const today = todayStr();
+    const twoWeeksAgo = new Date(Date.now() - 14 * 86400000).toISOString().split("T")[0];
+
+    // Find old pending tasks: no due_date OR due_date < 14 days ago
+    const { data: oldTasks } = await supabase.from("tasks")
+      .select("id, title, created_at, due_date, priority")
+      .in("status", ["pending", "in_progress"])
+      .or(`due_date.lt.${twoWeeksAgo},due_date.is.null`)
+      .order("created_at", { ascending: true })
+      .limit(50);
+
+    if (!oldTasks || oldTasks.length === 0) {
+      await sendTelegramMessage(chatId, "✅ Aucune vieille tâche à nettoyer.\nToutes tes tâches sont récentes ou planifiées.");
+      return;
+    }
+
+    // Filter only truly old ones (created > 14 days ago if no due_date)
+    const reallyOld = oldTasks.filter((t: any) => {
+      if (t.due_date && t.due_date < twoWeeksAgo) return true;
+      if (!t.due_date && t.created_at < twoWeeksAgo + "T00:00:00") return true;
+      return false;
+    });
+
+    if (reallyOld.length === 0) {
+      await sendTelegramMessage(chatId, "✅ Aucune vieille tâche à nettoyer.");
+      return;
+    }
+
+    let text = `🧹 *NETTOYAGE — ${reallyOld.length} vieilles tâches*\n\n`;
+    text += `Ces tâches ont plus de 14 jours ou sont en retard depuis longtemps:\n\n`;
+
+    reallyOld.slice(0, 20).forEach((t: any, i: number) => {
+      const age = Math.floor((Date.now() - new Date(t.created_at).getTime()) / 86400000);
+      const p = (t.priority || 3) <= 1 ? "🔴" : (t.priority || 3) === 2 ? "🟠" : "🟡";
+      text += `${i + 1}. ${p} ${t.title.substring(0, 60)}\n`;
+      text += `   _Créée il y a ${age}j${t.due_date ? `, due: ${t.due_date}` : ""}_\n`;
+    });
+
+    if (reallyOld.length > 20) {
+      text += `\n_+ ${reallyOld.length - 20} autres tâches..._\n`;
+    }
+
+    text += `\n*Options:*\n`;
+    text += `• *Archiver tout* → elles disparaissent de ta liste\n`;
+    text += `• Annuler → garder comme elles sont`;
+
+    const taskIds = reallyOld.map((t: any) => t.id).join(",");
+    const buttons: InlineKeyboardMarkup = {
+      inline_keyboard: [
+        [
+          { text: "🗑️ Archiver tout", callback_data: `cleanup_archive_${taskIds.substring(0, 50)}` },
+          { text: "❌ Annuler", callback_data: "menu_main" },
+        ],
+      ],
+    };
+
+    await sendTelegramMessage(chatId, text, "Markdown", buttons);
+
+  } catch (e) {
+    console.error("Cleanup error:", e);
+    await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 100)}`);
+  }
+}
+
 async function handleGoals(chatId: number): Promise<void> {
   const supabase = getSupabaseClient();
 
@@ -4609,6 +4783,144 @@ async function handleGoals(chatId: number): Promise<void> {
   } catch (e) {
     console.error("Goals error:", e);
     await sendTelegramMessage(chatId, `error: ${String(e).substring(0, 50)}`);
+  }
+}
+
+// --- Unified Dashboard (single view of all domains) ---
+
+async function handleDashboard(chatId: number): Promise<void> {
+  const supabase = getSupabaseClient();
+  const now = getIsraelNow();
+  const today = todayStr();
+  const dayName = ["Dim", "Lun", "Mar", "Mer", "Jeu", "Ven", "Sam"][now.getDay()];
+  const monthStart = `${today.substring(0, 7)}-01`;
+
+  try {
+    // Parallel fetch across all domains
+    const [
+      tasksRes, goalsRes, jobsRes, leadsRes,
+      financeRes, weightRes, workoutsRes, studyRes,
+    ] = await Promise.all([
+      // Tasks: today pending + completed
+      supabase.from("tasks").select("id, title, priority, status, due_time")
+        .eq("due_date", today).in("status", ["pending", "in_progress", "completed"])
+        .order("priority", { ascending: true }).limit(20),
+      // Goals: active
+      supabase.from("goals").select("domain, title, metric_current, metric_target, metric_unit, deadline, priority")
+        .eq("status", "active").order("priority").limit(8),
+      // Career: pipeline
+      supabase.from("job_listings").select("status")
+        .in("status", ["new", "applied", "interview", "offer"]),
+      // HiGrow: leads this month
+      supabase.from("leads").select("status")
+        .gte("created_at", monthStart),
+      // Finance: month summary
+      supabase.from("finance_logs").select("transaction_type, amount")
+        .gte("transaction_date", monthStart),
+      // Health: latest weight
+      supabase.from("health_logs").select("value")
+        .eq("log_type", "weight").order("log_date", { ascending: false }).limit(1),
+      // Health: workouts this week
+      supabase.from("health_logs").select("id")
+        .eq("log_type", "workout")
+        .gte("log_date", new Date(now.getTime() - 7 * 86400000).toISOString().split("T")[0]),
+      // Learning: study this week
+      supabase.from("study_sessions").select("duration_minutes")
+        .gte("session_date", new Date(now.getTime() - 7 * 86400000).toISOString().split("T")[0])
+        .neq("topic", "agent_analysis"),
+    ]);
+
+    const tasks = tasksRes.data || [];
+    const goals = goalsRes.data || [];
+    const jobs = jobsRes.data || [];
+    const leads = leadsRes.data || [];
+    const finance = financeRes.data || [];
+    const weight = weightRes.data?.[0]?.value || "?";
+    const workoutCount = workoutsRes.data?.length || 0;
+    const studyMinutes = (studyRes.data || []).reduce((s: number, ss: any) => s + (ss.duration_minutes || 0), 0);
+
+    // Process tasks
+    const pendingTasks = tasks.filter((t: any) => t.status !== "completed");
+    const completedTasks = tasks.filter((t: any) => t.status === "completed");
+    const p1p2 = pendingTasks.filter((t: any) => (t.priority || 3) <= 2);
+
+    // Process career
+    const newJobs = jobs.filter((j: any) => j.status === "new").length;
+    const applied = jobs.filter((j: any) => j.status === "applied").length;
+    const interviews = jobs.filter((j: any) => j.status === "interview").length;
+    const offers = jobs.filter((j: any) => j.status === "offer").length;
+
+    // Process HiGrow
+    const totalLeads = leads.length;
+    const converted = leads.filter((l: any) => l.status === "converted").length;
+
+    // Process finance
+    const monthIncome = finance.filter((f: any) => f.transaction_type === "income").reduce((s: number, e: any) => s + e.amount, 0);
+    const monthExpense = finance.filter((f: any) => f.transaction_type === "expense").reduce((s: number, e: any) => s + e.amount, 0);
+    const balance = monthIncome - monthExpense;
+    const savingsRate = monthIncome > 0 ? Math.round(((monthIncome - monthExpense) / monthIncome) * 100) : 0;
+
+    // Process goals urgency
+    const urgentGoals = goals.filter((g: any) => {
+      if (!g.deadline) return false;
+      const daysLeft = Math.ceil((new Date(g.deadline).getTime() - now.getTime()) / 86400000);
+      return daysLeft <= 30;
+    });
+
+    // Determine urgency level
+    let urgency = "🟢";
+    if (interviews === 0 || converted === 0 || urgentGoals.length > 0) urgency = "🔴";
+    else if (applied < 5 || savingsRate < 20) urgency = "🟡";
+
+    // Build message
+    let msg = `${urgency} *DASHBOARD* — ${dayName} ${today}\n`;
+    msg += `━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+    // Tasks summary
+    msg += `📋 *TACHES:* ${completedTasks.length}✓ / ${tasks.length} total\n`;
+    if (p1p2.length > 0) {
+      msg += `  Urgentes: ${p1p2.map((t: any) => t.title).slice(0, 2).join(", ")}\n`;
+    }
+
+    // Career
+    msg += `\n💼 *CARRIERE:*\n`;
+    msg += `  ${newJobs} nouvelles · ${applied} postulées · ${interviews} interviews`;
+    if (offers > 0) msg += ` · ${offers} offres`;
+    msg += `\n`;
+    if (interviews === 0) msg += `  ⚠️ _0 interviews — augmenter les candidatures_\n`;
+
+    // HiGrow
+    msg += `\n🚀 *HIGROW:* ${converted}/${totalLeads || "?"} clients convertis\n`;
+    if (converted === 0 && totalLeads > 0) msg += `  ⚠️ _0 conversion — relancer les leads_\n`;
+
+    // Finance
+    msg += `\n💰 *FINANCE:*\n`;
+    msg += `  Revenus: ${Math.round(monthIncome)}₪ · Dépenses: ${Math.round(monthExpense)}₪\n`;
+    msg += `  Balance: ${balance >= 0 ? "+" : ""}${Math.round(balance)}₪ · Épargne: ${savingsRate}%\n`;
+
+    // Health
+    msg += `\n🏋️ *SANTE:* ${weight}kg · ${workoutCount}/5 workouts · ${Math.round(studyMinutes / 60)}h étude\n`;
+
+    // Goals
+    if (urgentGoals.length > 0) {
+      msg += `\n🎯 *OBJECTIFS URGENTS:*\n`;
+      for (const g of urgentGoals.slice(0, 3)) {
+        const daysLeft = Math.ceil((new Date(g.deadline).getTime() - now.getTime()) / 86400000);
+        const progress = g.metric_target ? Math.round((g.metric_current / g.metric_target) * 100) : 0;
+        msg += `  ${g.domain === "career" ? "💼" : g.domain === "health" ? "🏋️" : g.domain === "higrow" ? "🚀" : "🎯"} ${g.title}: ${progress}% · J-${daysLeft}\n`;
+      }
+    }
+
+    await sendTelegramMessage(chatId, msg, "Markdown", {
+      inline_keyboard: [
+        [{ text: "💼 Carrière", callback_data: "menu_jobs" }, { text: "🚀 HiGrow", callback_data: "menu_leads" }, { text: "💰 Budget", callback_data: "menu_budget" }],
+        [{ text: "📋 Tasks", callback_data: "menu_tasks" }, { text: "🏋️ Santé", callback_data: "menu_health" }, { text: "🎯 Goals", callback_data: "menu_goals" }],
+        [{ text: "🔄 Rafraîchir", callback_data: "dashboard" }, { text: "📌 Menu", callback_data: "menu_main" }],
+      ],
+    });
+  } catch (e) {
+    console.error("Dashboard error:", e);
+    await sendTelegramMessage(chatId, "❌ Erreur dashboard. Réessaie.", "Markdown");
   }
 }
 
@@ -4728,7 +5040,7 @@ ACTIONS DISPONIBLES:
 add_task - Ajouter une tâche ou rappel
   params: { "title": "texte", "priority": 1-5, "due_date": "YYYY-MM-DD", "due_time": "HH:MM", "context": "work|home|errands|health|learning", "energy": "high|medium|low" }
   Priorité: 1=critique, 2=urgent, 3=normal, 4=faible, 5=un jour
-  Context: TOUJOURS déduire et inclure! (boulot=work, maison/voiture/perso=home, courses=errands, sport=health, étude=learning)
+  Context: déduis selon le sujet (boulot=work, maison=home, courses=errands, sport=health, étude=learning)
   Energy: tâches intellectuelles/créatives=high, admin/routine=medium, simple/mécanique=low
 
 complete_task - Marquer une tâche terminée (cherche par mot-clé)
@@ -4880,8 +5192,8 @@ let _aiContextCache: { text: string; ts: number } | null = null;
 const AI_CONTEXT_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
 async function getAIContext(): Promise<string> {
-  const now = Date.now();
-  if (_aiContextCache && (now - _aiContextCache.ts) < AI_CONTEXT_TTL_MS) {
+  const now2 = Date.now();
+  if (_aiContextCache && (now2 - _aiContextCache.ts) < AI_CONTEXT_TTL_MS) {
     return _aiContextCache.text;
   }
   const supabase = getSupabaseClient();
@@ -5058,16 +5370,12 @@ async function handleNaturalLanguage(chatId: number, text: string): Promise<void
           priority: params.priority || 3,
           created_at: new Date().toISOString(),
         };
-        // Default due_date to today so task appears in daily Tasks view
-        taskData.due_date = params.due_date || new Date().toISOString().split("T")[0];
+        if (params.due_date) taskData.due_date = params.due_date;
         if (params.due_time) {
           taskData.due_time = params.due_time;
           taskData.duration_minutes = params.duration || 30;
         }
-        // Auto-assign context from AI deduction
-        if (params.context && TASK_CONTEXTS.includes(params.context)) {
-          taskData.context = params.context;
-        }
+        // Don't auto-assign context — ask the user instead
         if (params.energy) taskData.energy_level = params.energy;
         const { data: inserted, error } = await supabase.from("tasks").insert(taskData).select("id").single();
         if (error) throw error;
@@ -5725,21 +6033,38 @@ async function analyzePhoto(chatId: number, fileId: string, caption?: string): P
   // Get DB context
   const context = await getAIContext();
 
-  const visionPrompt = `Tu es OREN, assistant personnel. Analyse cette image et réponds en JSON:
+  const visionPrompt = `Tu es OREN, assistant personnel. Analyse cette image avec précision et réponds en JSON.
+
+FORMAT DE RÉPONSE:
 {
-  "type": "receipt|document|screenshot|other",
-  "intent": "add_expense|add_task|add_job|chat",
+  "type": "receipt|bank_statement|document|screenshot|other",
+  "intent": "add_expenses|add_expense|add_task|add_job|chat",
+  "items": [
+    { "amount": number, "category": "string", "description": "string", "payment_method": "card|cash" }
+  ],
   "params": { ... },
   "reply": "description courte en français"
 }
 
-Si c'est un ticket/reçu: extrais montant, catégorie (restaurant|transport|shopping|health|entertainment|utilities|other), description.
-Si c'est une offre d'emploi: extrais titre, entreprise, URL si visible.
-Si c'est autre chose: décris simplement ce que tu vois.
-${caption ? `\nLégende de l'utilisateur: "${caption}"` : ""}
+INSTRUCTIONS:
+- Si c'est un relevé bancaire, ticket, liste de dépenses ou capture d'écran de transactions:
+  → intent = "add_expenses"
+  → Extrais CHAQUE dépense/transaction individuellement dans "items"
+  → Lis ATTENTIVEMENT chaque montant, ne les invente pas
+  → Catégories: restaurant, transport, shopping, health, entertainment, utilities, groceries, subscriptions, autre
+  → Inclus la description/marchand de chaque ligne
+  → Ne fusionne PAS les lignes entre elles, garde chaque transaction séparée
+
+- Si c'est un seul ticket/reçu simple avec un seul montant:
+  → intent = "add_expense"
+  → Mets les infos dans "params": { "amount", "category", "description", "payment_method" }
+
+- Si c'est une offre d'emploi: intent = "add_job", params: { title, company, url }
+- Si c'est autre chose: intent = "chat", reply = description
+${caption ? `\nMessage de l'utilisateur: "${caption}"` : ""}
 
 CONTEXTE: ${context}
-Réponds UNIQUEMENT en JSON.`;
+Réponds UNIQUEMENT en JSON valide. Sois PRÉCIS sur les montants.`;
 
   try {
     const response = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -5749,15 +6074,15 @@ Réponds UNIQUEMENT en JSON.`;
         "Authorization": `Bearer ${openaiKey}`,
       },
       body: JSON.stringify({
-        model: "gpt-4o-mini",
+        model: "gpt-4o",
         temperature: 0,
-        max_tokens: 1024,
+        max_tokens: 2048,
         messages: [
           {
             role: "user",
             content: [
               { type: "text", text: visionPrompt },
-              { type: "image_url", image_url: { url: dataUrl, detail: "low" } },
+              { type: "image_url", image_url: { url: dataUrl, detail: "high" } },
             ],
           },
         ],
@@ -5784,6 +6109,34 @@ Réponds UNIQUEMENT en JSON.`;
 
     // Route based on detected intent
     switch (result.intent) {
+      case "add_expenses": {
+        // Multiple expenses from bank statement / receipt list
+        const items = result.items || [];
+        if (items.length === 0) {
+          await sendTelegramMessage(chatId, result.reply || "Aucune dépense détectée sur l'image.");
+          break;
+        }
+        const supabase = getSupabaseClient();
+        const rows = items.map((item: { amount: number; category?: string; description?: string; payment_method?: string }) => ({
+          transaction_type: "expense",
+          amount: item.amount,
+          category: item.category || "autre",
+          description: item.description || "Depuis photo",
+          payment_method: item.payment_method || "card",
+          transaction_date: todayStr(),
+        }));
+        const { error } = await supabase.from("finance_logs").insert(rows);
+        if (error) throw error;
+
+        const total = items.reduce((sum: number, item: { amount: number }) => sum + item.amount, 0);
+        const lines = items.map((item: { amount: number; category?: string; description?: string }, i: number) =>
+          `${i + 1}. *${item.amount}₪* · ${item.category || "autre"}${item.description ? " — " + item.description : ""}`
+        );
+        await sendTelegramMessage(chatId,
+          `📸✅ *${items.length} dépenses* extraites et enregistrées:\n\n${lines.join("\n")}\n\n💰 Total: *${total}₪*`);
+        break;
+      }
+
       case "add_expense": {
         if (result.params?.amount) {
           const supabase = getSupabaseClient();
@@ -5971,9 +6324,8 @@ serve(async (req: Request) => {
       await handleTradingMain(chatId);
     } else if (command === "/morning" || command === "/bonjour") {
       await handleMorningBriefing(chatId);
-    } else if (command === "/dashboard") {
-      const sbUrl = Deno.env.get("SUPABASE_URL") || "";
-      await sendTelegramMessage(chatId, `📊 *Dashboard OREN*\n\n${sbUrl}/functions/v1/dashboard`, "Markdown");
+    } else if (command === "/dashboard" || command === "/d") {
+      await handleDashboard(chatId);
     } else if (command === "/review") {
       await handleReview(chatId);
     } else if (command === "/insights") {
@@ -5982,6 +6334,8 @@ serve(async (req: Request) => {
       await handleGoals(chatId);
     } else if (command === "/focus") {
       await handleFocus(chatId, args);
+    } else if (command === "/cleanup") {
+      await handleCleanup(chatId);
     }
     // === TASK MANAGEMENT V2 COMMANDS ===
     else if (command === "/inbox") {
@@ -6022,8 +6376,6 @@ serve(async (req: Request) => {
       } else {
         await sendTelegramMessage(chatId, `Contextes: ${TASK_CONTEXTS.map(c => `${CONTEXT_EMOJI[c]} ${c}`).join(', ')}\nEx: /ctx work`);
       }
-    } else if (command === "/music" || command === "/reveil" || command === "/wake") {
-      await handleWakeMusic(chatId, args);
     } else if (command === "/tuto" || command === "/tutorial" || command === "/guide") {
       const page = TUTO_PAGES["tuto_main"];
       await sendTelegramMessage(chatId, page.text, "HTML", page.buttons);

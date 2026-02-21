@@ -91,7 +91,8 @@ serve(async (_req: Request) => {
       todayCompletedRes, allPendingRes, financeRes, finance7dRes,
       healthRes, health7dRes, learningRes, learning7dRes,
       signalsRes, leadsRes, leads7dRes, goalsRes,
-      weekTasksRes, careerApps7dRes, careerRejectionsRes, careerAllPipelineRes
+      weekTasksRes, careerApps7dRes, careerRejectionsRes, careerAllPipelineRes,
+      failReasonsRes
     ] = await Promise.all([
       // Today's completed tasks
       supabase.from("tasks").select("title, status, updated_at, agent_type")
@@ -142,6 +143,9 @@ serve(async (_req: Request) => {
       // Career: full pipeline for conversion rates
       supabase.from("job_listings").select("status, source, region, applied_date")
         .in("status", ["applied", "interview", "offer", "rejected"]),
+      // Fail reason patterns (last 14 days)
+      supabase.from("task_fail_reasons").select("reason, task_date")
+        .gte("task_date", weekAgoStr),
     ]);
 
     // Extract data
@@ -245,6 +249,14 @@ serve(async (_req: Request) => {
       regionStats[reg].applied++;
       if (job.status === "interview") regionStats[reg].interview++;
     }
+
+    // Fail reason patterns
+    const failReasons7d = failReasonsRes.data || [];
+    const failReasonCounts: Record<string, number> = {};
+    failReasons7d.forEach((fr: any) => {
+      failReasonCounts[fr.reason] = (failReasonCounts[fr.reason] || 0) + 1;
+    });
+    const topFailReason = Object.entries(failReasonCounts).sort((a, b) => b[1] - a[1])[0];
 
     // Rejection pattern: time to rejection
     const rejectionTimes = careerRejections
@@ -492,6 +504,9 @@ serve(async (_req: Request) => {
       });
       if (humanCompleted.length > 4) msg += `  + ${humanCompleted.length - 4} autres\n`;
     }
+    // Collect fail reason buttons for top 3 failed tasks
+    const failReasonButtons: any[][] = [];
+
     if (failedTasks.length > 0) {
       msg += `\n<b>⚠️ PAS FAIT (${failedTasks.length}):</b>\n`;
       failedTasks.slice(0, 15).forEach((t: any) => {
@@ -500,6 +515,34 @@ serve(async (_req: Request) => {
         msg += `  ✗ ${p} ${escHTML(t.title)}${dueTime}\n`;
       });
       if (failedTasks.length > 15) msg += `  <i>+ ${failedTasks.length - 15} autres tâches anciennes...</i>\n`;
+
+      // Add fail reason prompt for top 3 failed P1-P2 tasks
+      const topFailed = failedTasks
+        .filter((t: any) => (t.priority || 3) <= 3)
+        .slice(0, 3);
+
+      if (topFailed.length > 0) {
+        msg += `\n<b>📝 Pourquoi pas fait ?</b> (clique pour chaque tâche)\n`;
+        for (const t of topFailed) {
+          const shortTitle = (t.title || "").substring(0, 20);
+          msg += `  → ${escHTML(shortTitle)}...\n`;
+          failReasonButtons.push([
+            { text: `🚧 Bloqué`, callback_data: `fail_blocked_${t.id}` },
+            { text: `🧠 Oublié`, callback_data: `fail_forgot_${t.id}` },
+            { text: `🏔 Trop gros`, callback_data: `fail_toobig_${t.id}` },
+            { text: `🔋 Énergie`, callback_data: `fail_energy_${t.id}` },
+          ]);
+        }
+      }
+
+      // Show fail reason pattern if enough data
+      if (topFailReason && failReasons7d.length >= 3) {
+        const REASON_LABELS: Record<string, string> = {
+          blocked: "Bloqué", forgot: "Oublié", toobig: "Trop grosse", energy: "Énergie", skip: "Pas prioritaire",
+        };
+        msg += `\n📊 <i>Pattern 7j: "${REASON_LABELS[topFailReason[0]] || topFailReason[0]}" = raison #1 (${topFailReason[1]}x)</i>\n`;
+      }
+
       if (completionRate < 50) {
         msg += `  <i>Moins de la moitié fait. Qu'est-ce qui a bloqué ?</i>\n`;
       }
@@ -788,7 +831,8 @@ serve(async (_req: Request) => {
 - Signals trading: ${activeSignals.length} actifs
 - Streaks: ${streaksContext}
 - Objectifs: ${goalsContext}
-- Demain: ${TOMORROW_SCHEDULE[tomorrowDay]}`;
+- Demain: ${TOMORROW_SCHEDULE[tomorrowDay]}
+- Pattern d'échec 7j: ${topFailReason ? `"${topFailReason[0]}" (${topFailReason[1]}x)` : "pas assez de données"}`;
 
       const aiReflection = await callOpenAI(
         `Tu es OREN, coach personnel d'Oren. Génère une réflexion de soirée ULTRA-CONCRÈTE en français (max 6 lignes courtes):
@@ -871,6 +915,7 @@ Style: coach ultra-direct, français, data-driven. Max 200 mots.`,
     // ============================================
     const sent = await sendTG(msg, {
       buttons: [
+        ...failReasonButtons, // Fail reason buttons for top failed tasks
         [
           { text: "✅ Valider plan demain", callback_data: `plan_validate_${tmrwStr}` },
           { text: "✏️ Modifier", callback_data: "menu_tasks" },
