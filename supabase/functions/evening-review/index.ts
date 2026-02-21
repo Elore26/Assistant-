@@ -12,6 +12,7 @@ import { sendTG, escHTML } from "../_shared/telegram.ts";
 import { progressBar, trend, simpleProgressBar } from "../_shared/formatting.ts";
 import { DOMAIN_EMOJIS, TOMORROW_SCHEDULE, FAIL_REASON_LABELS } from "../_shared/config.ts";
 import { buildScorecard, formatScorecardHTML } from "../_shared/scorecard.ts";
+import { rankGoals, type GoalRanked } from "../_shared/goal-engine.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") || "";
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
@@ -350,80 +351,20 @@ serve(async (_req: Request) => {
     // ============================================
     // GOAL PROGRESS + PREDICTIONS
     // ============================================
-    interface GoalPrediction {
-      domain: string;
-      title: string;
-      current: number;
-      target: number;
-      start: number;
-      direction: string;
-      unit: string;
-      daysLeft: number;
-      progressPct: number;
-      onTrack: boolean;
-      predictedCompletion: string;
-      dailyActionsStatus: string;
+    // === GOAL INTELLIGENCE ENGINE ===
+    const goalPredictions: GoalRanked[] = rankGoals(goals, now);
+
+    // Check daily actions completion
+    const completedTitlesLower = completedTasks.map((t: any) => (t.title || "").toLowerCase());
+    const goalDailyActionsStatus: Record<string, string> = {};
+    for (const gp of goalPredictions) {
+      let status = "";
+      for (const action of gp.dailyActions) {
+        const done = completedTitlesLower.some((t: string) => t.includes(action.substring(0, 15).toLowerCase()));
+        status += done ? "✅" : "❌";
+      }
+      goalDailyActionsStatus[gp.domain] = status;
     }
-
-    const goalPredictions: GoalPrediction[] = goals.map((goal: any) => {
-      const current = Number(goal.metric_current) || 0;
-      const target = Number(goal.metric_target) || 1;
-      const start = Number(goal.metric_start) || 0;
-      const isDecrease = goal.direction === 'decrease';
-      const deadline = goal.deadline ? new Date(goal.deadline) : null;
-      const daysLeft = deadline
-        ? Math.ceil((deadline.getTime() - now.getTime()) / (1000 * 60 * 60 * 24))
-        : 999;
-
-      // Smart progress: handle both increase and decrease goals
-      let progressPct: number;
-      if (isDecrease && start > target) {
-        progressPct = Math.max(0, Math.min(100, Math.round(((start - current) / (start - target)) * 100)));
-      } else {
-        progressPct = Math.round((current / target) * 100);
-      }
-
-      // Estimate if on track based on elapsed time vs progress
-      const totalDays = deadline
-        ? Math.ceil((deadline.getTime() - new Date("2025-02-01").getTime()) / (1000 * 60 * 60 * 24))
-        : 120;
-      const elapsed = Math.max(totalDays - daysLeft, 1);
-      const expectedPct = Math.round((elapsed / totalDays) * 100);
-      const onTrack = progressPct >= expectedPct * 0.8; // 80% of expected = on track
-
-      // Predict completion
-      let predictedCompletion = "N/A";
-      if (progressPct > 0 && elapsed > 7) {
-        const dailyProgressRate = progressPct / elapsed;
-        const pctRemaining = 100 - progressPct;
-        const daysNeeded = dailyProgressRate > 0 ? Math.ceil(pctRemaining / dailyProgressRate) : 999;
-        const completionDate = new Date(now.getTime() + daysNeeded * 24 * 60 * 60 * 1000);
-        predictedCompletion = `${completionDate.getDate()}/${completionDate.getMonth() + 1}/${completionDate.getFullYear()}`;
-      }
-
-      // Daily actions check
-      let dailyActionsStatus = "";
-      if (goal.daily_actions && Array.isArray(goal.daily_actions)) {
-        const completedTitles = completedTasks.map((t: any) => (t.title || "").toLowerCase());
-        goal.daily_actions.forEach((action: string) => {
-          const done = completedTitles.some((t: string) => t.includes(action.substring(0, 15).toLowerCase()));
-          dailyActionsStatus += done ? "✅" : "❌";
-        });
-      }
-
-      return {
-        domain: goal.domain,
-        title: goal.title,
-        current, target, start,
-        direction: goal.direction || 'increase',
-        unit: goal.metric_unit || "",
-        daysLeft,
-        progressPct,
-        onTrack,
-        predictedCompletion,
-        dailyActionsStatus,
-      };
-    });
 
     // ============================================
     // CONSUME INTER-AGENT SIGNALS FOR REVIEW
@@ -650,26 +591,25 @@ serve(async (_req: Request) => {
     // OBJECTIFS — TOP 3 PRIORITAIRES
     // ============================================
     if (goalPredictions.length > 0) {
-      msg += `${LINE}\n<b>🎯 OBJECTIFS</b>\n\n`;
+      msg += `${LINE}\n<b>🎯 OBJECTIFS — Intelligence</b>\n\n`;
 
-      // Sort: off-track first, then by days left, limit to TOP 3
-      const top3Goals = [...goalPredictions]
-        .sort((a, b) => {
-          if (a.onTrack !== b.onTrack) return a.onTrack ? 1 : -1; // Off-track first
-          return a.daysLeft - b.daysLeft; // Then by urgency (deadline)
-        })
-        .slice(0, 3);
+      // Already sorted by urgency score from goal engine
+      const top3Goals = goalPredictions.slice(0, 3);
 
       for (const gp of top3Goals) {
         const emoji = DOMAIN_EMOJIS[gp.domain] || "📌";
-        const status = gp.onTrack ? "✅" : "⚠️";
-        msg += `${emoji} <b>${escHTML(gp.title)}</b>\n`;
+        const riskIcon = gp.riskLevel === "critical" ? "🔴" : gp.riskLevel === "danger" ? "🟠" : gp.riskLevel === "watch" ? "🟡" : "🟢";
+        msg += `${emoji} <b>${escHTML(gp.title)}</b> ${riskIcon}\n`;
         msg += `  ${progressBar(gp.current, gp.target, 10, gp.start, gp.direction)} · ${gp.current}/${gp.target}${gp.unit}\n`;
-        msg += `  ${status} J-${gp.daysLeft}`;
-        if (!gp.onTrack) msg += ` · ⚠️ Retard estimé`;
+        msg += `  Progrès: ${gp.progressPct}% (attendu ${gp.expectedPct}%)`;
+        if (gp.gap > 0) msg += ` · <b>retard ${gp.gap}%</b>`;
         msg += `\n`;
-        if (gp.dailyActionsStatus) {
-          msg += `  Actions du jour: ${gp.dailyActionsStatus}\n`;
+        if (gp.daysLeft < 999) {
+          msg += `  Pace: ${gp.currentDailyPace}/j (requis ${gp.requiredDailyPace}/j) · J-${gp.daysLeft}\n`;
+        }
+        const actionsStatus = goalDailyActionsStatus[gp.domain];
+        if (actionsStatus) {
+          msg += `  Actions: ${actionsStatus}\n`;
         }
         msg += `\n`;
       }
@@ -677,7 +617,7 @@ serve(async (_req: Request) => {
       if (goalPredictions.length > 3) {
         const remaining = goalPredictions.length - 3;
         const onTrackCount = goalPredictions.slice(3).filter(g => g.onTrack).length;
-        msg += `<i>+ ${remaining} autres objectifs (${onTrackCount} on track)</i>\n\n`;
+        msg += `<i>+ ${remaining} autres (${onTrackCount} on track)</i>\n\n`;
       }
     }
 
@@ -792,8 +732,9 @@ serve(async (_req: Request) => {
     // ============================================
     try {
       const goalsContext = goalPredictions.map(gp => {
-        return `${gp.domain}: ${gp.progressPct}% (${gp.onTrack ? "on track" : "en retard"}, J-${gp.daysLeft})`;
-      }).join(", ");
+        const risk = gp.riskLevel === "critical" ? "🔴CRIT" : gp.riskLevel === "danger" ? "🟠DANGER" : gp.riskLevel === "watch" ? "🟡" : "🟢";
+        return `${risk} ${gp.domain}: ${gp.progressPct}% vs ${gp.expectedPct}% attendu, pace ${gp.currentDailyPace}/j vs ${gp.requiredDailyPace}/j requis, J-${gp.daysLeft}`;
+      }).join("\n");
 
       const streaksContext = `Workout streak: ${workoutStreak}j, Study streak: ${studyStreak}j`;
 
@@ -814,16 +755,17 @@ Finance: ${totalExpenses.toFixed(0)}₪ (moy ${avgExpDaily.toFixed(0)}₪/j) · 
 Santé: ${workouts.length > 0 ? workouts.map((w: any) => w.workout_type).join("+") : "0 workout"} (${workoutsThisWeek}/5) · ${latestWeight || "?"}kg${weightTrend ? ` (${weightTrend}kg/7j)` : ""} → 70kg
 Étude: ${totalStudyMin}min · Leads: ${leadsContactedToday} · Streaks: ${streaksContext}
 ${topFailReason ? `Échec pattern: "${topFailReason[0]}" ${topFailReason[1]}x` : ""}
+Goals:\n${goalsContext}
 Demain: ${TOMORROW_SCHEDULE[tomorrowDay]}`;
 
       const aiReflection = await callOpenAI(
-        `Coach Oren. Réflexion soirée (6 lignes max, français):
-1. Cause racine du score (chiffres réels)
-2. Tendance 7j vs moyenne
-3. Pourquoi tâches non faites
-4. TOP 3 actions demain avec horaires
-5. UNE question de coaching provocante
-Zéro motivation générique. Data-driven. Max 150 mots.`,
+        `Coach Oren. Réflexion soirée (7 lignes max, français):
+1. Quel goal est le plus en danger et pourquoi (pace vs requis)
+2. Cause racine du score aujourd'hui (chiffres)
+3. Lien entre tâches non faites et goals en retard
+4. TOP 3 actions demain orientées goal critique
+5. UNE question de coaching provocante sur l'objectif critique
+Data-driven, focus sur les goals. Max 150 mots.`,
         aiContext,
         300
       );
@@ -881,6 +823,18 @@ Zéro motivation générique. Data-driven. Max 150 mots.`,
           pattern: `${strongDomain}_streak`,
           strength: streakLength,
         }, { target: "morning-briefing", priority: 3, ttlHours: 14 });
+      }
+
+      // Goal intelligence signals — alert morning-briefing about critical goals
+      const criticalGoals = goalPredictions.filter(g => g.riskLevel === "critical" || g.riskLevel === "danger");
+      for (const cg of criticalGoals.slice(0, 2)) {
+        await signals.emit("goal_at_risk", `Goal ${cg.riskLevel}: ${cg.title} — ${cg.progressPct}% (attendu ${cg.expectedPct}%), J-${cg.daysLeft}`, {
+          domain: cg.domain,
+          riskLevel: cg.riskLevel,
+          gap: cg.gap,
+          daysLeft: cg.daysLeft,
+          requiredPace: cg.requiredDailyPace,
+        }, { target: "morning-briefing", priority: cg.riskLevel === "critical" ? 1 : 2, ttlHours: 14 });
       }
     } catch (sigErr) {
       console.error("[Signals] Evening emit error:", sigErr);
@@ -1176,7 +1130,7 @@ Faits + solutions seulement. Max 150 mots.`,
       success: sent, score, scorePct, date: today,
       trends: { tasksAvg: tasksWeekAvg, expenseAvg: avgExpDaily, studyAvg: avgStudyDaily, leadsAvg: avgLeadsDaily },
       streaks: { workout: workoutStreak, study: studyStreak },
-      goals: goalPredictions.map(g => ({ domain: g.domain, pct: g.progressPct, onTrack: g.onTrack })),
+      goals: goalPredictions.map(g => ({ domain: g.domain, pct: g.progressPct, onTrack: g.onTrack, risk: g.riskLevel, gap: g.gap })),
     }), { status: 200, headers: { "Content-Type": "application/json" } });
 
   } catch (error) {

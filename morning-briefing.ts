@@ -6,6 +6,7 @@ import { robustFetch } from "../_shared/robust-fetch.ts";
 import { getIsraelNow, todayStr, daysAgo, DAYS_FR } from "../_shared/timezone.ts";
 import { callOpenAI } from "../_shared/openai.ts";
 import { sendTG, escHTML } from "../_shared/telegram.ts";
+import { rankGoals, analyzeBrainTrend, detectGoalRockMisalignment, generateGoalNudges, buildGoalIntelligenceContext } from "../_shared/goal-engine.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") || "";
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
@@ -725,13 +726,47 @@ serve(async (req: Request) => {
     let priorityDomain = "career";
     let dailyMode = "normal";
     try {
-      let goalsCtx = "";
-      for (const g of activeGoals) {
-        const dLeft = g.deadline ? Math.ceil((new Date(g.deadline).getTime() - now.getTime()) / 86400000) : null;
-        goalsCtx += `- ${g.domain}: ${g.title} (${g.metric_current}/${g.metric_target}${g.metric_unit || ""})`;
-        if (dLeft !== null) goalsCtx += ` [${dLeft}j]`;
-        goalsCtx += "\n";
-      }
+      // === GOAL INTELLIGENCE ENGINE ===
+      const rankedGoalsList = rankGoals(activeGoals, now);
+
+      // 7-day brain trend analysis
+      let trendData = { dominantDomain: null as string | null, urgenceDays: 0, pattern: "insufficient_data", stuckDomains: [] as string[] };
+      try {
+        const { data: brainHistory } = await supabase.from("daily_brain")
+          .select("priority_domain, daily_mode")
+          .gte("plan_date", daysAgo(7))
+          .order("plan_date", { ascending: false });
+        if (brainHistory && brainHistory.length > 0) {
+          trendData = analyzeBrainTrend(brainHistory);
+        }
+      } catch (_) {}
+
+      // Goal-Rock misalignment detection
+      const misalignments = detectGoalRockMisalignment(rankedGoalsList, rocks);
+
+      // Build enriched goal intelligence context for AI
+      const goalIntelCtx = buildGoalIntelligenceContext(rankedGoalsList, trendData, misalignments);
+
+      // Auto-create goal nudge tasks (daily_actions not yet done)
+      try {
+        const { data: todayDoneTasks } = await supabase.from("tasks")
+          .select("title").eq("due_date", today)
+          .in("status", ["completed", "in_progress"]);
+        const doneTitles = (todayDoneTasks || []).map((t: any) => t.title || "");
+        const nudges = generateGoalNudges(rankedGoalsList, doneTitles, today);
+        for (const nudge of nudges) {
+          // Dedup: don't create if similar task exists
+          const { data: existing } = await supabase.from("tasks")
+            .select("id").eq("context", nudge.context).eq("due_date", today)
+            .in("status", ["pending", "in_progress"]).limit(1);
+          if (existing && existing.length > 0) continue;
+          await supabase.from("tasks").insert({
+            title: nudge.title, status: "pending", priority: nudge.priority,
+            agent_type: nudge.domain, context: nudge.context,
+            due_date: nudge.due_date, created_at: new Date().toISOString(),
+          });
+        }
+      } catch (nudgeErr) { console.error("Goal nudge error:", nudgeErr); }
 
       const tasksCtx = allTasks.length > 0
         ? allTasks.slice(0, 10).map((t: any) => `- P${t.priority}: ${t.title}${t.due_time ? ` @${t.due_time.substring(0, 5)}` : ""}`).join("\n")
@@ -770,38 +805,49 @@ serve(async (req: Request) => {
         if (topReason) anticipationsCtx += `⚠️ ${dayName} jour faible (${topReason[0]} ${topReason[1]}x)\n`;
       }
 
+      // Trend context for AI
+      let trendCtx = "";
+      if (trendData.pattern === "chronic_urgence") trendCtx = `⚠️ TREND: Mode urgence ${trendData.urgenceDays}/7 jours — attention burnout`;
+      else if (trendData.pattern === "stuck_on_domain") trendCtx = `⚠️ TREND: Bloqué sur ${trendData.dominantDomain} depuis 5+ jours`;
+      else if (trendData.pattern === "frequent_urgence") trendCtx = `⚡ TREND: Urgence fréquente (${trendData.urgenceDays}/7j)`;
+
       const brainContext = `${dayName} ${today}
 Rocks: ${rocksCtx || "aucun"}${rocksOffTrack.length > 0 ? ` | ⚠️ OFF: ${rocksOffTrack.join(", ")}` : ""}
 Career: ${newJobs} new, ${appliedJobs} applied, ${interviews} interviews · Vélocité ${appVelocity}/j (requis ${requiredDailyApps}/j) · ${rejections.length} rejets${interviews === 0 ? " ⚠️ 0 INTERVIEWS" : ""}
 HiGrow: ${convertedLeads}/${totalLeads || "?"} convertis · Finance: ${balance > 0 ? "+" : ""}${Math.round(balance)}₪
-Objectifs: ${goalsCtx || "aucun"}
-Tâches: ${tasksCtx}
+🎯 GOAL INTELLIGENCE:
+${goalIntelCtx || "Aucun objectif actif"}${misalignments.length > 0 ? `\n⚠️ MISALIGNMENT: ${misalignments.map(m => m.issue).join("; ")}` : ""}
+${trendCtx ? `${trendCtx}\n` : ""}Tâches: ${tasksCtx}
 ${signalsCtx ? `Signaux: ${signalsCtx}` : ""}${anticipationsCtx ? `Anticipations: ${anticipationsCtx}` : ""}`.trim();
 
       brainText = await callOpenAI(
         `Briefing matin Oren (HTML: <b>, <i>). Format strict:
-🔴/🟡/🟢 URGENCE — Domaine · ${dayName}
-💼 Career stats · 🚀 HiGrow · 📋 Tâches · 💰 Balance
-🪨 Rocks off-track en priorité
-${overnightSignals.weakDomain ? `⚠️ Faible hier: ${overnightSignals.weakDomain}` : ""}${overnightSignals.interviewAlert ? " 🔴 INTERVIEW PREP" : ""}
-⚡ UNE action concrète
-🔴=0 interviews/deadline<30j/off-track · 🟢=tout on-track
-Max 8 lignes, data-driven, actionnable.`,
+🔴/🟡/🟢 URGENCE — Domaine prioritaire · ${dayName}
+🎯 Goal le + critique: pace actuel vs requis, J-X, risque
+💼 Career · 🚀 HiGrow · 💰 Finance (chiffres réels)
+🪨 Rocks off-track${overnightSignals.interviewAlert ? " · 🔴 INTERVIEW PREP" : ""}
+${trendCtx ? `📊 Trend 7j\n` : ""}⚡ UNE action concrète pour débloquer le goal critique
+🔴=goal critique/danger · 🟡=watch · 🟢=on track
+Max 8 lignes, data-driven, focus sur le goal le plus en retard.`,
         brainContext,
         350
       );
 
-      // Priority domain (Rock-aware + signal-aware)
+      // Priority domain: Goal-aware + Rock-aware + signal-aware
+      const criticalGoal = rankedGoalsList.find(g => g.riskLevel === "critical" || g.riskLevel === "danger");
       const offTrackRock = rocks.find((r: any) => r.current_status === "off_track");
       if (overnightSignals.interviewAlert) priorityDomain = "career";
+      else if (criticalGoal) priorityDomain = criticalGoal.domain;
       else if (offTrackRock) priorityDomain = offTrackRock.domain;
       else if (interviews === 0 && appliedJobs < 5) priorityDomain = "career";
       else if (convertedLeads === 0) priorityDomain = "higrow";
       else if (overnightSignals.weakDomain) priorityDomain = overnightSignals.weakDomain;
 
-      // Daily mode
+      // Daily mode — goal-aware
       const velocityBehind = requiredDailyApps !== "N/A" && parseFloat(appVelocity) < parseFloat(requiredDailyApps);
-      if (interviews === 0 || convertedLeads === 0 || velocityBehind || rocksOffTrack.length > 0) dailyMode = "urgence";
+      const hasCriticalGoal = rankedGoalsList.some(g => g.riskLevel === "critical");
+      const hasDangerGoal = rankedGoalsList.some(g => g.riskLevel === "danger" && g.daysLeft <= 14);
+      if (interviews === 0 || convertedLeads === 0 || velocityBehind || rocksOffTrack.length > 0 || hasCriticalGoal || hasDangerGoal) dailyMode = "urgence";
 
       // Auto-create follow-up tasks for stale applications
       for (const app of staleApps.slice(0, 3)) {

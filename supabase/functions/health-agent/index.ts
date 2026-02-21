@@ -383,10 +383,24 @@ Français, direct.`,
     msg += `\n<b>🧠 Analyse IA:</b>\n${aiReview}\n`;
   }
 
-  // Update goal metric_current with latest weight
+  // Update goal metric_current with latest weight + sync health rock
   if (goal && weights.length > 0) {
     const latestWeight = weights[weights.length - 1].value;
     await supabase.from("goals").update({ metric_current: latestWeight }).eq("id", goal.id);
+    // Sync health rock progress
+    try {
+      const { data: healthRock } = await supabase.from("rocks").select("id")
+        .eq("domain", "health").in("current_status", ["on_track", "off_track"]).limit(1);
+      if (healthRock && healthRock.length > 0) {
+        const targetWeight = Number(goal.metric_target) || 70;
+        const onTrack = latestWeight <= targetWeight * 1.05; // within 5% of target
+        await supabase.from("rocks").update({
+          progress_notes: `Poids: ${latestWeight}kg (objectif ${targetWeight}kg), ${workouts.length} workouts cette semaine`,
+          current_status: onTrack ? "on_track" : "off_track",
+          updated_at: new Date().toISOString(),
+        }).eq("id", healthRock[0].id);
+      }
+    } catch (_) {}
   }
 
   return msg;

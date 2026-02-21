@@ -7,6 +7,7 @@ import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { getGoogleCalendar, GCAL_COLORS } from "../_shared/google-calendar.ts";
 import { getSignalBus } from "../_shared/agent-signals.ts";
+import { rankGoals, formatGoalIntelligence } from "../_shared/goal-engine.ts";
 
 // --- Types Telegram ---
 interface TelegramUpdate {
@@ -3758,6 +3759,27 @@ async function handleCallbackQuery(callbackId: string, chatId: number, data: str
   else if (data === "menu_scorecard") {
     await handleScorecard(chatId);
   }
+  // === GOAL UPDATE CALLBACKS ===
+  else if (data.startsWith("goal_inc_")) {
+    const domain = data.replace("goal_inc_", "");
+    try {
+      const { data: goal } = await supabase.from("goals")
+        .select("id, metric_current, metric_target, metric_unit, direction, title")
+        .eq("domain", domain).eq("status", "active").limit(1).single();
+      if (goal) {
+        const current = Number(goal.metric_current) || 0;
+        const isDecrease = goal.direction === "decrease";
+        const newValue = isDecrease ? current - 1 : current + 1;
+        await supabase.from("goals").update({ metric_current: newValue }).eq("id", goal.id);
+        const arrow = isDecrease ? "↓" : "↑";
+        await sendTelegramMessage(chatId, `✅ ${goal.title}: ${current} → ${newValue}${goal.metric_unit || ""} ${arrow}`);
+        // Refresh goals view
+        await handleGoals(chatId);
+      } else {
+        await sendTelegramMessage(chatId, `Aucun objectif actif pour ${domain}`);
+      }
+    } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
+  }
   // === CIR CALLBACKS ===
   else if (data === "menu_cirs") {
     await handleCIR(chatId, []);
@@ -5050,41 +5072,27 @@ async function handleGoals(chatId: number): Promise<void> {
       return;
     }
 
-    const domainEmoji: Record<string, string> = {
-      career: "💼", finance: "💰", health: "🏋️",
-      higrow: "🚀", trading: "📈", learning: "📚", personal: "🏠"
-    };
+    // Use Goal Intelligence Engine
+    const ranked = rankGoals(goals);
+    const text = formatGoalIntelligence(ranked);
 
-    let text = "🎯 *MES OBJECTIFS*\n\n";
-    goals.forEach((g: any) => {
+    // Build inline update buttons for top goals
+    const buttons: InlineKeyboardButton[][] = [];
+    for (const g of ranked.slice(0, 4)) {
+      const domainEmoji: Record<string, string> = {
+        career: "💼", finance: "💰", health: "🏋️",
+        higrow: "🚀", trading: "📈", learning: "📚", personal: "🏠",
+      };
       const emoji = domainEmoji[g.domain] || "📌";
-      const current = Number(g.metric_current) || 0;
-      const target = Number(g.metric_target) || 1;
-      const start = Number(g.metric_start) || 0;
-      const isDecrease = g.direction === 'decrease';
+      // Quick increment button
+      const increment = g.direction === "decrease" ? "-1" : "+1";
+      buttons.push([
+        { text: `${emoji} ${g.title.substring(0, 16)} (${increment})`, callback_data: `goal_inc_${g.domain}` },
+      ]);
+    }
+    buttons.push([{ text: "🔙 Menu", callback_data: "menu_main" }]);
 
-      let progress: number;
-      if (isDecrease && start > target) {
-        // Decrease goal (e.g., weight: 75 → 70kg, currently 72.5)
-        const totalToLose = start - target;       // 75 - 70 = 5
-        const alreadyLost = start - current;      // 75 - 72.5 = 2.5
-        progress = Math.max(0, Math.min(100, Math.round((alreadyLost / totalToLose) * 100)));
-      } else {
-        progress = target > 0 ? Math.min(100, Math.round((current / target) * 100)) : 0;
-      }
-
-      const daysLeft = g.deadline ? Math.ceil((new Date(g.deadline).getTime() - Date.now()) / 86400000) : null;
-      const barFilled = Math.round(progress / 10);
-      const bar = "█".repeat(barFilled) + "░".repeat(10 - barFilled);
-
-      text += `${emoji} *${g.title}*\n`;
-      text += `   ${bar} ${progress}%\n`;
-      text += `   ${current}/${target}${g.metric_unit}`;
-      if (daysLeft !== null) text += ` · ${daysLeft}j restants`;
-      text += `\n\n`;
-    });
-
-    await sendTelegramMessage(chatId, text);
+    await sendTelegramMessage(chatId, text, "HTML", { inline_keyboard: buttons });
   } catch (e) {
     console.error("Goals error:", e);
     await sendTelegramMessage(chatId, `error: ${String(e).substring(0, 50)}`);
@@ -5111,7 +5119,7 @@ async function handleDashboard(chatId: number): Promise<void> {
         .eq("due_date", today).in("status", ["pending", "in_progress", "completed"])
         .order("priority", { ascending: true }).limit(20),
       // Goals: active
-      supabase.from("goals").select("domain, title, metric_current, metric_target, metric_unit, deadline, priority")
+      supabase.from("goals").select("domain, title, metric_current, metric_target, metric_unit, metric_start, direction, deadline, priority, daily_actions, created_at")
         .eq("status", "active").order("priority").limit(8),
       // Career: pipeline
       supabase.from("job_listings").select("status")
@@ -5165,17 +5173,14 @@ async function handleDashboard(chatId: number): Promise<void> {
     const balance = monthIncome - monthExpense;
     const savingsRate = monthIncome > 0 ? Math.round(((monthIncome - monthExpense) / monthIncome) * 100) : 0;
 
-    // Process goals urgency
-    const urgentGoals = goals.filter((g: any) => {
-      if (!g.deadline) return false;
-      const daysLeft = Math.ceil((new Date(g.deadline).getTime() - now.getTime()) / 86400000);
-      return daysLeft <= 30;
-    });
+    // Goal Intelligence — ranked by urgency
+    const rankedGoals = rankGoals(goals);
+    const criticalGoals = rankedGoals.filter(g => g.riskLevel === "critical" || g.riskLevel === "danger");
 
-    // Determine urgency level
+    // Determine urgency level — goal-aware
     let urgency = "🟢";
-    if (interviews === 0 || converted === 0 || urgentGoals.length > 0) urgency = "🔴";
-    else if (applied < 5 || savingsRate < 20) urgency = "🟡";
+    if (interviews === 0 || converted === 0 || criticalGoals.length > 0) urgency = "🔴";
+    else if (applied < 5 || savingsRate < 20 || rankedGoals.some(g => g.riskLevel === "watch")) urgency = "🟡";
 
     // Build message
     let msg = `${urgency} *DASHBOARD* — ${dayName} ${today}\n`;
@@ -5206,13 +5211,17 @@ async function handleDashboard(chatId: number): Promise<void> {
     // Health
     msg += `\n🏋️ *SANTE:* ${weight}kg · ${workoutCount}/5 workouts · ${Math.round(studyMinutes / 60)}h étude\n`;
 
-    // Goals
-    if (urgentGoals.length > 0) {
-      msg += `\n🎯 *OBJECTIFS URGENTS:*\n`;
-      for (const g of urgentGoals.slice(0, 3)) {
-        const daysLeft = Math.ceil((new Date(g.deadline).getTime() - now.getTime()) / 86400000);
-        const progress = g.metric_target ? Math.round((g.metric_current / g.metric_target) * 100) : 0;
-        msg += `  ${g.domain === "career" ? "💼" : g.domain === "health" ? "🏋️" : g.domain === "higrow" ? "🚀" : "🎯"} ${g.title}: ${progress}% · J-${daysLeft}\n`;
+    // Goals — Intelligence-driven
+    if (rankedGoals.length > 0) {
+      const topGoals = rankedGoals.slice(0, 3);
+      msg += `\n🎯 *OBJECTIFS:*\n`;
+      for (const g of topGoals) {
+        const riskIcon = g.riskLevel === "critical" ? "🔴" : g.riskLevel === "danger" ? "🟠" : g.riskLevel === "watch" ? "🟡" : "🟢";
+        const domEmoji = g.domain === "career" ? "💼" : g.domain === "health" ? "🏋️" : g.domain === "higrow" ? "🚀" : g.domain === "finance" ? "💰" : "🎯";
+        msg += `  ${domEmoji} ${g.title}: ${g.progressPct}% ${riskIcon}`;
+        if (g.daysLeft < 999) msg += ` · J-${g.daysLeft}`;
+        if (g.gap > 0) msg += ` (-${g.gap}%)`;
+        msg += `\n`;
       }
     }
 
@@ -6637,6 +6646,31 @@ serve(async (req: Request) => {
       await handleInsights(chatId);
     } else if (command === "/goals") {
       await handleGoals(chatId);
+    } else if (command === "/goal") {
+      // /goal update <domain> <value> — Quick metric update
+      if (args[0] === "update" && args[1] && args[2]) {
+        const domain = args[1].toLowerCase();
+        const newValue = parseFloat(args[2]);
+        if (isNaN(newValue)) {
+          await sendTelegramMessage(chatId, "Format: /goal update <domaine> <valeur>\nEx: /goal update health 72.5");
+        } else {
+          try {
+            const supabase = getSupabaseClient();
+            const { data: goal } = await supabase.from("goals")
+              .select("id, title, metric_current, metric_unit")
+              .eq("domain", domain).eq("status", "active").limit(1).single();
+            if (goal) {
+              const oldValue = Number(goal.metric_current) || 0;
+              await supabase.from("goals").update({ metric_current: newValue }).eq("id", goal.id);
+              await sendTelegramMessage(chatId, `✅ ${goal.title}: ${oldValue} → ${newValue}${goal.metric_unit || ""}`);
+            } else {
+              await sendTelegramMessage(chatId, `Aucun objectif actif pour "${domain}"`);
+            }
+          } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
+        }
+      } else {
+        await sendTelegramMessage(chatId, "Usage:\n/goals — Voir les objectifs\n/goal update <domaine> <valeur>\nEx: /goal update career 45\nEx: /goal update health 72.5");
+      }
     } else if (command === "/focus") {
       await handleFocus(chatId, args);
     } else if (command === "/cleanup") {

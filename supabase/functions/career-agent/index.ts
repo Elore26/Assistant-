@@ -684,13 +684,27 @@ serve(async (req: Request) => {
     // Get pipeline data (after scraping so counts are up to date)
     const pipeline = await getPipelineSummary(supabase);
 
-    // Auto-update career goal metric (total applications sent)
+    // Auto-update career goal metric + sync with career rock
     try {
-      const { data: careerGoal } = await supabase.from("goals").select("id, metric_target")
-        .eq("domain", "career").eq("status", "active").limit(1);
-      if (careerGoal && careerGoal.length > 0) {
-        const totalApplied = pipeline.applied + pipeline.interview + pipeline.offer;
-        await supabase.from("goals").update({ metric_current: totalApplied }).eq("id", careerGoal[0].id);
+      const totalApplied = pipeline.applied + pipeline.interview + pipeline.offer;
+      const [goalRes, rockRes] = await Promise.all([
+        supabase.from("goals").select("id, metric_target")
+          .eq("domain", "career").eq("status", "active").limit(1),
+        supabase.from("rocks").select("id, title, measurable_target")
+          .eq("domain", "career").in("current_status", ["on_track", "off_track"]).limit(1),
+      ]);
+      if (goalRes.data && goalRes.data.length > 0) {
+        await supabase.from("goals").update({ metric_current: totalApplied }).eq("id", goalRes.data[0].id);
+      }
+      // Sync rock: update progress notes + status based on pipeline
+      if (rockRes.data && rockRes.data.length > 0) {
+        const rock = rockRes.data[0];
+        const hasInterviews = pipeline.interview > 0;
+        const newStatus = hasInterviews ? "on_track" : (totalApplied >= 10 ? "on_track" : "off_track");
+        await supabase.from("rocks").update({
+          progress_notes: `${totalApplied} candidatures, ${pipeline.interview} entretiens, ${pipeline.offer} offres`,
+          current_status: newStatus, updated_at: new Date().toISOString(),
+        }).eq("id", rock.id);
       }
     } catch (_) {}
 
