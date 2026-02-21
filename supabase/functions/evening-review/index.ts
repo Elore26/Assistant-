@@ -6,26 +6,12 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { getSignalBus } from "../_shared/agent-signals.ts";
+import { getIsraelNow, todayStr, daysAgo, DAYS_FR } from "../_shared/timezone.ts";
+import { callOpenAI } from "../_shared/openai.ts";
+import { sendTG, escHTML } from "../_shared/telegram.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") || "";
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
-const TELEGRAM_BOT_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN") || "";
-const TELEGRAM_CHAT_ID = Deno.env.get("TELEGRAM_CHAT_ID") || "775360436";
-
-// --- Israel timezone ---
-function getIsraelDate(): Date {
-  return new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Jerusalem" }));
-}
-function getIsraelDateStr(): string {
-  const d = getIsraelDate();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-}
-function daysAgo(n: number): string {
-  const d = new Date(getIsraelDate().getTime() - n * 24 * 60 * 60 * 1000);
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-}
-
-const DAYS_FR = ["Dimanche", "Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi"];
 
 const DOMAIN_EMOJIS: Record<string, string> = {
   career: "💼", finance: "💰", health: "🏋️", higrow: "🚀",
@@ -42,46 +28,7 @@ const TOMORROW_SCHEDULE: Record<number, string> = {
   6: "Samedi — OFF · Repos actif",
 };
 
-// --- OpenAI ---
-async function callOpenAI(systemPrompt: string, userContent: string, maxTokens = 600): Promise<string> {
-  const apiKey = Deno.env.get("OPENAI_API_KEY");
-  if (!apiKey) return "";
-  try {
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
-      body: JSON.stringify({
-        model: "gpt-4o-mini", temperature: 0.7, max_tokens: maxTokens,
-        messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userContent }],
-      }),
-    });
-    if (!response.ok) return "";
-    const data = await response.json();
-    return data.choices?.[0]?.message?.content || "";
-  } catch (e) { console.error("OpenAI error:", e); return ""; }
-}
-
-// --- Telegram ---
-async function sendTelegram(text: string, buttons?: any[][]): Promise<boolean> {
-  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-  const payload: any = { chat_id: TELEGRAM_CHAT_ID, text, parse_mode: "HTML", disable_web_page_preview: true };
-  if (buttons && buttons.length > 0) payload.reply_markup = { inline_keyboard: buttons };
-  let r = await fetch(url, {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  if (r.ok) return true;
-  // Fallback plain text
-  r = await fetch(url, {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: text.replace(/<[^>]*>/g, "") }),
-  });
-  return r.ok;
-}
-
-function esc(s: string): string {
-  return (s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
+// OpenAI, Telegram, escHTML imported from _shared modules above
 
 // --- Progress bar visual ---
 function progressBar(current: number, target: number, width = 10, start?: number, direction?: string): string {
@@ -110,20 +57,20 @@ serve(async (_req: Request) => {
   try {
     const signals = getSignalBus("evening-review");
     const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
-    const now = getIsraelDate();
+    const now = getIsraelNow();
     const day = now.getDay();
-    const todayStr = getIsraelDateStr();
+    const today = todayStr();
     const dayName = DAYS_FR[day];
     const weekAgoStr = daysAgo(7);
 
     // --- Deduplication: skip if evening review already sent today ---
     try {
       const { data: existingReview } = await supabase.from("briefings")
-        .select("id").eq("briefing_type", "evening").eq("briefing_date", todayStr).limit(1);
+        .select("id").eq("briefing_type", "evening").eq("briefing_date", today).limit(1);
       if (existingReview && existingReview.length > 0) {
-        console.log(`[Evening Review] Already sent today (${todayStr}), skipping duplicate`);
+        console.log(`[Evening Review] Already sent today (${today}), skipping duplicate`);
         return new Response(JSON.stringify({
-          success: true, type: "skipped_duplicate", date: todayStr,
+          success: true, type: "skipped_duplicate", date: today,
         }), { headers: { "Content-Type": "application/json" } });
       }
     } catch (_) {}
@@ -148,34 +95,34 @@ serve(async (_req: Request) => {
     ] = await Promise.all([
       // Today's completed tasks
       supabase.from("tasks").select("title, status, updated_at, agent_type")
-        .eq("status", "completed").gte("updated_at", todayStr + "T00:00:00"),
+        .eq("status", "completed").gte("updated_at", today + "T00:00:00"),
       // Pending tasks
       supabase.from("tasks").select("id, title, priority, due_date, agent_type")
         .in("status", ["pending", "in_progress"]).order("priority"),
       // Today's finance
       supabase.from("finance_logs").select("transaction_type, amount, category")
-        .eq("transaction_date", todayStr),
+        .eq("transaction_date", today),
       // 7-day finance
       supabase.from("finance_logs").select("transaction_type, amount, transaction_date")
-        .gte("transaction_date", weekAgoStr).lte("transaction_date", todayStr),
+        .gte("transaction_date", weekAgoStr).lte("transaction_date", today),
       // Today's health
       supabase.from("health_logs").select("log_type, workout_type, duration_minutes, value")
-        .eq("log_date", todayStr),
+        .eq("log_date", today),
       // 7-day health (workouts + weight)
       supabase.from("health_logs").select("log_type, workout_type, duration_minutes, value, log_date")
-        .gte("log_date", weekAgoStr).lte("log_date", todayStr),
+        .gte("log_date", weekAgoStr).lte("log_date", today),
       // Today's learning
       supabase.from("study_sessions").select("topic, duration_minutes")
-        .eq("session_date", todayStr),
+        .eq("session_date", today),
       // 7-day learning
       supabase.from("study_sessions").select("duration_minutes, session_date")
-        .gte("session_date", weekAgoStr).lte("session_date", todayStr),
+        .gte("session_date", weekAgoStr).lte("session_date", today),
       // Active signals
       supabase.from("trading_signals").select("symbol, signal_type, confidence, notes")
         .eq("status", "active"),
       // Today's leads contacted
       supabase.from("leads").select("name, status")
-        .gte("last_contact_date", todayStr + "T00:00:00").lte("last_contact_date", todayStr + "T23:59:59"),
+        .gte("last_contact_date", today + "T00:00:00").lte("last_contact_date", today + "T23:59:59"),
       // 7-day leads
       supabase.from("leads").select("name, status, last_contact_date")
         .gte("last_contact_date", weekAgoStr + "T00:00:00"),
@@ -270,7 +217,7 @@ serve(async (_req: Request) => {
     function calcStreak(dates: string[]): number {
       if (dates.length === 0) return 0;
       const sorted = [...new Set(dates)].sort().reverse();
-      const today = todayStr;
+      const today = todayStr();
       const yesterday = daysAgo(1);
       if (sorted[0] !== today && sorted[0] !== yesterday) return 0;
       let streak = 1;
@@ -290,7 +237,7 @@ serve(async (_req: Request) => {
     const studyStreak = calcStreak(studyDates);
 
     // --- Accountability: planned but not done (human tasks only) ---
-    const failedTasks = humanPending.filter((t: any) => t.due_date === todayStr);
+    const failedTasks = humanPending.filter((t: any) => t.due_date === today);
     const failedCount = failedTasks.length;
     const todayTotalScheduled = tasksDoneToday + failedCount;
     const completionRate = todayTotalScheduled > 0
@@ -485,7 +432,7 @@ serve(async (_req: Request) => {
     // ============================================
     // BUILD MESSAGE
     // ============================================
-    let msg = `<b>📋 BILAN</b> — ${dayName} ${todayStr}\n${LINE}\n\n`;
+    let msg = `<b>📋 BILAN</b> — ${dayName} ${today}\n${LINE}\n\n`;
 
     // --- SCORE ---
     msg += `${scoreEmoji} <b>Score: ${score}/${maxScore}</b> (${scorePct}%)\n`;
@@ -498,7 +445,7 @@ serve(async (_req: Request) => {
     msg += `✅ ${tasksDoneToday} faites · ❌ ${failedCount} non faites · Taux: <b>${completionRate}%</b>\n`;
     if (humanCompleted.length > 0) {
       humanCompleted.slice(0, 4).forEach((t: any) => {
-        msg += `  ✓ ${esc(t.title)}\n`;
+        msg += `  ✓ ${escHTML(t.title)}\n`;
       });
       if (humanCompleted.length > 4) msg += `  + ${humanCompleted.length - 4} autres\n`;
     }
@@ -507,7 +454,7 @@ serve(async (_req: Request) => {
       failedTasks.slice(0, 15).forEach((t: any) => {
         const dueTime = t.due_time ? ` (${t.due_time.substring(0, 5)})` : "";
         const p = (t.priority || 3) <= 1 ? "🔴" : (t.priority || 3) === 2 ? "🟠" : "🟡";
-        msg += `  ✗ ${p} ${esc(t.title)}${dueTime}\n`;
+        msg += `  ✗ ${p} ${escHTML(t.title)}${dueTime}\n`;
       });
       if (failedTasks.length > 15) msg += `  <i>+ ${failedTasks.length - 15} autres tâches anciennes...</i>\n`;
       if (completionRate < 50) {
@@ -522,7 +469,7 @@ serve(async (_req: Request) => {
     if (financeLogs.length > 0) {
       msg += `Dépenses: <b>${totalExpenses.toFixed(0)}₪</b> · Revenus: <b>${totalIncome.toFixed(0)}₪</b>\n`;
       if (topCats.length > 0) {
-        msg += `  ${topCats.map(([cat, amt]) => `${esc(cat)} ${amt.toFixed(0)}₪`).join(" · ")}\n`;
+        msg += `  ${topCats.map(([cat, amt]) => `${escHTML(cat)} ${amt.toFixed(0)}₪`).join(" · ")}\n`;
       }
       msg += `  <i>Moy 7j: ${avgExpDaily.toFixed(0)}₪/jour · Épargne: ${savingsRate7d}%</i>\n`;
     } else {
@@ -594,7 +541,7 @@ serve(async (_req: Request) => {
       for (const gp of top3Goals) {
         const emoji = DOMAIN_EMOJIS[gp.domain] || "📌";
         const status = gp.onTrack ? "✅" : "⚠️";
-        msg += `${emoji} <b>${esc(gp.title)}</b>\n`;
+        msg += `${emoji} <b>${escHTML(gp.title)}</b>\n`;
         msg += `  ${progressBar(gp.current, gp.target, 10, gp.start, gp.direction)} · ${gp.current}/${gp.target}${gp.unit}\n`;
         msg += `  ${status} J-${gp.daysLeft}`;
         if (!gp.onTrack) msg += ` · ⚠️ Retard estimé`;
@@ -618,11 +565,11 @@ serve(async (_req: Request) => {
     // Save daily velocity metrics
     try {
       const todayCreated = await supabase.from("tasks").select("id", { count: "exact", head: true })
-        .gte("created_at", todayStr + "T00:00:00").lte("created_at", todayStr + "T23:59:59");
+        .gte("created_at", today + "T00:00:00").lte("created_at", today + "T23:59:59");
       const todayRescheduled = await supabase.from("tasks").select("id", { count: "exact", head: true })
-        .gt("reschedule_count", 0).gte("updated_at", todayStr + "T00:00:00");
+        .gt("reschedule_count", 0).gte("updated_at", today + "T00:00:00");
       const todayPomodoros = await supabase.from("pomodoro_sessions").select("id, duration_minutes")
-        .eq("completed", true).gte("started_at", todayStr + "T00:00:00");
+        .eq("completed", true).gte("started_at", today + "T00:00:00");
 
       const pomCount = todayPomodoros.data?.length || 0;
       const deepWork = (todayPomodoros.data || []).reduce((s: number, p: any) => s + (p.duration_minutes || 25), 0);
@@ -634,7 +581,7 @@ serve(async (_req: Request) => {
         .order("reschedule_count", { ascending: false }).limit(1);
 
       await supabase.from("task_metrics").upsert({
-        metric_date: todayStr,
+        metric_date: today,
         tasks_completed: tasksDoneToday,
         tasks_created: todayCreated.count || 0,
         tasks_rescheduled: todayRescheduled.count || 0,
@@ -686,12 +633,12 @@ serve(async (_req: Request) => {
         const time = t.due_time ? `${t.due_time.substring(0, 5)} ` : "";
         const rInfo = (t.reschedule_count || 0) > 0 ? ` (x${t.reschedule_count})` : "";
         const dur = t.duration_minutes ? ` [${t.duration_minutes}min]` : "";
-        msg += `${i + 1}. ${p} ${time}${esc(t.title)}${dur}${ctx}${overdue}${rInfo}\n`;
+        msg += `${i + 1}. ${p} ${time}${escHTML(t.title)}${dur}${ctx}${overdue}${rInfo}\n`;
       });
       msg += `\n`;
 
       if (winTask) {
-        msg += `<b>🎯 WIN du jour:</b> ${esc(winTask.title)}\n`;
+        msg += `<b>🎯 WIN du jour:</b> ${escHTML(winTask.title)}\n`;
       }
     } else {
       // Fall back to high priority pending tasks
@@ -702,7 +649,7 @@ serve(async (_req: Request) => {
         msg += `<b>⚡ Priorités:</b>\n`;
         urgentTasks.forEach((t: any) => {
           const domainEmoji = DOMAIN_EMOJIS[t.agent_type] || "📌";
-          msg += `  ${domainEmoji} ${esc(t.title)}\n`;
+          msg += `  ${domainEmoji} ${escHTML(t.title)}\n`;
         });
       } else {
         msg += `Aucune tâche planifiée.\n`;
@@ -822,21 +769,23 @@ Style: coach ultra-direct, français, data-driven. Max 200 mots.`,
     // ============================================
     // SEND + SAVE
     // ============================================
-    const sent = await sendTelegram(msg, [
-      [
-        { text: "✅ Valider plan demain", callback_data: `plan_validate_${tmrwStr}` },
-        { text: "✏️ Modifier", callback_data: "menu_tasks" },
+    const sent = await sendTG(msg, {
+      buttons: [
+        [
+          { text: "✅ Valider plan demain", callback_data: `plan_validate_${tmrwStr}` },
+          { text: "✏️ Modifier", callback_data: "menu_tasks" },
+        ],
+        [
+          { text: "📊 Vélocité", callback_data: "menu_velocity" },
+          { text: "🎯 Sprint", callback_data: "menu_sprint" },
+        ],
       ],
-      [
-        { text: "📊 Vélocité", callback_data: "menu_velocity" },
-        { text: "🎯 Sprint", callback_data: "menu_sprint" },
-      ],
-    ]);
+    });
 
     try {
       await supabase.from("briefings").insert({
         briefing_type: "evening",
-        briefing_date: todayStr,
+        briefing_date: today,
         content: msg,
         sent_at: new Date().toISOString(),
       });
@@ -846,7 +795,7 @@ Style: coach ultra-direct, français, data-driven. Max 200 mots.`,
     try {
       await supabase.from("health_logs").insert({
         log_type: "daily_score",
-        log_date: todayStr,
+        log_date: today,
         value: score,
         notes: JSON.stringify({
           score, maxScore, scorePct,
@@ -858,7 +807,7 @@ Style: coach ultra-direct, français, data-driven. Max 200 mots.`,
     } catch (_) {}
 
     return new Response(JSON.stringify({
-      success: sent, score, scorePct, date: todayStr,
+      success: sent, score, scorePct, date: today,
       trends: { tasksAvg: tasksWeekAvg, expenseAvg: avgExpDaily, studyAvg: avgStudyDaily, leadsAvg: avgLeadsDaily },
       streaks: { workout: workoutStreak, study: studyStreak },
       goals: goalPredictions.map(g => ({ domain: g.domain, pct: g.progressPct, onTrack: g.onTrack })),

@@ -6,50 +6,19 @@
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { getIsraelNow, todayStr, daysAgo, DAYS_FR } from "../_shared/timezone.ts";
+import { callOpenAI } from "../_shared/openai.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") || "";
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
-const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY") || "";
-
-function getIsraelNow(): Date {
-  return new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Jerusalem" }));
-}
-
-function dateStr(): string {
-  const d = getIsraelNow();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-}
-
-function daysAgo(n: number): string {
-  const d = new Date(getIsraelNow().getTime() - n * 86400000);
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-}
-
-async function callOpenAI(systemPrompt: string, userContent: string, maxTokens = 500): Promise<string> {
-  if (!OPENAI_API_KEY) return "";
-  try {
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${OPENAI_API_KEY}` },
-      body: JSON.stringify({
-        model: "gpt-4o-mini", temperature: 0.7, max_tokens: maxTokens,
-        messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userContent }],
-      }),
-    });
-    const data = await response.json();
-    return data.choices?.[0]?.message?.content || "";
-  } catch (e) { console.error("OpenAI error:", e); return ""; }
-}
-
-const DAYS = ["Dimanche", "Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi"];
 
 serve(async (_req: Request) => {
   try {
     const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
     const now = getIsraelNow();
-    const today = dateStr();
+    const today = todayStr();
     const day = now.getDay();
-    const dayName = DAYS[day];
+    const dayName = DAYS_FR[day];
 
     // Skip Saturday
     if (day === 6) {

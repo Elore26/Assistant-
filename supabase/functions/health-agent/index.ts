@@ -13,50 +13,10 @@ interface WorkoutProgram { type: string; title: string; duration: number; exerci
 interface MealPlan { meal: string; time: string; foods: string; calories: number; protein: number; }
 interface DayHealthPlan { workout: WorkoutProgram | null; meals: MealPlan[]; fasting: { start: string; end: string; eating_window: string }; water_target: number; steps_target: number; supplements: string[]; }
 
-// --- Timezone ---
-function getIsraelNow(): Date {
-  return new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Jerusalem" }));
-}
-function todayStr(): string {
-  const d = getIsraelNow();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-}
-
-// --- OpenAI ---
-async function callOpenAI(systemPrompt: string, userContent: string, maxTokens = 800): Promise<string> {
-  const apiKey = Deno.env.get("OPENAI_API_KEY");
-  if (!apiKey) return "";
-  try {
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
-      body: JSON.stringify({
-        model: "gpt-4o-mini", temperature: 0.6, max_tokens: maxTokens,
-        messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userContent }],
-      }),
-    });
-    if (!response.ok) return "";
-    const data = await response.json();
-    return data.choices?.[0]?.message?.content || "";
-  } catch (e) { console.error("OpenAI error:", e); return ""; }
-}
-
-// --- Telegram ---
-async function sendTelegram(text: string, replyMarkup?: any): Promise<boolean> {
-  const token = Deno.env.get("TELEGRAM_BOT_TOKEN");
-  const chatId = Deno.env.get("TELEGRAM_CHAT_ID") || "775360436";
-  if (!token) return false;
-  try {
-    const payload: any = { chat_id: chatId, text, parse_mode: "HTML" };
-    if (replyMarkup) payload.reply_markup = JSON.stringify(replyMarkup);
-    const r = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    return r.ok;
-  } catch (e) { console.error("TG error:", e); return false; }
-}
+// --- Shared Imports ---
+import { getIsraelNow, todayStr } from "../_shared/timezone.ts";
+import { callOpenAI } from "../_shared/openai.ts";
+import { sendTG } from "../_shared/telegram.ts";
 
 // ============================================
 // PROGRAMMES D'ENTRAÎNEMENT COMPLETS
@@ -580,8 +540,8 @@ serve(async (req: Request) => {
       notif += `\n\n💡 ${shortAdvice}`;
     }
 
-    await sendTelegram(notif, {
-      inline_keyboard: [
+    await sendTG(notif, {
+      buttons: [
         [{ text: "💪 Mon Entraînement", callback_data: "morning_sport" }, { text: "🍽 Mon Alimentation", callback_data: "morning_nutrition" }],
         [{ text: "🔙 Menu", callback_data: "menu_main" }],
       ],
@@ -599,7 +559,7 @@ serve(async (req: Request) => {
     let weeklyMsg = "";
     if (isSunday) {
       weeklyMsg = await weeklyHealthReview(supabase);
-      await sendTelegram(weeklyMsg);
+      await sendTG(weeklyMsg);
       responseType = "weekly";
     }
 

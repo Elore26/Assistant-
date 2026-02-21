@@ -3,37 +3,13 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { GoogleCalendar, GCAL_COLORS, getGoogleCalendar } from "../_shared/google-calendar.ts";
 import { getSignalBus } from "../_shared/agent-signals.ts";
 import { robustFetch } from "../_shared/robust-fetch.ts";
+import { getIsraelNow, todayStr, DAYS_FR } from "../_shared/timezone.ts";
+import { callOpenAI } from "../_shared/openai.ts";
+import { sendTG, escHTML } from "../_shared/telegram.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") || "";
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
-const TELEGRAM_BOT_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN") || "";
-const TELEGRAM_CHAT_ID = Deno.env.get("TELEGRAM_CHAT_ID") || "775360436";
 const GMAPS_KEY = Deno.env.get("GOOGLE_MAPS_API_KEY") || "";
-
-// =============================================
-// AI ENHANCEMENT
-// =============================================
-async function callOpenAI(systemPrompt: string, userContent: string, maxTokens = 500): Promise<string> {
-  const apiKey = Deno.env.get("OPENAI_API_KEY");
-  if (!apiKey) return "";
-  try {
-    const response = await robustFetch("https://api.openai.com/v1/chat/completions", {
-      timeoutMs: 15000,
-      retries: 1,
-      init: {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
-        body: JSON.stringify({
-          model: "gpt-4o-mini", temperature: 0.7, max_tokens: maxTokens,
-          messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userContent }],
-        }),
-      },
-    });
-    if (!response.ok) return "";
-    const data = await response.json();
-    return data.choices?.[0]?.message?.content || "";
-  } catch (e) { console.error("OpenAI error:", e); return ""; }
-}
 
 // --- Commute config ---
 const HOME = "114 Marc Shagal, Ashdod, Israel";
@@ -42,14 +18,7 @@ const STATION_TLV = "Tel Aviv HaShalom Railway Station, Israel";
 const WORK = "Shaul Hamelech Street, Tel Aviv, Israel";
 const LIME_MIN = 10;
 
-// --- Timezone ---
-function getIsraelNow(): Date {
-  return new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Jerusalem" }));
-}
-function dateStr(): string {
-  const d = getIsraelNow();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-}
+// --- Timezone helpers (unique to morning-briefing) ---
 function istToUnix(h: number, m: number, daysOffset = 0): number {
   const now = new Date();
   const utcYear = now.getUTCFullYear();
@@ -61,7 +30,6 @@ function istToUnix(h: number, m: number, daysOffset = 0): number {
 }
 
 // --- Schedule ---
-const DAYS = ["Dimanche", "Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi"];
 interface Sched { type: string; ws: string; we: string; label: string; }
 function getSched(d: number): Sched {
   const s: Record<number, Sched> = {
@@ -253,38 +221,7 @@ async function getTrainSchedule(
 }
 
 // =============================================
-// TELEGRAM
-// =============================================
-async function sendTG(text: string): Promise<boolean> {
-  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-  try {
-    let r = await robustFetch(url, {
-      timeoutMs: 10000,
-      retries: 2,
-      init: {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text, parse_mode: "HTML", disable_web_page_preview: true }),
-      },
-    });
-    if (r.ok) return true;
-    r = await robustFetch(url, {
-      timeoutMs: 10000,
-      retries: 1,
-      init: {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: text.replace(/<[^>]*>/g, "") }),
-      },
-    });
-    return r.ok;
-  } catch (e) {
-    console.error("Telegram send error:", e);
-    return false;
-  }
-}
-
-function esc(s: string): string {
-  return (s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
+// sendTG and escHTML imported from _shared/telegram.ts
 
 // =============================================
 // TIME HELPERS
@@ -467,10 +404,10 @@ function buildDayPlan(
 function formatPlan(blocks: PlanBlock[]): string {
   let text = "";
   for (const b of blocks) {
-    text += `<b>${b.start}</b>  ${esc(b.label)}\n`;
+    text += `<b>${b.start}</b>  ${escHTML(b.label)}\n`;
     if (b.details && b.details.length > 0) {
       for (const d of b.details) {
-        text += `        · ${esc(d)}\n`;
+        text += `        · ${escHTML(d)}\n`;
       }
     }
   }
@@ -544,8 +481,8 @@ serve(async (req: Request) => {
     const now = getIsraelNow();
     const actualDay = now.getDay();
     const day = forceDay !== null ? forceDay : actualDay;
-    const dayName = DAYS[day];
-    const today = dateStr();
+    const dayName = DAYS_FR[day];
+    const today = todayStr();
     const sched = getSched(day);
     const daysOffset = forceDay !== null ? ((forceDay - actualDay + 7) % 7) : 0;
 
@@ -855,7 +792,7 @@ serve(async (req: Request) => {
         const time = t.due_time || t.autoTime;
         const timeStr = time ? ` → <b>${time.substring(0, 5)}</b>` : "";
         const overdue = t.urgencyBoost > 0 ? " ⚠️" : "";
-        msg += `${num} ${esc(t.title)}${timeStr}${overdue}\n`;
+        msg += `${num} ${escHTML(t.title)}${timeStr}${overdue}\n`;
       });
       if (allTasks.length > 3) {
         msg += `<i>+${allTasks.length - 3} autres tâches</i>\n`;
@@ -865,7 +802,7 @@ serve(async (req: Request) => {
       allTasks.slice(0, 5).forEach((t: any) => {
         const p = t.priority <= 2 ? "●" : t.priority === 3 ? "◐" : "○";
         const time = t.due_time ? ` <b>${t.due_time}</b>` : "";
-        msg += `${p} ${esc(t.title)}${time}\n`;
+        msg += `${p} ${escHTML(t.title)}${time}\n`;
       });
     }
 

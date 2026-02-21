@@ -2924,6 +2924,8 @@ async function handleCallbackQuery(callbackId: string, chatId: number, data: str
   // === MAIN MENU BUTTONS ===
   if (data === "menu_main") {
     await sendTelegramMessage(chatId, "📌 *OREN*", "Markdown", MAIN_MENU);
+  } else if (data === "dashboard") {
+    await handleDashboard(chatId);
   } else if (data === "menu_tasks") {
     await handleTasksMainV2(chatId);
   } else if (data === "menu_budget") {
@@ -4670,6 +4672,144 @@ async function handleGoals(chatId: number): Promise<void> {
   }
 }
 
+// --- Unified Dashboard (single view of all domains) ---
+
+async function handleDashboard(chatId: number): Promise<void> {
+  const supabase = getSupabaseClient();
+  const now = getIsraelNow();
+  const today = todayStr();
+  const dayName = ["Dim", "Lun", "Mar", "Mer", "Jeu", "Ven", "Sam"][now.getDay()];
+  const monthStart = `${today.substring(0, 7)}-01`;
+
+  try {
+    // Parallel fetch across all domains
+    const [
+      tasksRes, goalsRes, jobsRes, leadsRes,
+      financeRes, weightRes, workoutsRes, studyRes,
+    ] = await Promise.all([
+      // Tasks: today pending + completed
+      supabase.from("tasks").select("id, title, priority, status, due_time")
+        .eq("due_date", today).in("status", ["pending", "in_progress", "completed"])
+        .order("priority", { ascending: true }).limit(20),
+      // Goals: active
+      supabase.from("goals").select("domain, title, metric_current, metric_target, metric_unit, deadline, priority")
+        .eq("status", "active").order("priority").limit(8),
+      // Career: pipeline
+      supabase.from("job_listings").select("status")
+        .in("status", ["new", "applied", "interview", "offer"]),
+      // HiGrow: leads this month
+      supabase.from("leads").select("status")
+        .gte("created_at", monthStart),
+      // Finance: month summary
+      supabase.from("finance_logs").select("transaction_type, amount")
+        .gte("transaction_date", monthStart),
+      // Health: latest weight
+      supabase.from("health_logs").select("value")
+        .eq("log_type", "weight").order("log_date", { ascending: false }).limit(1),
+      // Health: workouts this week
+      supabase.from("health_logs").select("id")
+        .eq("log_type", "workout")
+        .gte("log_date", new Date(now.getTime() - 7 * 86400000).toISOString().split("T")[0]),
+      // Learning: study this week
+      supabase.from("study_sessions").select("duration_minutes")
+        .gte("session_date", new Date(now.getTime() - 7 * 86400000).toISOString().split("T")[0])
+        .neq("topic", "agent_analysis"),
+    ]);
+
+    const tasks = tasksRes.data || [];
+    const goals = goalsRes.data || [];
+    const jobs = jobsRes.data || [];
+    const leads = leadsRes.data || [];
+    const finance = financeRes.data || [];
+    const weight = weightRes.data?.[0]?.value || "?";
+    const workoutCount = workoutsRes.data?.length || 0;
+    const studyMinutes = (studyRes.data || []).reduce((s: number, ss: any) => s + (ss.duration_minutes || 0), 0);
+
+    // Process tasks
+    const pendingTasks = tasks.filter((t: any) => t.status !== "completed");
+    const completedTasks = tasks.filter((t: any) => t.status === "completed");
+    const p1p2 = pendingTasks.filter((t: any) => (t.priority || 3) <= 2);
+
+    // Process career
+    const newJobs = jobs.filter((j: any) => j.status === "new").length;
+    const applied = jobs.filter((j: any) => j.status === "applied").length;
+    const interviews = jobs.filter((j: any) => j.status === "interview").length;
+    const offers = jobs.filter((j: any) => j.status === "offer").length;
+
+    // Process HiGrow
+    const totalLeads = leads.length;
+    const converted = leads.filter((l: any) => l.status === "converted").length;
+
+    // Process finance
+    const monthIncome = finance.filter((f: any) => f.transaction_type === "income").reduce((s: number, e: any) => s + e.amount, 0);
+    const monthExpense = finance.filter((f: any) => f.transaction_type === "expense").reduce((s: number, e: any) => s + e.amount, 0);
+    const balance = monthIncome - monthExpense;
+    const savingsRate = monthIncome > 0 ? Math.round(((monthIncome - monthExpense) / monthIncome) * 100) : 0;
+
+    // Process goals urgency
+    const urgentGoals = goals.filter((g: any) => {
+      if (!g.deadline) return false;
+      const daysLeft = Math.ceil((new Date(g.deadline).getTime() - now.getTime()) / 86400000);
+      return daysLeft <= 30;
+    });
+
+    // Determine urgency level
+    let urgency = "🟢";
+    if (interviews === 0 || converted === 0 || urgentGoals.length > 0) urgency = "🔴";
+    else if (applied < 5 || savingsRate < 20) urgency = "🟡";
+
+    // Build message
+    let msg = `${urgency} *DASHBOARD* — ${dayName} ${today}\n`;
+    msg += `━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+    // Tasks summary
+    msg += `📋 *TACHES:* ${completedTasks.length}✓ / ${tasks.length} total\n`;
+    if (p1p2.length > 0) {
+      msg += `  Urgentes: ${p1p2.map((t: any) => t.title).slice(0, 2).join(", ")}\n`;
+    }
+
+    // Career
+    msg += `\n💼 *CARRIERE:*\n`;
+    msg += `  ${newJobs} nouvelles · ${applied} postulées · ${interviews} interviews`;
+    if (offers > 0) msg += ` · ${offers} offres`;
+    msg += `\n`;
+    if (interviews === 0) msg += `  ⚠️ _0 interviews — augmenter les candidatures_\n`;
+
+    // HiGrow
+    msg += `\n🚀 *HIGROW:* ${converted}/${totalLeads || "?"} clients convertis\n`;
+    if (converted === 0 && totalLeads > 0) msg += `  ⚠️ _0 conversion — relancer les leads_\n`;
+
+    // Finance
+    msg += `\n💰 *FINANCE:*\n`;
+    msg += `  Revenus: ${Math.round(monthIncome)}₪ · Dépenses: ${Math.round(monthExpense)}₪\n`;
+    msg += `  Balance: ${balance >= 0 ? "+" : ""}${Math.round(balance)}₪ · Épargne: ${savingsRate}%\n`;
+
+    // Health
+    msg += `\n🏋️ *SANTE:* ${weight}kg · ${workoutCount}/5 workouts · ${Math.round(studyMinutes / 60)}h étude\n`;
+
+    // Goals
+    if (urgentGoals.length > 0) {
+      msg += `\n🎯 *OBJECTIFS URGENTS:*\n`;
+      for (const g of urgentGoals.slice(0, 3)) {
+        const daysLeft = Math.ceil((new Date(g.deadline).getTime() - now.getTime()) / 86400000);
+        const progress = g.metric_target ? Math.round((g.metric_current / g.metric_target) * 100) : 0;
+        msg += `  ${g.domain === "career" ? "💼" : g.domain === "health" ? "🏋️" : g.domain === "higrow" ? "🚀" : "🎯"} ${g.title}: ${progress}% · J-${daysLeft}\n`;
+      }
+    }
+
+    await sendTelegramMessage(chatId, msg, "Markdown", {
+      inline_keyboard: [
+        [{ text: "💼 Carrière", callback_data: "menu_jobs" }, { text: "🚀 HiGrow", callback_data: "menu_leads" }, { text: "💰 Budget", callback_data: "menu_budget" }],
+        [{ text: "📋 Tasks", callback_data: "menu_tasks" }, { text: "🏋️ Santé", callback_data: "menu_health" }, { text: "🎯 Goals", callback_data: "menu_goals" }],
+        [{ text: "🔄 Rafraîchir", callback_data: "dashboard" }, { text: "📌 Menu", callback_data: "menu_main" }],
+      ],
+    });
+  } catch (e) {
+    console.error("Dashboard error:", e);
+    await sendTelegramMessage(chatId, "❌ Erreur dashboard. Réessaie.", "Markdown");
+  }
+}
+
 // --- Insights Handler (4 lignes haute valeur, pas d'AI) ---
 
 async function handleInsights(chatId: number): Promise<void> {
@@ -6070,9 +6210,8 @@ serve(async (req: Request) => {
       await handleTradingMain(chatId);
     } else if (command === "/morning" || command === "/bonjour") {
       await handleMorningBriefing(chatId);
-    } else if (command === "/dashboard") {
-      const sbUrl = Deno.env.get("SUPABASE_URL") || "";
-      await sendTelegramMessage(chatId, `📊 *Dashboard OREN*\n\n${sbUrl}/functions/v1/dashboard`, "Markdown");
+    } else if (command === "/dashboard" || command === "/d") {
+      await handleDashboard(chatId);
     } else if (command === "/review") {
       await handleReview(chatId);
     } else if (command === "/insights") {

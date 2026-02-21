@@ -1,26 +1,13 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { getSignalBus } from "../_shared/agent-signals.ts";
+import { getIsraelNow, todayStr, timeStr } from "../_shared/timezone.ts";
+import { sendTG, escHTML } from "../_shared/telegram.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") || "";
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
-const TELEGRAM_BOT_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN") || "";
-const TELEGRAM_CHAT_ID = Deno.env.get("TELEGRAM_CHAT_ID") || "775360436";
 
 const LINE = "━━━━━━━━━━━━━━━━━━━━";
-
-function getIsraelNow(): Date {
-  return new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Jerusalem" }));
-}
-
-function todayStr(): string {
-  const d = getIsraelNow();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-}
-
-function timeStr(d: Date): string {
-  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
-}
 
 function addMinutes(d: Date, min: number): Date {
   return new Date(d.getTime() + min * 60000);
@@ -44,38 +31,6 @@ function getScheduleEvents(dow: number): Array<{ time: string; label: string }> 
     events.push({ time: dow === 0 ? "19:30" : "15:30", label: "Fin bureau" });
   }
   return events;
-}
-
-// Send TG with optional inline keyboard
-async function sendTG(text: string, buttons?: any[][]): Promise<boolean> {
-  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-  const payload: any = {
-    chat_id: TELEGRAM_CHAT_ID,
-    text,
-    parse_mode: "HTML",
-    disable_web_page_preview: true,
-  };
-  if (buttons && buttons.length > 0) {
-    payload.reply_markup = { inline_keyboard: buttons };
-  }
-
-  let r = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  if (r.ok) return true;
-  // Fallback plain (without buttons)
-  r = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: text.replace(/<[^>]*>/g, "") }),
-  });
-  return r.ok;
-}
-
-function esc(s: string): string {
-  return (s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 serve(async (_req: Request) => {
@@ -129,7 +84,7 @@ serve(async (_req: Request) => {
         for (const t of filteredUpcoming) {
           const p = (t.priority || 3) <= 2 ? "●" : (t.priority || 3) === 3 ? "◐" : "○";
           const dur = t.duration_minutes ? ` · ${t.duration_minutes}min` : "";
-          msg += `${p} ${esc(t.title)} → <b>${t.due_time?.substring(0, 5)}</b>${dur}\n`;
+          msg += `${p} ${escHTML(t.title)} → <b>${t.due_time?.substring(0, 5)}</b>${dur}\n`;
         }
       }
 
@@ -178,7 +133,7 @@ serve(async (_req: Request) => {
           const delay = diffMin(t.due_time?.substring(0, 5) || nowTime, nowTime);
           const rBadge = t.urgency_level === "critique" ? "🔴" : t.urgency_level === "urgent" ? "🟠" : t.urgency_level === "attention" ? "🟡" : "";
           const rInfo = (t.reschedule_count || 0) > 0 ? ` (report x${t.reschedule_count})` : "";
-          nudgeMsg += `⚠️ ${rBadge}${esc(t.title)} — <b>${delay}min</b> retard${rInfo}\n`;
+          nudgeMsg += `⚠️ ${rBadge}${escHTML(t.title)} — <b>${delay}min</b> retard${rInfo}\n`;
 
           buttons.push([
             { text: `✅ Fait`, callback_data: `tdone_${t.id}` },
@@ -188,7 +143,7 @@ serve(async (_req: Request) => {
         }
 
         nudgeMsg += `\nQu'est-ce qui bloque ?`;
-        await sendTG(nudgeMsg, buttons);
+        await sendTG(nudgeMsg, { buttons });
         reminderCount += missed.length;
 
         // Mark missed tasks as reminded to prevent duplicate nudges
@@ -246,19 +201,21 @@ serve(async (_req: Request) => {
             const nextTask = actionable[0];
             let idleMsg = `<b>💪 NUDGE</b>\n`;
             idleMsg += `Rien complété depuis 2h. Ta prochaine tâche :\n\n`;
-            idleMsg += `→ <b>${esc(nextTask.title)}</b>\n\n`;
+            idleMsg += `→ <b>${escHTML(nextTask.title)}</b>\n\n`;
             idleMsg += `Commence par 5 minutes. C'est tout.`;
 
-            await sendTG(idleMsg, [
-              [
-                { text: "✅ J'y suis", callback_data: `tstart_${nextTask.id}` },
-                { text: "🍅 Pomodoro", callback_data: `pomo_start_${nextTask.id}` },
+            await sendTG(idleMsg, {
+              buttons: [
+                [
+                  { text: "✅ J'y suis", callback_data: `tstart_${nextTask.id}` },
+                  { text: "🍅 Pomodoro", callback_data: `pomo_start_${nextTask.id}` },
+                ],
+                [
+                  { text: "⏰ +1h", callback_data: `tsnz1h_${nextTask.id}` },
+                  { text: "🔄 Reporter", callback_data: `reschedule_${nextTask.id}` },
+                ],
               ],
-              [
-                { text: "⏰ +1h", callback_data: `tsnz1h_${nextTask.id}` },
-                { text: "🔄 Reporter", callback_data: `reschedule_${nextTask.id}` },
-              ],
-            ]);
+            });
             reminderCount++;
 
             // Log execution for dedup
@@ -359,12 +316,14 @@ serve(async (_req: Request) => {
             }
           }
 
-          await sendTG(`🍅 <b>POMODORO TERMINÉ !</b>\n\n${esc(taskName)}\n☕ Pause 5 min.`, [
-            [
-              { text: "🍅 Encore un !", callback_data: session.task_id ? `pomo_start_${session.task_id}` : "pomo_start_free" },
-              { text: "✅ Tâche finie", callback_data: session.task_id ? `tdone_${session.task_id}` : "menu_tasks" },
+          await sendTG(`🍅 <b>POMODORO TERMINÉ !</b>\n\n${escHTML(taskName)}\n☕ Pause 5 min.`, {
+            buttons: [
+              [
+                { text: "🍅 Encore un !", callback_data: session.task_id ? `pomo_start_${session.task_id}` : "pomo_start_free" },
+                { text: "✅ Tâche finie", callback_data: session.task_id ? `tdone_${session.task_id}` : "menu_tasks" },
+              ],
             ],
-          ]);
+          });
           reminderCount++;
         }
       }
@@ -378,9 +337,9 @@ serve(async (_req: Request) => {
           .eq("is_inbox", true).in("status", ["pending", "in_progress"]);
 
         if (inboxCount && inboxCount > 0) {
-          await sendTG(`📥 <b>${inboxCount} tâche(s) dans l'inbox</b>\nPrends 2 min pour trier.`, [
-            [{ text: "📥 Trier l'inbox", callback_data: "menu_inbox" }],
-          ]);
+          await sendTG(`📥 <b>${inboxCount} tâche(s) dans l'inbox</b>\nPrends 2 min pour trier.`, {
+            buttons: [[{ text: "📥 Trier l'inbox", callback_data: "menu_inbox" }]],
+          });
           reminderCount++;
         }
       } catch (ibxErr) { console.error("[Inbox] Reminder error:", ibxErr); }

@@ -10,36 +10,11 @@ import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { getGoogleCalendar, GCAL_COLORS } from "../_shared/google-calendar.ts";
 import { robustFetch, robustFetchJSON } from "../_shared/robust-fetch.ts";
+import { callOpenAI } from "../_shared/openai.ts";
+import { sendTG } from "../_shared/telegram.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") || "";
 const SUPABASE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
-const BOT_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN") || "";
-const CHAT_ID = Deno.env.get("TELEGRAM_CHAT_ID") || "775360436";
-
-// =============================================
-// OPENAI INTEGRATION
-// =============================================
-async function callOpenAI(systemPrompt: string, userContent: string, maxTokens = 600): Promise<string> {
-  const apiKey = Deno.env.get("OPENAI_API_KEY");
-  if (!apiKey) return "";
-  try {
-    const response = await robustFetch("https://api.openai.com/v1/chat/completions", {
-      timeoutMs: 15000,
-      retries: 1,
-      init: {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
-        body: JSON.stringify({
-          model: "gpt-4o-mini", temperature: 0.5, max_tokens: maxTokens,
-          messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userContent }],
-        }),
-      },
-    });
-    if (!response.ok) return "";
-    const data = await response.json();
-    return data.choices?.[0]?.message?.content || "";
-  } catch (e) { console.error("OpenAI error:", e); return ""; }
-}
 
 // =============================================
 // TYPES
@@ -1265,41 +1240,7 @@ function formatTradingAnalysis(a: AnalysisResult): string {
 }
 
 // =============================================
-// TELEGRAM
-// =============================================
-async function sendTG(text: string, replyMarkup?: any): Promise<boolean> {
-  if (!BOT_TOKEN) return false;
-  const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
-  try {
-    const payload: any = { chat_id: CHAT_ID, text, parse_mode: "HTML", disable_web_page_preview: true };
-    if (replyMarkup) payload.reply_markup = JSON.stringify(replyMarkup);
-    let res = await robustFetch(url, {
-      timeoutMs: 10000,
-      retries: 2,
-      init: {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      },
-    });
-    if (!res.ok) {
-      const plain = text.replace(/<[^>]+>/g, "");
-      res = await robustFetch(url, {
-        timeoutMs: 10000,
-        retries: 1,
-        init: {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ chat_id: CHAT_ID, text: plain }),
-        },
-      });
-    }
-    return res.ok;
-  } catch (e) {
-    console.error("Telegram send error:", e);
-    return false;
-  }
-}
+// sendTG imported from _shared/telegram.ts
 
 function isNightInIsrael(): boolean {
   const now = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Jerusalem" }));
@@ -1603,7 +1544,7 @@ Style: direct, chiffres précis, pas de généralités. Emojis autorisés.`,
       else notif += `\nPas de signal`;
 
       await sendTG(notif, {
-        inline_keyboard: [
+        buttons: [
           [{ text: "📊 Voir l'analyse complète", callback_data: "trading_last" }],
           [{ text: "📋 Plans semaine", callback_data: "trading_plans" }, { text: "🔙 Menu", callback_data: "menu_signals" }],
         ],
