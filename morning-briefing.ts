@@ -504,6 +504,20 @@ serve(async (req: Request) => {
 
     const LINE = "━━━━━━━━━━━━━━━━━━━━";
 
+    // --- Deduplication: skip if briefing already sent today ---
+    if (forceDay === null) {
+      try {
+        const { data: existingBriefing } = await supabase.from("briefings")
+          .select("id").eq("briefing_type", "morning").eq("briefing_date", today).limit(1);
+        if (existingBriefing && existingBriefing.length > 0) {
+          console.log(`[Morning Briefing] Already sent today (${today}), skipping duplicate`);
+          return new Response(JSON.stringify({
+            success: true, type: "skipped_duplicate", date: today,
+          }), { headers: { "Content-Type": "application/json" } });
+        }
+      } catch (_) {}
+    }
+
     // Saturday OFF
     if (sched.type === "off") {
       const offPlan = buildDayPlan(day, "", "", "", "", []);
@@ -511,6 +525,7 @@ serve(async (req: Request) => {
       offMsg += formatPlan(offPlan);
       offMsg += `\n${LINE}\nBon week-end.`;
       await sendTG(offMsg);
+      try { await supabase.from("briefings").insert({ briefing_type: "morning", briefing_date: today, content: offMsg, sent_at: new Date().toISOString() }); } catch (_) {}
       return new Response(JSON.stringify({ success: true, type: "off" }), { headers: { "Content-Type": "application/json" } });
     }
 

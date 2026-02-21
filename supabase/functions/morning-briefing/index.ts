@@ -572,6 +572,7 @@ serve(async (req: Request) => {
       offMsg += formatPlan(offPlan);
       offMsg += `\n${LINE}\nBon week-end.`;
       await sendTG(offMsg);
+      try { await supabase.from("briefings").insert({ briefing_type: "morning", briefing_date: today, content: offMsg, sent_at: new Date().toISOString() }); } catch (_) {}
       return new Response(JSON.stringify({ success: true, type: "off" }), { headers: { "Content-Type": "application/json" } });
     }
 
