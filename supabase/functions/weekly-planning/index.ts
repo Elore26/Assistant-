@@ -7,96 +7,33 @@ import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { getSignalBus } from "../_shared/agent-signals.ts";
 import { buildScorecard, formatScorecardHTML } from "../_shared/scorecard.ts";
+import { getIsraelNow, todayStr, dateStr, daysAgo as sharedDaysAgo } from "../_shared/timezone.ts";
+import { callOpenAI } from "../_shared/openai.ts";
+import { sendTG, escHTML } from "../_shared/telegram.ts";
+import { simpleProgressBar } from "../_shared/formatting.ts";
+import { FAIL_REASON_LABELS, DOMAIN_EMOJIS } from "../_shared/config.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") || "";
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
-const TELEGRAM_BOT_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN") || "";
-const TELEGRAM_CHAT_ID = Deno.env.get("TELEGRAM_CHAT_ID") || "775360436";
-const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY") || "";
 
 const LINE = "━━━━━━━━━━━━━━━━━━━━";
 
-function getIsraelNow(): Date {
-  return new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Jerusalem" }));
-}
-
-function dateStr(d: Date): string {
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-}
-
-function daysAgo(n: number): string {
-  const d = getIsraelNow();
-  d.setDate(d.getDate() - n);
-  return dateStr(d);
-}
-
+// Use shared imports above — aliases for backward compat
+function daysAgo(n: number): string { return sharedDaysAgo(n); }
 function daysFromNow(n: number): string {
   const d = getIsraelNow();
   d.setDate(d.getDate() + n);
   return dateStr(d);
 }
-
-function dayName(dateString: string): string {
-  const d = new Date(dateString + "T12:00:00");
-  return ["Dim", "Lun", "Mar", "Mer", "Jeu", "Ven", "Sam"][d.getDay()];
+function dayName(ds: string): string {
+  return ["Dim", "Lun", "Mar", "Mer", "Jeu", "Ven", "Sam"][new Date(ds + "T12:00:00").getDay()];
 }
+const esc = escHTML;
+const progressBar = simpleProgressBar;
 
-function esc(s: string): string {
-  return (s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
-
-function progressBar(pct: number, len = 10): string {
-  const filled = Math.round((pct / 100) * len);
-  return "█".repeat(Math.min(filled, len)) + "░".repeat(Math.max(len - filled, 0));
-}
-
-async function callOpenAI(systemPrompt: string, userPrompt: string, maxTokens = 600): Promise<string> {
-  try {
-    const r = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${OPENAI_API_KEY}` },
-      body: JSON.stringify({
-        model: "gpt-4o-mini",
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userPrompt },
-        ],
-        max_tokens: maxTokens,
-        temperature: 0.7,
-      }),
-    });
-    const data = await r.json();
-    return data.choices?.[0]?.message?.content || "";
-  } catch (e) {
-    console.error("OpenAI error:", e);
-    return "";
-  }
-}
-
-async function sendTG(text: string, buttons?: any[][]): Promise<boolean> {
-  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-  const payload: any = {
-    chat_id: TELEGRAM_CHAT_ID,
-    text,
-    parse_mode: "HTML",
-    disable_web_page_preview: true,
-  };
-  if (buttons && buttons.length > 0) {
-    payload.reply_markup = { inline_keyboard: buttons };
-  }
-  let r = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  if (r.ok) return true;
-  // Fallback without HTML
-  r = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: text.replace(/<[^>]*>/g, "") }),
-  });
-  return r.ok;
+// Wrapper for sendTG to match local pattern (buttons as array)
+async function sendTGLocal(text: string, buttons?: any[][]): Promise<boolean> {
+  return sendTG(text, buttons ? { buttons } : undefined);
 }
 
 serve(async (_req: Request) => {
@@ -243,7 +180,7 @@ serve(async (_req: Request) => {
     try {
       const scorecardData = await buildScorecard(supabase, weekStart, weekEnd);
       const scorecardMsg = formatScorecardHTML(scorecardData);
-      await sendTG(`<b>📋 L10 WEEKLY</b> — Dimanche ${today}\n${LINE}\n\n${scorecardMsg}`);
+      await sendTGLocal(`<b>📋 L10 WEEKLY</b> — Dimanche ${today}\n${LINE}\n\n${scorecardMsg}`);
 
       // Save scorecard snapshot
       try {
@@ -261,7 +198,7 @@ serve(async (_req: Request) => {
       msg += `📋 Tâches: ${totalDone}/${totalPlanned} (${completionRate}%)\n`;
       msg += `💰 Dépenses: ₪${Math.round(totalSpent)}\n`;
       msg += `🏋️ Workouts: ${workoutDays}j\n`;
-      await sendTG(msg);
+      await sendTGLocal(msg);
     }
 
     // ════════════════════════════════════════════
@@ -271,11 +208,10 @@ serve(async (_req: Request) => {
     let rockMsg = `\n<b>🪨 ROCK REVIEW</b>\n${LINE}\n`;
 
     if (rocks.length > 0) {
-      const DOMAIN_EMOJI: Record<string, string> = { career: "💼", health: "🏋️", finance: "💰", learning: "📚", higrow: "🚀" };
       for (const rock of rocks) {
         const daysLeft = Math.ceil((new Date(rock.quarter_end).getTime() - now.getTime()) / 86400000);
         const statusIcon = rock.current_status === "on_track" ? "✅" : "⚠️";
-        const emoji = DOMAIN_EMOJI[rock.domain] || "📌";
+        const emoji = DOMAIN_EMOJIS[rock.domain] || "📌";
         rockMsg += `${statusIcon} ${emoji} ${esc(rock.title)} — <b>${rock.current_status.replace("_", " ").toUpperCase()}</b>\n`;
         rockMsg += `   J-${daysLeft} · ${esc(rock.measurable_target)}\n`;
         if (rock.progress_notes) rockMsg += `   <i>${esc(rock.progress_notes)}</i>\n`;
@@ -324,11 +260,10 @@ serve(async (_req: Request) => {
 
     // Fail reason pattern
     if (topFailReason && failReasons.length >= 3) {
-      const REASON_LABELS: Record<string, string> = { blocked: "Bloqué", forgot: "Oublié", toobig: "Trop gros", energy: "Énergie", skip: "Skip" };
-      rockMsg += `\n📊 <i>Pattern échecs: "${REASON_LABELS[topFailReason[0]] || topFailReason[0]}" = raison #1 (${topFailReason[1]}x)</i>\n`;
+      rockMsg += `\n📊 <i>Pattern échecs: "${FAIL_REASON_LABELS[topFailReason[0]] || topFailReason[0]}" = raison #1 (${topFailReason[1]}x)</i>\n`;
     }
 
-    await sendTG(rockMsg);
+    await sendTGLocal(rockMsg);
 
     // ════════════════════════════════════════════
     // MESSAGE 3: IDS ISSUES (AI-generated)
@@ -352,29 +287,18 @@ serve(async (_req: Request) => {
     };
 
     const idsInsight = await callOpenAI(
-      `Tu es le coach EOS d'Oren. Génère la section IDS (Identify, Discuss, Solve) du L10 weekly review.
-Tu analyses les données de la semaine et identifies les 3 problèmes les plus critiques.
-
-FORMAT STRICT (HTML autorisé, <b> et <i> seulement):
-Pour chaque issue (max 3):
-🔴/🟡 <b>ISSUE:</b> [description courte et précise]
-   → <b>ROOT CAUSE:</b> [pourquoi ça arrive]
-   → <b>SOLVE:</b> [action concrète et mesurable pour cette semaine]
-
-RÈGLES:
-- Priorise: Rocks off-track > métriques off-track > patterns d'échec
-- Chaque SOLVE doit être une action concrète avec un résultat mesurable
-- Si un Rock est off-track, c'est TOUJOURS une issue
-- Max 200 mots total
-- Ne mets pas de motivation, seulement des faits et des solutions`,
+      `Coach EOS. Section IDS du L10 weekly (3 issues max, HTML <b>/<i>):
+🔴/🟡 <b>ISSUE:</b> [court] → <b>ROOT CAUSE:</b> [pourquoi] → <b>SOLVE:</b> [action mesurable]
+Prio: Rocks off-track > métriques off-track > patterns échec. Rock off-track = toujours issue.
+Faits + solutions seulement. Max 150 mots.`,
       JSON.stringify(idsContext),
-      500
+      400
     );
 
     if (idsInsight) {
       let idsMsg = `\n<b>⚠️ IDS — Identify, Discuss, Solve</b>\n${LINE}\n\n`;
       idsMsg += idsInsight.trim();
-      await sendTG(idsMsg);
+      await sendTGLocal(idsMsg);
     }
 
     // ════════════════════════════════════════════
@@ -469,7 +393,7 @@ RÈGLES:
       }
     } catch (velErr) { console.error("[Velocity] Week summary error:", velErr); }
 
-    await sendTG(planMsg);
+    await sendTGLocal(planMsg);
 
     // ─── AUTO-CARRY-OVER: Move critical overdue to tomorrow ──────
     let carryCount = 0;
@@ -485,11 +409,11 @@ RÈGLES:
     }
 
     if (carryCount > 0) {
-      await sendTG(`✅ ${carryCount} tâche(s) prioritaire(s) reportée(s) à demain.`);
+      await sendTGLocal(`✅ ${carryCount} tâche(s) prioritaire(s) reportée(s) à demain.`);
     }
 
     // ─── CLOSING ─────────────────────────────────────────────────
-    await sendTG(
+    await sendTGLocal(
       `<b>✨ Bonne semaine Oren !</b>\n` +
       `Focus sur les Rocks. 3 tâches max par jour.`,
       [

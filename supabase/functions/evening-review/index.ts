@@ -9,46 +9,11 @@ import { getSignalBus } from "../_shared/agent-signals.ts";
 import { getIsraelNow, todayStr, daysAgo, DAYS_FR } from "../_shared/timezone.ts";
 import { callOpenAI } from "../_shared/openai.ts";
 import { sendTG, escHTML } from "../_shared/telegram.ts";
+import { progressBar, trend } from "../_shared/formatting.ts";
+import { DOMAIN_EMOJIS, TOMORROW_SCHEDULE, FAIL_REASON_LABELS } from "../_shared/config.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") || "";
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
-
-const DOMAIN_EMOJIS: Record<string, string> = {
-  career: "💼", finance: "💰", health: "🏋️", higrow: "🚀",
-  trading: "📈", learning: "📚", personal: "🏠",
-};
-
-const TOMORROW_SCHEDULE: Record<number, string> = {
-  0: "Dimanche — Journée longue (09:30-19:30) · Legs 06:30",
-  1: "Lundi — Journée courte (09:30-15:30) · Push 17:00",
-  2: "Mardi — Journée courte (09:30-15:30) · Pull 17:00",
-  3: "Mercredi — Journée courte (09:30-15:30) · Legs 17:00",
-  4: "Jeudi — Journée tardive (12:00-19:30) · Cardio 07:00",
-  5: "Vendredi — Variable · Push 09:00",
-  6: "Samedi — OFF · Repos actif",
-};
-
-// OpenAI, Telegram, escHTML imported from _shared modules above
-
-// --- Progress bar visual ---
-function progressBar(current: number, target: number, width = 10, start?: number, direction?: string): string {
-  let ratio: number;
-  if (direction === 'decrease' && start !== undefined && start > target) {
-    ratio = Math.max(0, Math.min(1, (start - current) / (start - target)));
-  } else {
-    ratio = Math.min(current / Math.max(target, 1), 1);
-  }
-  const filled = Math.round(ratio * width);
-  const empty = width - filled;
-  return "█".repeat(filled) + "░".repeat(empty) + ` ${Math.round(ratio * 100)}%`;
-}
-
-// --- Trend arrow ---
-function trend(today: number, weekAvg: number): string {
-  if (today > weekAvg * 1.1) return "↑";
-  if (today < weekAvg * 0.9) return "↓";
-  return "→";
-}
 
 // ============================================
 // MAIN HANDLER
@@ -540,10 +505,7 @@ serve(async (_req: Request) => {
 
       // Show fail reason pattern if enough data
       if (topFailReason && failReasons7d.length >= 3) {
-        const REASON_LABELS: Record<string, string> = {
-          blocked: "Bloqué", forgot: "Oublié", toobig: "Trop grosse", energy: "Énergie", skip: "Pas prioritaire",
-        };
-        msg += `\n📊 <i>Pattern 7j: "${REASON_LABELS[topFailReason[0]] || topFailReason[0]}" = raison #1 (${topFailReason[1]}x)</i>\n`;
+          msg += `\n📊 <i>Pattern 7j: "${FAIL_REASON_LABELS[topFailReason[0]] || topFailReason[0]}" = raison #1 (${topFailReason[1]}x)</i>\n`;
       }
 
       if (completionRate < 50) {
@@ -723,21 +685,20 @@ serve(async (_req: Request) => {
     // ============================================
     // Save daily velocity metrics
     try {
-      const todayCreated = await supabase.from("tasks").select("id", { count: "exact", head: true })
-        .gte("created_at", today + "T00:00:00").lte("created_at", today + "T23:59:59");
-      const todayRescheduled = await supabase.from("tasks").select("id", { count: "exact", head: true })
-        .gt("reschedule_count", 0).gte("updated_at", today + "T00:00:00");
-      const todayPomodoros = await supabase.from("pomodoro_sessions").select("id, duration_minutes")
-        .eq("completed", true).gte("started_at", today + "T00:00:00");
+      const [todayCreated, todayRescheduled, todayPomodoros, { data: mostRescheduled }] = await Promise.all([
+        supabase.from("tasks").select("id", { count: "exact", head: true })
+          .gte("created_at", today + "T00:00:00").lte("created_at", today + "T23:59:59"),
+        supabase.from("tasks").select("id", { count: "exact", head: true })
+          .gt("reschedule_count", 0).gte("updated_at", today + "T00:00:00"),
+        supabase.from("pomodoro_sessions").select("id, duration_minutes")
+          .eq("completed", true).gte("started_at", today + "T00:00:00"),
+        supabase.from("tasks").select("title, reschedule_count").gt("reschedule_count", 0)
+          .in("status", ["pending", "in_progress"])
+          .order("reschedule_count", { ascending: false }).limit(1),
+      ]);
 
       const pomCount = todayPomodoros.data?.length || 0;
       const deepWork = (todayPomodoros.data || []).reduce((s: number, p: any) => s + (p.duration_minutes || 25), 0);
-
-      // Find most rescheduled task
-      const { data: mostRescheduled } = await supabase.from("tasks")
-        .select("title, reschedule_count").gt("reschedule_count", 0)
-        .in("status", ["pending", "in_progress"])
-        .order("reschedule_count", { ascending: false }).limit(1);
 
       await supabase.from("task_metrics").upsert({
         metric_date: today,
@@ -843,41 +804,27 @@ serve(async (_req: Request) => {
           }).join(", ")
         : "aucun Rock défini";
 
-      const aiContext = `BILAN DU JOUR (${dayName}):
-- Score: ${score}/${maxScore} (${scorePct}%)
-- Tâches: ${tasksDoneToday} complétées (moy 7j: ${tasksWeekAvg.toFixed(1)}/jour), ${tasksPending} en attente
-- Tâches non faites: ${failedTasks.slice(0, 3).map((t: any) => t.title).join(", ") || "aucune"}
-- Taux de complétion: ${completionRate}%
-- Pattern jour: ${dayPattern || "pas assez de données"}
-- 🪨 ROCKS: ${rocksContext}
-- Career vélocité: ${appVelocity7d.toFixed(1)} apps/jour (7j), ${careerRejections.length} rejets en 14j${avgRejectionDays ? ` (délai moyen ${avgRejectionDays}j)` : ""}
-- Dépenses: ${totalExpenses.toFixed(0)}₪ (moy 7j: ${avgExpDaily.toFixed(0)}₪/jour), Épargne: ${savingsRate7d}%
-- Workout: ${workouts.length > 0 ? workouts.map((w: any) => w.workout_type).join(", ") : "aucun"} (${workoutsThisWeek}/5 cette semaine)
-- Poids: ${latestWeight || "N/A"}kg${weightTrend ? ` (${weightTrend}kg sur 7j)` : ""} → objectif 70kg
-- Étude: ${totalStudyMin}min (${(totalStudy7d / 60).toFixed(1)}h cette semaine)
-- Leads: ${leadsContactedToday} contactés (moy 7j: ${avgLeadsDaily.toFixed(1)}/jour)
-- Signals trading: ${activeSignals.length} actifs
-- Streaks: ${streaksContext}
-- Objectifs: ${goalsContext}
-- Demain: ${TOMORROW_SCHEDULE[tomorrowDay]}
-- Pattern d'échec 7j: ${topFailReason ? `"${topFailReason[0]}" (${topFailReason[1]}x)` : "pas assez de données"}`;
+      const aiContext = `${dayName} | Score: ${score}/${maxScore} (${scorePct}%)
+Tâches: ${tasksDoneToday} faites, ${failedCount} non faites (${completionRate}%) · Moy 7j: ${tasksWeekAvg.toFixed(1)}/j
+Non faites: ${failedTasks.slice(0, 3).map((t: any) => t.title).join(", ") || "aucune"}
+Rocks: ${rocksContext}
+Career: ${appVelocity7d.toFixed(1)} apps/j, ${careerRejections.length} rejets 14j
+Finance: ${totalExpenses.toFixed(0)}₪ (moy ${avgExpDaily.toFixed(0)}₪/j) · Épargne ${savingsRate7d}%
+Santé: ${workouts.length > 0 ? workouts.map((w: any) => w.workout_type).join("+") : "0 workout"} (${workoutsThisWeek}/5) · ${latestWeight || "?"}kg${weightTrend ? ` (${weightTrend}kg/7j)` : ""} → 70kg
+Étude: ${totalStudyMin}min · Leads: ${leadsContactedToday} · Streaks: ${streaksContext}
+${topFailReason ? `Échec pattern: "${topFailReason[0]}" ${topFailReason[1]}x` : ""}
+Demain: ${TOMORROW_SCHEDULE[tomorrowDay]}`;
 
       const aiReflection = await callOpenAI(
-        `Tu es OREN, coach personnel d'Oren. Génère une réflexion de soirée ULTRA-CONCRÈTE en français (max 6 lignes courtes):
-
-1. **Score du jour** : Identifie LA cause racine précise (ex: "3/10 car aucun workout + 0 candidatures envoyées")
-2. **Tendance 7j** : Compare avec la moyenne (ex: "2.9 tâches/jour → en légère régression vs 3.5 la semaine dernière")
-3. **ROOT CAUSE des tâches non faites** : POURQUOI ces tâches n'ont pas été faites ? (ex: "Test Calendar bloqué depuis 3j car attends réponse client ?")
-4. **TOP 3 actions DEMAIN** : Sois chirurgical avec horaires précis (ex: "1. 10h → Appeler Etan. 2. 14h → Finir Test Calendar. 3. 17h → PUSH workout")
-5. **PAS DE MOTIVATION** : Remplace par UNE question de coaching (ex: "Qu'est-ce qui t'empêche de décrocher le tel avec Etan ?")
-
-RÈGLES STRICTES:
-- ZÉRO phrase générique ("tu peux le faire", "je crois en toi" → INTERDIT)
-- Utilise TOUJOURS les chiffres réels (montants ₪, kg, heures, %)
-- Si score < 5/10 → identifie LE blocage principal, pas une liste
-- Fin avec UNE question provocante pour débloquer l'action
-Style: coach ultra-direct, français, data-driven. Max 200 mots.`,
-        aiContext
+        `Coach Oren. Réflexion soirée (6 lignes max, français):
+1. Cause racine du score (chiffres réels)
+2. Tendance 7j vs moyenne
+3. Pourquoi tâches non faites
+4. TOP 3 actions demain avec horaires
+5. UNE question de coaching provocante
+Zéro motivation générique. Data-driven. Max 150 mots.`,
+        aiContext,
+        300
       );
 
       if (aiReflection) {

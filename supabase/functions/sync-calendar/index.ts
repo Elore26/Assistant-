@@ -73,9 +73,18 @@ const COLORS = {
   MISSION: "6", BRIEFING: "7", MEAL: "5", GOAL: "3", COMMUTE: "1",
 };
 
+function getIsraelOffset(date: string): string {
+  const d = new Date(date + "T12:00:00");
+  const utcDate = new Date(d.toLocaleString("en-US", { timeZone: "UTC" }));
+  const israelDate = new Date(d.toLocaleString("en-US", { timeZone: TZ }));
+  const diffHours = Math.round((israelDate.getTime() - utcDate.getTime()) / 3600000);
+  return `+${String(diffHours).padStart(2, "0")}:00`;
+}
+
 async function clearDayEvents(token: string, dateStr: string): Promise<number> {
-  const timeMin = `${dateStr}T00:00:00+02:00`;
-  const timeMax = `${dateStr}T23:59:59+02:00`;
+  const offset = getIsraelOffset(dateStr);
+  const timeMin = `${dateStr}T00:00:00${offset}`;
+  const timeMax = `${dateStr}T23:59:59${offset}`;
   const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(CALENDAR_ID)}/events?timeMin=${encodeURIComponent(timeMin)}&timeMax=${encodeURIComponent(timeMax)}&maxResults=200&singleEvents=true`;
   const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
   if (!res.ok) return 0;

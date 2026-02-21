@@ -453,7 +453,8 @@ async function handleTaskList(chatId: number): Promise<void> {
       .from("tasks")
       .select("*")
       .in("status", ["pending", "in_progress"])
-      .order("priority", { ascending: true });
+      .order("priority", { ascending: true })
+      .limit(50);
 
     if (error) throw error;
 
@@ -516,7 +517,8 @@ async function handleTaskDone(chatId: number, args: string[]): Promise<void> {
       .from("tasks")
       .select("id, title")
       .in("status", ["pending", "in_progress"])
-      .order("created_at", { ascending: true });
+      .order("created_at", { ascending: true })
+      .limit(50);
 
     if (selectError) throw selectError;
     if (!data || num > data.length) {
@@ -850,7 +852,8 @@ async function handleLead(chatId: number, args: string[]): Promise<void> {
       const { data, error } = await supabase
         .from("leads")
         .select("*")
-        .order("created_at", { ascending: false });
+        .order("created_at", { ascending: false })
+        .limit(50);
 
       if (error) throw error;
 
@@ -1804,7 +1807,8 @@ async function handleTimeBlock(chatId: number): Promise<void> {
     const { data: tasks } = await supabase.from("tasks")
       .select("id, title, priority, duration_minutes, energy_level, due_time, context")
       .eq("due_date", today).in("status", ["pending", "in_progress"])
-      .order("priority", { ascending: true });
+      .order("priority", { ascending: true })
+      .limit(20);
 
     const unscheduled = (tasks || []).filter((t: any) => !t.due_time);
     const scheduled = (tasks || []).filter((t: any) => t.due_time);
@@ -2757,7 +2761,8 @@ async function handleCareerMain(chatId: number): Promise<void> {
   const supabase = getSupabaseClient();
   try {
     const { data: jobs } = await supabase.from("job_listings").select("status")
-      .in("status", ["new", "saved", "applied", "interviewed", "offer", "rejected"]);
+      .in("status", ["new", "saved", "applied", "interviewed", "offer", "rejected"])
+      .limit(500);
     const all = jobs || [];
 
     const newCount = all.filter((j: any) => j.status === "new" || j.status === "saved").length;

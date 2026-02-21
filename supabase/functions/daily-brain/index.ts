@@ -205,72 +205,27 @@ serve(async (_req: Request) => {
       }
     }
 
-    const context = `
-Date: ${dayName} ${today}
-Heure: ${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}
-
-🪨 ROCKS (priorités 90 jours):
-${rocksContext || "Aucun Rock défini"}
-${rocksOffTrack.length > 0 ? `⚠️ ${rocksOffTrack.length} Rock(s) OFF TRACK: ${rocksOffTrack.join(", ")}` : ""}
-
-OBJECTIFS ACTIFS:
-${goalsContext || "Aucun objectif"}
-
-CAREER PIPELINE:
-- ${newJobs} offres non postulées
-- ${appliedJobs} candidatures en cours
-- ${interviews} interviews
-- Vélocité: ${appVelocity} candidatures/jour (7j) · Requis: ${requiredDailyApps}/jour
-- ${rejections.length} rejets en 14j${rejections.length >= 3 ? " ⚠️ PATTERN" : ""}
-${interviews === 0 ? "⚠️ ALERTE: 0 interviews — le volume de candidatures est le goulot" : ""}
-
-HIGROW:
-- ${convertedLeads}/${totalLeads > 0 ? totalLeads : "?"} clients convertis ce mois
-
-FINANCE:
-- Balance: ${balance > 0 ? "+" : ""}${Math.round(balance)}₪
-
-TÂCHES DU JOUR:
-${tasksContext}
-
-SIGNAUX AGENTS (overnight):
-${signalsContext || "Aucun signal critique"}
-
-${anticipationsContext ? `ANTICIPATIONS:\n${anticipationsContext}` : ""}
-
-BILAN HIER: ${yesterdayScoreRes.data?.[0]?.content ? "Disponible" : "Non disponible"}
-`.trim();
+    const context = `${dayName} ${today}
+Rocks: ${rocksContext || "aucun"}${rocksOffTrack.length > 0 ? ` | ⚠️ OFF: ${rocksOffTrack.join(", ")}` : ""}
+Career: ${newJobs} new, ${appliedJobs} applied, ${interviews} interviews · Vélocité ${appVelocity}/j (requis ${requiredDailyApps}/j) · ${rejections.length} rejets${interviews === 0 ? " ⚠️ 0 INTERVIEWS" : ""}
+HiGrow: ${convertedLeads}/${totalLeads || "?"} convertis · Finance: ${balance > 0 ? "+" : ""}${Math.round(balance)}₪
+Objectifs: ${goalsContext || "aucun"}
+Tâches: ${tasksContext}
+${signalsContext ? `Signaux: ${signalsContext}` : ""}${anticipationsContext ? `Anticipations: ${anticipationsContext}` : ""}`.trim();
 
     // ─── Generate AI daily plan ──────────────────────────────────
     const briefingText = await callOpenAI(
-      `Tu es OREN, l'assistant IA d'Oren. Génère le briefing du matin en HTML (balises <b>, <i> autorisées).
+      `Briefing matin Oren (HTML: <b>, <i>). Format strict:
+🔴/🟡/🟢 URGENCE — Domaine · ${dayName}
+💼 Career stats · 🚀 HiGrow · 📋 Tâches · 💰 Balance
+🪨 Rocks off-track en priorité
+${overnightSignals.weakDomain ? `⚠️ Faible hier: ${overnightSignals.weakDomain}` : ""}${overnightSignals.interviewAlert ? " 🔴 INTERVIEW PREP" : ""}
+⚡ UNE action concrète
 
-FORMAT STRICT (utilise exactement ce format):
-🔴/🟡/🟢 URGENCE_LEVEL — Domaine prioritaire · Jour Date
-
-💼 Xj deadline, Y interviews · Vélocité Z/jour (requis: W/jour)
-🚀 A/B clients, Cj restants
-📋 N tâches · WORKOUT_TYPE · 💰 +BALANCE₪
-
-🪨 Si Rocks off-track: mentionner en priorité
-${overnightSignals.weakDomain ? `⚠️ Hier faible en ${overnightSignals.weakDomain} — corrige aujourd'hui` : ""}
-${overnightSignals.interviewAlert ? "🔴 INTERVIEW: prep = priorité #1" : ""}
-${anticipationsContext ? "📌 Anticipations: inclure les relances/alertes dans les recommandations" : ""}
-
-⚡ UNE PHRASE d'action concrète orientée mission.
-
-RÈGLES:
-- 🔴 si 0 interviews OU deadline < 30j OU 0 clients HiGrow OU vélocité < requis OU Rock off-track
-- 🟡 si des progrès mais insuffisants
-- 🟢 si tout est on-track ET tous les Rocks on-track
-- Si vélocité candidatures < requis, le dire explicitement ("Envoie X candidatures aujourd'hui pour rattraper")
-- Si des signaux overnight existent, les intégrer dans la recommandation
-- Si une candidature est en attente > 5j, mentionner la relance
-- Si c'est le jour faible de l'utilisateur, recommander de planifier léger
-- La phrase ⚡ doit être SPÉCIFIQUE et ACTIONNABLE (pas "travaille dur")
-- Max 10 lignes total, compact, data-driven`,
+🔴=0 interviews/deadline<30j/off-track · 🟢=tout on-track
+Max 8 lignes, data-driven, actionnable.`,
       context,
-      400
+      350
     );
 
     if (!briefingText) {
@@ -302,23 +257,25 @@ RÈGLES:
     // ─── Auto-create follow-up tasks for stale applications (anticipatory) ─
     if (staleApps.length > 0) {
       for (const app of staleApps.slice(0, 3)) {
-        // Check if follow-up task already exists
-        const { data: existing } = await supabase.from("tasks")
-          .select("id").eq("context", `followup_${app.id}`)
-          .in("status", ["pending", "in_progress"]).limit(1);
-        if (existing && existing.length > 0) continue;
+        try {
+          // Check if follow-up task already exists
+          const { data: existing } = await supabase.from("tasks")
+            .select("id").eq("context", `followup_${app.id}`)
+            .in("status", ["pending", "in_progress"]).limit(1);
+          if (existing && existing.length > 0) continue;
 
-        const daysSince = Math.ceil((now.getTime() - new Date(app.applied_date).getTime()) / 86400000);
-        await supabase.from("tasks").insert({
-          title: `📧 Relance ${app.company} — "${app.title}" (${daysSince}j)`,
-          status: "pending",
-          priority: 2,
-          agent_type: "career",
-          context: `followup_${app.id}`,
-          due_date: today,
-          duration_minutes: 10,
-          created_at: new Date().toISOString(),
-        });
+          const daysSince = Math.ceil((now.getTime() - new Date(app.applied_date).getTime()) / 86400000);
+          await supabase.from("tasks").insert({
+            title: `📧 Relance ${app.company} — "${app.title}" (${daysSince}j)`,
+            status: "pending",
+            priority: 2,
+            agent_type: "career",
+            context: `followup_${app.id}`,
+            due_date: today,
+            duration_minutes: 10,
+            created_at: new Date().toISOString(),
+          });
+        } catch (e) { console.error(`[Daily Brain] Follow-up task error for ${app.company}:`, e); }
       }
     }
 

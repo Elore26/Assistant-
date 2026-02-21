@@ -313,14 +313,11 @@ async function getAICoachAdvice(supabase: any, plan: DayHealthPlan): Promise<str
   context += `Nutrition: Jeûne 16:8, fenêtre ${plan.fasting.eating_window}\n`;
 
   const advice = await callOpenAI(
-    `Tu es le coach santé personnel d'Oren. Profil: homme, ~75kg, objectif recomposition (muscle + perte de gras → 70kg).
-Programme: PPL 5x/semaine + jeûne intermittent 16:8.
-Donne un conseil UNIQUE et ACTIONNABLE pour aujourd'hui en 3-4 lignes max.
-Adapte le conseil au programme du jour et aux données récentes.
-Si les workouts manquent → motive. Si poids stagne → ajuste nutrition. Si bonne progression → félicite.
-Français, direct, coach sportif motivant. Emojis ok.`,
+    `Coach santé Oren. 75kg→70kg, PPL 5x/sem, IF 16:8.
+1 conseil ACTIONNABLE (3 lignes max). Adapte au jour + données.
+Français, direct, emojis ok.`,
     context,
-    250
+    150
   );
 
   return advice;
@@ -376,14 +373,10 @@ async function weeklyHealthReview(supabase: any): Promise<string> {
   // AI Weekly Analysis
   const aiContext = `Semaine: ${totalWorkouts}/5 workouts, ${totalMinutes} min total. Types: ${JSON.stringify(byType)}. Poids: ${weights.map((w: any) => w.value).join("→")}kg. Objectif: 70kg recomp.`;
   const aiReview = await callOpenAI(
-    `Tu es coach santé. Analyse la semaine d'Oren et donne:
-1) Score de la semaine /10
-2) Point fort de la semaine
-3) Axe d'amélioration principal
-4) Objectif précis pour la semaine prochaine
-5) Ajustement nutrition si nécessaire
-Max 6 lignes, français, direct.`,
-    aiContext, 350
+    `Coach santé. Bilan hebdo (5 points, 6 lignes max):
+Score /10 · Point fort · Axe amélioration · Objectif semaine prochaine · Ajustement nutrition si besoin.
+Français, direct.`,
+    aiContext, 250
   );
 
   if (aiReview) {
@@ -563,12 +556,18 @@ serve(async (req: Request) => {
       responseType = "weekly";
     }
 
-    // 7. Save analysis
-    await supabase.from("health_logs").insert({
-      log_type: "agent_analysis",
-      log_date: today,
-      notes: JSON.stringify({ type: responseType, tasks_created: tasksCreated, workout_done: workoutDone }),
-    }).then(() => {}).catch(() => {});
+    // 7. Save analysis (dedup: skip if already saved today)
+    try {
+      const { data: existingAnalysis } = await supabase.from("health_logs")
+        .select("id").eq("log_type", "agent_analysis").eq("log_date", today).limit(1);
+      if (!existingAnalysis || existingAnalysis.length === 0) {
+        await supabase.from("health_logs").insert({
+          log_type: "agent_analysis",
+          log_date: today,
+          notes: JSON.stringify({ type: responseType, tasks_created: tasksCreated, workout_done: workoutDone }),
+        });
+      }
+    } catch (_) {}
 
     return new Response(JSON.stringify({
       success: true,
