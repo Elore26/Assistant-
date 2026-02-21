@@ -61,12 +61,9 @@ interface FocusAreaStats {
   percentage: number;
 }
 
-// Helper function to get Israel timezone date (IST is UTC+2, or UTC+3 during DST)
+// Helper function to get Israel timezone date (handles DST automatically)
 function getIsraeliDate(): Date {
-  const now = new Date();
-  const utcDate = new Date(now.getTime() + now.getTimezoneOffset() * 60000);
-  const istDate = new Date(utcDate.getTime() + 2 * 60 * 60 * 1000); // UTC+2 base
-  return istDate;
+  return new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Jerusalem" }));
 }
 
 function getIsraeliDateString(date: Date): string {
@@ -481,7 +478,20 @@ async function processLearningAgent() {
     let sentWeekly = false;
 
     // Daily reminder if no study session logged today
+    // --- Deduplication: skip if reminder already sent today ---
+    let reminderAlreadySent = false;
     if (!studiedToday) {
+      try {
+        const { data: existing } = await supabase.from("agent_executions")
+          .select("id").eq("agent_name", "learning-agent-daily")
+          .gte("executed_at", todayDate + "T00:00:00").limit(1);
+        if (existing && existing.length > 0) {
+          console.log(`[Learning] Daily reminder already sent (${todayDate}), skipping`);
+          reminderAlreadySent = true;
+        }
+      } catch (_) {}
+    }
+    if (!studiedToday && !reminderAlreadySent) {
       // --- Consume Inter-Agent Signals ---
       let careerUrgency = "";
       let skillGapHints: string[] = [];
@@ -540,6 +550,15 @@ async function processLearningAgent() {
 
       sentReminder = await sendTelegramMessage(reminderMessage);
       responseType = "reminder";
+
+      // Log execution for dedup
+      try {
+        await supabase.from("agent_executions").insert({
+          agent_name: "learning-agent-daily",
+          executed_at: new Date().toISOString(),
+          result_summary: `Reminder sent: streak ${streakData.currentStreak}d`,
+        });
+      } catch (_) {}
     }
 
     // Weekly summary on Sunday

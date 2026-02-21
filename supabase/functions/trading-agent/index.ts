@@ -1640,10 +1640,20 @@ Style: direct, chiffres précis, pas de généralités. Emojis autorisés.`,
       }
     } catch (e) { console.error("GCal trading sync error:", e); }
 
-    // Save to DB (include full message text for retrieval via trading_last button)
+    // Save to DB (with deduplication — skip symbols already analyzed today)
     const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+    const todayDate = new Date().toISOString().split("T")[0];
+    const { data: existingSignals } = await supabase.from("trading_signals")
+      .select("symbol").gte("created_at", todayDate + "T00:00:00")
+      .not("symbol", "in", "(PLAN,CONFIG)");
+    const alreadySaved = new Set((existingSignals || []).map((s: any) => s.symbol));
+
     for (let i = 0; i < analyses.length; i++) {
       const a = analyses[i];
+      if (alreadySaved.has(a.symbol)) {
+        console.log(`[Trading] ${a.symbol} already saved today, skipping`);
+        continue;
+      }
       const notesObj: any = {
         trend1D: a.trend1D.structure,
         trend4H: a.trend4H.structure,

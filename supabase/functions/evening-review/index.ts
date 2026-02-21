@@ -116,6 +116,18 @@ serve(async (_req: Request) => {
     const dayName = DAYS_FR[day];
     const weekAgoStr = daysAgo(7);
 
+    // --- Deduplication: skip if evening review already sent today ---
+    try {
+      const { data: existingReview } = await supabase.from("briefings")
+        .select("id").eq("briefing_type", "evening").eq("briefing_date", todayStr).limit(1);
+      if (existingReview && existingReview.length > 0) {
+        console.log(`[Evening Review] Already sent today (${todayStr}), skipping duplicate`);
+        return new Response(JSON.stringify({
+          success: true, type: "skipped_duplicate", date: todayStr,
+        }), { headers: { "Content-Type": "application/json" } });
+      }
+    } catch (_) {}
+
     // Saturday: skip
     if (day === 6) {
       return new Response(JSON.stringify({ success: true, type: "off" }), {

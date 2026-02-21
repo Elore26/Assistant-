@@ -1577,9 +1577,19 @@ Style: direct, chiffres précis, pas de généralités. Emojis autorisés.`,
       }
     } catch (e) { console.error("GCal trading sync error:", e); }
 
-    // Save to DB
+    // Save to DB (with deduplication — skip symbols already analyzed today)
     const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+    const todayDate = new Date().toISOString().split("T")[0];
+    const { data: existingSignals } = await supabase.from("trading_signals")
+      .select("symbol").gte("created_at", todayDate + "T00:00:00")
+      .not("symbol", "in", "(PLAN,CONFIG)");
+    const alreadySaved = new Set((existingSignals || []).map((s: any) => s.symbol));
+
     for (const a of analyses) {
+      if (alreadySaved.has(a.symbol)) {
+        console.log(`[Trading] ${a.symbol} already saved today, skipping`);
+        continue;
+      }
       await supabase.from("trading_signals").insert({
         symbol: a.symbol,
         signal_type: a.signal?.type || "HOLD",

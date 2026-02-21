@@ -46,36 +46,29 @@ interface AgentResponse {
   error?: string;
 }
 
-// Helper: Get IST timezone adjusted date
+// Helper: Get Israel timezone adjusted date (handles DST automatically)
 function getISTNow(): Date {
-  const utcDate = new Date();
-  const istDate = new Date(utcDate.getTime() + 5.5 * 60 * 60 * 1000);
-  return istDate;
+  return new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Jerusalem" }));
 }
 
-// Helper: Get IST date string (YYYY-MM-DD)
+// Helper: Get Israel date string (YYYY-MM-DD)
 function getISTDateString(): string {
-  const istDate = getISTNow();
-  return istDate.toISOString().split("T")[0];
+  const d = getISTNow();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 
-// Helper: Check if today is Sunday (IST)
+// Helper: Check if today is Sunday (Israel time)
 function isSunday(): boolean {
-  const istDate = getISTNow();
-  // getUTCDay() works on the UTC date, so we need to manually calculate
-  const utcDate = new Date();
-  const istTime = utcDate.getTime() + 5.5 * 60 * 60 * 1000;
-  const istDateObj = new Date(istTime);
-  return istDateObj.getUTCDay() === 0; // 0 = Sunday
+  return getISTNow().getDay() === 0;
 }
 
-// Helper: Get week start date (Monday) in IST
+// Helper: Get week start date (Monday) in Israel time
 function getWeekStartDate(): string {
-  const istDate = getISTNow();
-  const day = istDate.getUTCDay();
-  const diff = istDate.getUTCDate() - day + (day === 0 ? -6 : 1);
-  const weekStart = new Date(istDate.getUTCFullYear(), istDate.getUTCMonth(), diff);
-  return weekStart.toISOString().split("T")[0];
+  const d = getISTNow();
+  const day = d.getDay();
+  const diff = d.getDate() - day + (day === 0 ? -6 : 1);
+  const weekStart = new Date(d.getFullYear(), d.getMonth(), diff);
+  return `${weekStart.getFullYear()}-${String(weekStart.getMonth() + 1).padStart(2, "0")}-${String(weekStart.getDate()).padStart(2, "0")}`;
 }
 
 // Helper: Calculate days remaining until deadline
