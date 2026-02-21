@@ -1,24 +1,9 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { getSignalBus } from "../_shared/agent-signals.ts";
-
-async function callOpenAI(systemPrompt: string, userContent: string, maxTokens = 500): Promise<string> {
-  const apiKey = Deno.env.get("OPENAI_API_KEY");
-  if (!apiKey) return "";
-  try {
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
-      body: JSON.stringify({
-        model: "gpt-4o-mini", temperature: 0.7, max_tokens: maxTokens,
-        messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userContent }],
-      }),
-    });
-    if (!response.ok) return "";
-    const data = await response.json();
-    return data.choices?.[0]?.message?.content || "";
-  } catch (e) { console.error("OpenAI error:", e); return ""; }
-}
+import { getIsraelNow, todayStr, dateStr, weekStart, monthStart } from "../_shared/timezone.ts";
+import { callOpenAI } from "../_shared/openai.ts";
+import { sendTG } from "../_shared/telegram.ts";
 
 interface StudySession {
   id?: string;
@@ -61,76 +46,7 @@ interface FocusAreaStats {
   percentage: number;
 }
 
-// Helper function to get Israel timezone date (handles DST automatically)
-function getIsraeliDate(): Date {
-  return new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Jerusalem" }));
-}
-
-function getIsraeliDateString(date: Date): string {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
-  return `${year}-${month}-${day}`;
-}
-
-function getDayOfWeek(date: Date): number {
-  return date.getDay();
-}
-
-function getWeekStartDate(date: Date): string {
-  const d = new Date(date);
-  const day = d.getDay();
-  const diff = d.getDate() - day + (day === 0 ? -6 : 1);
-  const weekStart = new Date(d.setDate(diff));
-  return getIsraeliDateString(weekStart);
-}
-
-function getMonthStartDate(date: Date): string {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  return `${year}-${month}-01`;
-}
-
-async function sendTelegramMessage(
-  message: string,
-  parseMode: "HTML" | "Markdown" | undefined = undefined
-): Promise<boolean> {
-  const botToken = Deno.env.get("TELEGRAM_BOT_TOKEN");
-  const chatId = Deno.env.get("TELEGRAM_CHAT_ID") || "775360436";
-
-  if (!botToken) {
-    console.error("TELEGRAM_BOT_TOKEN not configured");
-    return false;
-  }
-
-  try {
-    const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
-    const payload: Record<string, string | undefined> = {
-      chat_id: chatId,
-      text: message,
-    };
-
-    if (parseMode) {
-      payload.parse_mode = parseMode;
-    }
-
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-
-    if (!response.ok) {
-      console.error("Telegram API error:", response.statusText);
-      return false;
-    }
-
-    return true;
-  } catch (error) {
-    console.error("Failed to send Telegram message:", error);
-    return false;
-  }
-}
+// Timezone, OpenAI, Telegram imported from _shared modules above
 
 async function checkTodayStudy(
   supabase: ReturnType<typeof createClient>,
@@ -174,9 +90,9 @@ async function calculateStudyStreak(
 
     // Convert to unique dates and sort descending
     const uniqueDates = [...new Set(allSessions.map((s) => s.session_date))].sort().reverse();
-    const israeliDate = getIsraeliDate();
-    const todayDateString = getIsraeliDateString(israeliDate);
-    const yesterdayDateString = getIsraeliDateString(
+    const israeliDate = getIsraelNow();
+    const todayDateString = dateStr(israeliDate);
+    const yesterdayDateString = dateStr(
       new Date(israeliDate.getTime() - 24 * 60 * 60 * 1000)
     );
 
@@ -255,15 +171,15 @@ async function getFocusAreasStats(
   supabase: ReturnType<typeof createClient>
 ): Promise<FocusAreaStats[]> {
   try {
-    const monthStart = getMonthStartDate(getIsraeliDate());
-    const todayDate = getIsraeliDateString(getIsraeliDate());
+    const mStart = monthStart();
+    const todayDate = todayStr();
     const learningFocus = Deno.env.get("LEARNING_FOCUS") || "English,Product Management,AI";
     const focusTopics = learningFocus.split(",").map((t) => t.trim());
 
     const { data: sessions, error } = await supabase
       .from("study_sessions")
       .select("topic, duration_minutes")
-      .gte("session_date", monthStart)
+      .gte("session_date", mStart)
       .lte("session_date", todayDate);
 
     if (error) {
@@ -311,14 +227,14 @@ async function getWeeklyLearningData(
   supabase: ReturnType<typeof createClient>
 ): Promise<WeeklyLearningData | null> {
   try {
-    const weekStart = getWeekStartDate(getIsraeliDate());
-    const todayDate = getIsraeliDateString(getIsraeliDate());
+    const wStart = weekStart();
+    const todayDate = todayStr();
 
     // Get study sessions for the week
     const { data: sessions, error: sessionError } = await supabase
       .from("study_sessions")
       .select("topic, duration_minutes")
-      .gte("session_date", weekStart)
+      .gte("session_date", wStart)
       .lte("session_date", todayDate);
 
     if (sessionError) {
@@ -348,7 +264,7 @@ async function getWeeklyLearningData(
       .from("learning_resources")
       .select("id")
       .eq("status", "completed")
-      .gte("created_at", weekStart)
+      .gte("created_at", wStart)
       .lte("created_at", todayDate);
 
     if (resourceError) {
@@ -397,7 +313,7 @@ async function saveAnalysis(
   analysisType: string
 ): Promise<boolean> {
   try {
-    const todayDate = getIsraeliDateString(getIsraeliDate());
+    const todayDate = dateStr(getIsraelNow());
 
     const { error } = await supabase.from("study_sessions").insert({
       session_date: todayDate,
@@ -436,9 +352,9 @@ async function processLearningAgent() {
   const supabase = createClient(supabaseUrl, supabaseKey);
 
   try {
-    const israeliDate = getIsraeliDate();
-    const todayDate = getIsraeliDateString(israeliDate);
-    const dayOfWeek = getDayOfWeek(israeliDate);
+    const israeliDate = getIsraelNow();
+    const todayDate = dateStr(israeliDate);
+    const dayOfWeek = israeliDate.getDay();
     const studiedToday = await checkTodayStudy(supabase, todayDate);
     const streakData = await calculateStudyStreak(supabase);
     const inProgressResources = await getInProgressResources(supabase);
@@ -464,10 +380,10 @@ async function processLearningAgent() {
 
     // Update goal metric_current with monthly study hours
     if (learningGoal) {
-      const monthStart = getMonthStartDate(israeliDate);
+      const mStart = monthStart();
       try {
         const { data: monthSessions } = await supabase.from("study_sessions").select("duration_minutes")
-          .gte("session_date", monthStart).lte("session_date", todayDate).neq("topic", "agent_analysis");
+          .gte("session_date", mStart).lte("session_date", todayDate).neq("topic", "agent_analysis");
         const monthlyHours = (monthSessions || []).reduce((s: number, ss: any) => s + (Number(ss.duration_minutes) || 0), 0) / 60;
         await supabase.from("goals").update({ metric_current: Number(monthlyHours.toFixed(1)) }).eq("id", learningGoal.id);
       } catch (_) {}
@@ -548,7 +464,7 @@ async function processLearningAgent() {
         reminderMessage += `\n\n🎯 Message IA:\n${aiMotivation}`;
       }
 
-      sentReminder = await sendTelegramMessage(reminderMessage);
+      sentReminder = await sendTG(reminderMessage);
       responseType = "reminder";
 
       // Log execution for dedup
@@ -604,7 +520,7 @@ Donne: 1) Compétence PRIORITAIRE à travailler (liée à ses candidatures) 2) R
           weeklyMessage += `\n\n💡 Recommandations IA:\n${aiRecommendations}`;
         }
 
-        sentWeekly = await sendTelegramMessage(weeklyMessage);
+        sentWeekly = await sendTG(weeklyMessage);
         responseType = "weekly";
 
         // Save weekly analysis
@@ -618,6 +534,76 @@ Donne: 1) Compétence PRIORITAIRE à travailler (liée à ses candidatures) 2) R
       const focusTopics = focusAreaStats.slice(0, 3).map((s) => `${s.topic}(${s.percentage}%)`).join(", ");
       const analysisText = `No study logged. Streak: ${streakData.currentStreak}d, Focus areas: ${focusTopics}`;
       await saveAnalysis(supabase, analysisText, "DAILY_CHECK");
+    }
+
+    // --- Auto-create learning tasks from skill-gap signals ---
+    try {
+      const skillGapSignals = await signals.consume({
+        types: ["skill_gap"],
+        markConsumed: true,
+      });
+
+      for (const sig of skillGapSignals) {
+        const skill = sig.payload?.skill || sig.message;
+        const pct = sig.payload?.percentage || 0;
+
+        // Only create tasks for skills demanded in 20%+ of jobs
+        if (pct < 20) continue;
+
+        // Check if a learning task for this skill already exists
+        const { data: existingTask } = await supabase.from("tasks")
+          .select("id").eq("context", `skill_gap_${skill}`)
+          .in("status", ["pending", "in_progress"]).limit(1);
+
+        if (existingTask && existingTask.length > 0) continue;
+
+        // Create the learning task
+        const taskTitle = `📚 Apprendre ${skill} (demandé dans ${pct}% des offres)`;
+        await supabase.from("tasks").insert({
+          title: taskTitle,
+          status: "pending",
+          priority: 2,
+          agent_type: "learning",
+          context: `skill_gap_${skill}`,
+          due_date: todayDate,
+          duration_minutes: 30,
+          created_at: new Date().toISOString(),
+        });
+        console.log(`[Learning] Auto-created task for skill gap: ${skill} (${pct}%)`);
+      }
+
+      // Also check for interview_scheduled signals to prioritize English/negotiation
+      const interviewSignals = await signals.peek({
+        types: ["interview_scheduled"],
+        hoursBack: 72,
+      });
+
+      if (interviewSignals.length > 0) {
+        const companies = interviewSignals.flatMap(s => s.payload?.companies || []);
+        const interviewPrepSkills = ["English", "Négociation", "Pitch"];
+
+        for (const skill of interviewPrepSkills) {
+          const { data: existingPrep } = await supabase.from("tasks")
+            .select("id").eq("context", `interview_skill_${skill.toLowerCase()}`)
+            .in("status", ["pending", "in_progress"]).limit(1);
+
+          if (existingPrep && existingPrep.length > 0) continue;
+
+          await supabase.from("tasks").insert({
+            title: `🎯 Pratiquer ${skill} (interview ${companies[0] || "prochaine"})`,
+            status: "pending",
+            priority: 1,
+            agent_type: "learning",
+            context: `interview_skill_${skill.toLowerCase()}`,
+            due_date: todayDate,
+            duration_minutes: 20,
+            created_at: new Date().toISOString(),
+          });
+          console.log(`[Learning] Auto-created interview prep task: ${skill}`);
+        }
+      }
+    } catch (skillErr) {
+      console.error("[Learning] Skill gap task creation error:", skillErr);
     }
 
     // --- Emit Inter-Agent Signals ---

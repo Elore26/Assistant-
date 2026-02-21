@@ -91,7 +91,7 @@ serve(async (_req: Request) => {
       todayCompletedRes, allPendingRes, financeRes, finance7dRes,
       healthRes, health7dRes, learningRes, learning7dRes,
       signalsRes, leadsRes, leads7dRes, goalsRes,
-      weekTasksRes
+      weekTasksRes, careerApps7dRes, careerRejectionsRes, careerAllPipelineRes
     ] = await Promise.all([
       // Today's completed tasks
       supabase.from("tasks").select("title, status, updated_at, agent_type")
@@ -132,6 +132,16 @@ serve(async (_req: Request) => {
       // 7-day completed tasks for streak
       supabase.from("tasks").select("status, updated_at")
         .eq("status", "completed").gte("updated_at", weekAgoStr + "T00:00:00"),
+      // Career: applications in last 7 days (velocity)
+      supabase.from("job_listings").select("applied_date, source, region")
+        .eq("status", "applied").gte("applied_date", weekAgoStr),
+      // Career: rejections in last 14 days (pattern analysis)
+      supabase.from("job_listings").select("company, title, source, region, applied_date, updated_at")
+        .eq("status", "rejected")
+        .gte("updated_at", new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString()),
+      // Career: full pipeline for conversion rates
+      supabase.from("job_listings").select("status, source, region, applied_date")
+        .in("status", ["applied", "interview", "offer", "rejected"]),
     ]);
 
     // Extract data
@@ -210,6 +220,39 @@ serve(async (_req: Request) => {
     const leadsContactedToday = contactedLeads.length;
     const leadsContacted7d = leads7d.length;
     const avgLeadsDaily = leadsContacted7d / 7;
+
+    // --- Career Analytics ---
+    const careerApps7d = careerApps7dRes.data || [];
+    const careerRejections = careerRejectionsRes.data || [];
+    const careerAllPipeline = careerAllPipelineRes.data || [];
+    const appVelocity7d = careerApps7d.length / 7;
+
+    // Source conversion rates
+    const sourceStats: Record<string, { applied: number; interview: number; rejected: number }> = {};
+    for (const job of careerAllPipeline) {
+      const src = job.source || "direct";
+      if (!sourceStats[src]) sourceStats[src] = { applied: 0, interview: 0, rejected: 0 };
+      sourceStats[src].applied++;
+      if (job.status === "interview") sourceStats[src].interview++;
+      if (job.status === "rejected") sourceStats[src].rejected++;
+    }
+
+    // Region conversion rates
+    const regionStats: Record<string, { applied: number; interview: number }> = {};
+    for (const job of careerAllPipeline) {
+      const reg = job.region || "other";
+      if (!regionStats[reg]) regionStats[reg] = { applied: 0, interview: 0 };
+      regionStats[reg].applied++;
+      if (job.status === "interview") regionStats[reg].interview++;
+    }
+
+    // Rejection pattern: time to rejection
+    const rejectionTimes = careerRejections
+      .filter((r: any) => r.applied_date && r.updated_at)
+      .map((r: any) => Math.ceil((new Date(r.updated_at).getTime() - new Date(r.applied_date).getTime()) / 86400000));
+    const avgRejectionDays = rejectionTimes.length > 0
+      ? Math.round(rejectionTimes.reduce((s, d) => s + d, 0) / rejectionTimes.length)
+      : null;
 
     // ============================================
     // STREAKS (consecutive days with key actions)
@@ -524,6 +567,60 @@ serve(async (_req: Request) => {
       msg += `  ${leadsContactedToday} leads contactés · <i>Moy 7j: ${avgLeadsDaily.toFixed(1)}/jour</i>\n\n`;
     }
 
+    // --- CAREER ANALYTICS ---
+    if (careerAllPipeline.length > 0 || careerApps7d.length > 0) {
+      msg += `<b>💼 CAREER ANALYTICS</b>\n`;
+
+      // Velocity
+      const careerGoal = goals.find((g: any) => g.domain === "career");
+      let requiredDaily = "?";
+      if (careerGoal) {
+        const remaining = Math.max(0, (Number(careerGoal.metric_target) || 50) - (Number(careerGoal.metric_current) || 0));
+        const dLeft = careerGoal.deadline
+          ? Math.max(1, Math.ceil((new Date(careerGoal.deadline).getTime() - now.getTime()) / 86400000))
+          : 60;
+        requiredDaily = (remaining / dLeft).toFixed(1);
+      }
+      const velocityOk = appVelocity7d >= parseFloat(requiredDaily);
+      msg += `  📊 Vélocité: <b>${appVelocity7d.toFixed(1)}</b>/jour · Requis: ${requiredDaily}/jour ${velocityOk ? "✅" : "⚠️ DERRIÈRE"}\n`;
+
+      // Source conversion
+      const sourcesWithData = Object.entries(sourceStats).filter(([_, v]) => v.applied >= 3);
+      if (sourcesWithData.length > 0) {
+        msg += `  📈 Conversion par source:\n`;
+        for (const [src, stats] of sourcesWithData) {
+          const rate = stats.applied > 0 ? Math.round((stats.interview / stats.applied) * 100) : 0;
+          msg += `    ${escHTML(src)}: ${rate}% (${stats.interview}/${stats.applied})\n`;
+        }
+      }
+
+      // Region conversion
+      const regionsWithData = Object.entries(regionStats).filter(([_, v]) => v.applied >= 3);
+      if (regionsWithData.length > 0) {
+        msg += `  🌍 Par région:\n`;
+        for (const [reg, stats] of regionsWithData) {
+          const rate = stats.applied > 0 ? Math.round((stats.interview / stats.applied) * 100) : 0;
+          msg += `    ${escHTML(reg)}: ${rate}% interview (${stats.applied} apps)\n`;
+        }
+      }
+
+      // Rejection pattern
+      if (careerRejections.length >= 3) {
+        msg += `  ⚠️ <b>${careerRejections.length} rejets</b> en 14j`;
+        if (avgRejectionDays !== null) msg += ` · Délai moyen: ${avgRejectionDays}j`;
+        msg += `\n`;
+        // Most rejected companies
+        const companyCount: Record<string, number> = {};
+        careerRejections.forEach((r: any) => { companyCount[r.company] = (companyCount[r.company] || 0) + 1; });
+        const repeatedRejections = Object.entries(companyCount).filter(([_, c]) => c >= 2);
+        if (repeatedRejections.length > 0) {
+          msg += `    Récurrents: ${repeatedRejections.map(([co, c]) => `${escHTML(co)}(${c}x)`).join(", ")}\n`;
+        }
+      }
+
+      msg += `\n`;
+    }
+
     // ============================================
     // OBJECTIFS — TOP 3 PRIORITAIRES
     // ============================================
@@ -682,6 +779,7 @@ serve(async (_req: Request) => {
 - Tâches non faites: ${failedTasks.slice(0, 3).map((t: any) => t.title).join(", ") || "aucune"}
 - Taux de complétion: ${completionRate}%
 - Pattern jour: ${dayPattern || "pas assez de données"}
+- Career vélocité: ${appVelocity7d.toFixed(1)} apps/jour (7j), ${careerRejections.length} rejets en 14j${avgRejectionDays ? ` (délai moyen ${avgRejectionDays}j)` : ""}
 - Dépenses: ${totalExpenses.toFixed(0)}₪ (moy 7j: ${avgExpDaily.toFixed(0)}₪/jour), Épargne: ${savingsRate7d}%
 - Workout: ${workouts.length > 0 ? workouts.map((w: any) => w.workout_type).join(", ") : "aucun"} (${workoutsThisWeek}/5 cette semaine)
 - Poids: ${latestWeight || "N/A"}kg${weightTrend ? ` (${weightTrend}kg sur 7j)` : ""} → objectif 70kg
@@ -721,8 +819,8 @@ Style: coach ultra-direct, français, data-driven. Max 200 mots.`,
     // EMIT INTER-AGENT SIGNALS FOR TOMORROW
     // ============================================
     try {
-      // Emit daily score
-      await signals.emit("daily_score", `Score: ${score}/10`, {
+      // Emit daily score (enriched with career velocity)
+      await signals.emit("daily_score", `Score: ${score}/12`, {
         score: score,
         breakdown: {
           tasks: tasksDoneToday,
@@ -730,6 +828,8 @@ Style: coach ultra-direct, français, data-driven. Max 200 mots.`,
           study: totalStudyMin,
           finance: financeLogs.length > 0 ? 1 : 0,
           leads: leadsContactedToday,
+          careerVelocity: appVelocity7d,
+          rejections14d: careerRejections.length,
         },
       }, { target: "morning-briefing", priority: 3, ttlHours: 14 });
 

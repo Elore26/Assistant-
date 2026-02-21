@@ -536,6 +536,76 @@ Donne: 1) Compétence PRIORITAIRE à travailler (liée à ses candidatures) 2) R
       await saveAnalysis(supabase, analysisText, "DAILY_CHECK");
     }
 
+    // --- Auto-create learning tasks from skill-gap signals ---
+    try {
+      const skillGapSignals = await signals.consume({
+        types: ["skill_gap"],
+        markConsumed: true,
+      });
+
+      for (const sig of skillGapSignals) {
+        const skill = sig.payload?.skill || sig.message;
+        const pct = sig.payload?.percentage || 0;
+
+        // Only create tasks for skills demanded in 20%+ of jobs
+        if (pct < 20) continue;
+
+        // Check if a learning task for this skill already exists
+        const { data: existingTask } = await supabase.from("tasks")
+          .select("id").eq("context", `skill_gap_${skill}`)
+          .in("status", ["pending", "in_progress"]).limit(1);
+
+        if (existingTask && existingTask.length > 0) continue;
+
+        // Create the learning task
+        const taskTitle = `📚 Apprendre ${skill} (demandé dans ${pct}% des offres)`;
+        await supabase.from("tasks").insert({
+          title: taskTitle,
+          status: "pending",
+          priority: 2,
+          agent_type: "learning",
+          context: `skill_gap_${skill}`,
+          due_date: todayDate,
+          duration_minutes: 30,
+          created_at: new Date().toISOString(),
+        });
+        console.log(`[Learning] Auto-created task for skill gap: ${skill} (${pct}%)`);
+      }
+
+      // Also check for interview_scheduled signals to prioritize English/negotiation
+      const interviewSignals = await signals.peek({
+        types: ["interview_scheduled"],
+        hoursBack: 72,
+      });
+
+      if (interviewSignals.length > 0) {
+        const companies = interviewSignals.flatMap(s => s.payload?.companies || []);
+        const interviewPrepSkills = ["English", "Négociation", "Pitch"];
+
+        for (const skill of interviewPrepSkills) {
+          const { data: existingPrep } = await supabase.from("tasks")
+            .select("id").eq("context", `interview_skill_${skill.toLowerCase()}`)
+            .in("status", ["pending", "in_progress"]).limit(1);
+
+          if (existingPrep && existingPrep.length > 0) continue;
+
+          await supabase.from("tasks").insert({
+            title: `🎯 Pratiquer ${skill} (interview ${companies[0] || "prochaine"})`,
+            status: "pending",
+            priority: 1,
+            agent_type: "learning",
+            context: `interview_skill_${skill.toLowerCase()}`,
+            due_date: todayDate,
+            duration_minutes: 20,
+            created_at: new Date().toISOString(),
+          });
+          console.log(`[Learning] Auto-created interview prep task: ${skill}`);
+        }
+      }
+    } catch (skillErr) {
+      console.error("[Learning] Skill gap task creation error:", skillErr);
+    }
+
     // --- Emit Inter-Agent Signals ---
     try {
       const streak = streakData.currentStreak;
