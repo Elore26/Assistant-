@@ -626,13 +626,7 @@ async function scrapeJobBoards(supabase: any): Promise<{ newJobs: number; detail
 
       if (existing && existing.length > 0) continue;
 
-      // Generate cover letter snippet
-      let coverLetterSnippet = "";
-      try {
-        coverLetterSnippet = await generateCoverLetterSnippet(job);
-      } catch (e) {
-        console.error("Error generating cover letter snippet:", e);
-      }
+      // Cover letter generated on-demand when user applies (not on scrape — saves OpenAI costs)
 
       // Insert new job
       const { error } = await supabase.from("job_listings").insert({
@@ -645,7 +639,7 @@ async function scrapeJobBoards(supabase: any): Promise<{ newJobs: number; detail
         region: search.region,
         status: "new",
         date_posted: job.date_posted,
-        cover_letter_snippet: coverLetterSnippet || null,
+        cover_letter_snippet: null,
       });
 
       if (!error) {
@@ -813,6 +807,41 @@ serve(async (req: Request) => {
       await sendTelegramMessage(msg, "HTML");
       alertsSent.push("scan_pipeline");
     }
+
+    // 1b. POSTULE AUJOURD'HUI — Top 3 job recommendations
+    try {
+      const { data: newJobs } = await supabase.from("job_listings")
+        .select("id, title, company, location, role_type, region, date_posted, job_url")
+        .eq("status", "new")
+        .order("date_posted", { ascending: false })
+        .limit(20);
+
+      if (newJobs && newJobs.length > 0) {
+        const scored = newJobs.map((job: any) => {
+          let score = 0;
+          const daysOld = Math.floor((Date.now() - new Date(job.date_posted || Date.now()).getTime()) / 86400000);
+          score += Math.max(0, 10 - daysOld);
+          if (/account.executive|ae\b/i.test(job.role_type || job.title)) score += 5;
+          else if (/sdr|sales.dev/i.test(job.role_type || job.title)) score += 3;
+          if (job.region === "israel" || /israel|tel.?aviv/i.test(job.location || "")) score += 3;
+          return { ...job, _score: score };
+        });
+        scored.sort((a: any, b: any) => b._score - a._score);
+        const top3 = scored.slice(0, 3);
+
+        let recMsg = `<b>🎯 POSTULE AUJOURD'HUI</b>\n━━━━━━━━━━━━━━━━━━━━\n`;
+        top3.forEach((job: any, i: number) => {
+          const num = ["1️⃣", "2️⃣", "3️⃣"][i];
+          const loc = job.location ? ` · ${job.location}` : "";
+          recMsg += `${num} <b>${job.title}</b> @ ${job.company}${loc}\n`;
+          if (job.job_url) recMsg += `    → ${job.job_url}\n`;
+        });
+        recMsg += `\n<i>${newJobs.length - 3 > 0 ? `+${newJobs.length - 3} autres offres en attente` : "Postule maintenant, chaque candidature compte."}</i>`;
+
+        await sendTelegramMessage(recMsg, "HTML");
+        alertsSent.push("apply_recommendations");
+      }
+    } catch (e) { console.error("Apply recommendations error:", e); }
 
     // 2. Send follow-up reminders
     if (followupsNeeded > 0) {

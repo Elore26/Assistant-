@@ -360,10 +360,18 @@ serve(async (_req: Request) => {
     maxScore += 1;
     if (financeLogs.length > 0) score += 1;
 
-    // Leads/career (0-2): career/higrow goals
+    // HiGrow leads (0-2): client acquisition
     maxScore += 2;
     if (leadsContactedToday >= 3) score += 2;
     else if (leadsContactedToday > 0) score += 1;
+
+    // Career actions (0-2): job applications and follow-ups
+    maxScore += 2;
+    const careerTasksDone = completedTasks.filter((t: any) =>
+      t.agent_type === "career" || t.agent_type === "job"
+    ).length;
+    if (careerTasksDone >= 2) score += 2;
+    else if (careerTasksDone > 0) score += 1;
 
     const scoreEmoji = score >= 8 ? "🌟" : score >= 6 ? "🔥" : score >= 4 ? "👍" : score >= 2 ? "💪" : "📝";
     const scorePct = Math.round((score / maxScore) * 100);

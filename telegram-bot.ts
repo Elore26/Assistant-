@@ -4875,7 +4875,15 @@ RÈGLES:
 - IMPORTANT: Quand l'utilisateur partage une information (sur une personne, un meeting, un projet) sans demander d'action → utilise "add_note" pour sauvegarder cette info
 - NE JAMAIS répondre "je ne comprends pas" — si tu ne sais pas quoi faire, utilise "chat" et réponds intelligemment ou "add_note" si c'est une info à retenir`;
 
+// Cache AI context to avoid 5+ DB queries per natural language message
+let _aiContextCache: { text: string; ts: number } | null = null;
+const AI_CONTEXT_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
 async function getAIContext(): Promise<string> {
+  const now = Date.now();
+  if (_aiContextCache && (now - _aiContextCache.ts) < AI_CONTEXT_TTL_MS) {
+    return _aiContextCache.text;
+  }
   const supabase = getSupabaseClient();
   const now = getIsraelNow();
   const today = todayStr();
@@ -4944,6 +4952,7 @@ async function getAIContext(): Promise<string> {
     });
   }
 
+  _aiContextCache = { text: ctx, ts: Date.now() };
   return ctx;
 }
 
