@@ -18,6 +18,8 @@ export interface ToolParameter {
   description: string;
   required: boolean;
   enum?: string[];
+  /** Items schema for array types (required by OpenAI function calling) */
+  items?: { type: string; properties?: Record<string, any> };
 }
 
 export interface ToolDefinition {
@@ -93,6 +95,7 @@ class ToolRegistry {
               type: p.type,
               description: p.description,
               ...(p.enum ? { enum: p.enum } : {}),
+              ...(p.type === "array" ? { items: p.items || { type: "string" } } : {}),
             }])
           ),
           required: tool.parameters.filter(p => p.required).map(p => p.name),
@@ -419,7 +422,7 @@ registry.register(
     tier: "gated",
     parameters: [
       { name: "text", type: "string", description: "Message text (HTML supported)", required: true },
-      { name: "buttons", type: "array", description: "Optional inline keyboard buttons", required: false },
+      { name: "buttons", type: "array", description: "Optional inline keyboard buttons — array of rows, each row is an array of {text, callback_data}", required: false, items: { type: "array", properties: { text: { type: "string" }, callback_data: { type: "string" } } } },
     ],
   },
   async (args, _ctx) => {
@@ -614,7 +617,7 @@ registry.register(
       { name: "memory_type", type: "string", description: "Type of memory", required: true, enum: ["decision", "pattern", "insight", "preference", "lesson"] },
       { name: "domain", type: "string", description: "Related domain", required: false },
       { name: "importance", type: "number", description: "Importance 1-5 (5=critical)", required: false },
-      { name: "tags", type: "array", description: "Tags for retrieval", required: false },
+      { name: "tags", type: "array", description: "Tags for retrieval", required: false, items: { type: "string" } },
     ],
   },
   async (args, ctx) => {
