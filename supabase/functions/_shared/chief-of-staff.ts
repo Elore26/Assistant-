@@ -22,7 +22,7 @@ import { getSignalBus, type AgentName, type Signal } from "./agent-signals.ts";
 import { sendTG, escHTML } from "./telegram.ts";
 import { callOpenAI } from "./openai.ts";
 import { getIsraelNow, todayStr } from "./timezone.ts";
-import { WORK_SCHEDULE, WORKOUT_SCHEDULE } from "./config.ts";
+import { WORK_SCHEDULE, WORKOUT_SCHEDULE, USER_PROFILE } from "./config.ts";
 
 // ─── Chief-Specific Tools ─────────────────────────────────────────────
 
@@ -236,8 +236,8 @@ registry.register(
     };
 
     const scorecard = [
-      { metric: "Candidatures", value: apps.data?.length || 0, goal: 5, status: status(apps.data?.length || 0, 5) },
-      { metric: "Entretiens", value: interviews.data?.length || 0, goal: 1, status: status(interviews.data?.length || 0, 1) },
+      { metric: "Candidatures envoyées", value: apps.data?.length || 0, goal: 5, status: status(apps.data?.length || 0, 5) },
+      { metric: "Entretiens obtenus", value: interviews.data?.length || 0, goal: 1, status: status(interviews.data?.length || 0, 1) },
       { metric: "Task completion", value: completionRate, goal: 80, unit: "%", status: status(completionRate, 80) },
       { metric: "Workouts", value: workouts.data?.length || 0, goal: 5, status: status(workouts.data?.length || 0, 5) },
       { metric: "Study hours", value: studyHours, goal: 5, unit: "h", status: status(studyHours, 5) },
@@ -353,11 +353,15 @@ export async function runMorningBriefing(): Promise<AgentResult> {
     name: "morning-briefing",
     role: `Tu es le Chief of Staff d'Oren — son directeur de journée intelligent. Tu orchestres tous les agents domaine et décides des priorités.
 
+CONTEXTE PERSONNEL (CRITIQUE — ne confonds JAMAIS) :
+${USER_PROFILE.context}
+
 Tu ne suis PAS un script fixe. Tu RAISONNES :
 - Quels signaux sont critiques ? Que s'est-il passé depuis hier ?
 - Quel domaine est en retard ? Où faut-il concentrer l'énergie ?
 - Quels risques se profilent ? (deadline proche, streak à risquer, budget dépassé)
 - Comment optimiser la journée en fonction du schedule de travail ?
+- Combien de messages LinkedIn Oren a envoyé ? Combien de réponses ? Des meetings à venir ?
 
 Tu es CONCIS et ACTIONNABLE. Pas de bavardage. Des décisions.
 
@@ -365,7 +369,7 @@ Format de ton rapport final (en français) :
 1. MODE DU JOUR : urgence/focus/normal/recovery + pourquoi
 2. SIGNAUX CRITIQUES (s'il y en a)
 3. TOP 3 ACTIONS du jour (les plus impactantes)
-4. MÉTRIQUES CLÉS (scorecard express)
+4. MÉTRIQUES CLÉS (scorecard express — candidatures envoyées, entretiens obtenus, prospection LinkedIn)
 5. RISQUES & ALERTES`,
 
     goal: `Exécuter le briefing matinal intelligent :
@@ -427,6 +431,9 @@ export async function runEveningReview(): Promise<AgentResult> {
     name: "evening-review",
     role: `Tu es l'évaluateur quotidien d'Oren — tu analyses la journée, identifies ce qui a marché et ce qui n'a pas marché, et prépares le terrain pour demain.
 
+CONTEXTE PERSONNEL (CRITIQUE — ne confonds JAMAIS) :
+${USER_PROFILE.context}
+
 Tu es HONNÊTE mais CONSTRUCTIF :
 - Tu célèbres les victoires (même petites)
 - Tu identifies les échecs sans juger
@@ -435,7 +442,7 @@ Tu es HONNÊTE mais CONSTRUCTIF :
 
 Format de ton rapport final (en français) :
 1. SCORE DU JOUR : X/12 avec breakdown
-2. VICTOIRES (ce qui a bien marché)
+2. VICTOIRES (ce qui a bien marché — y compris prospection LinkedIn)
 3. MANQUES (ce qui n'a pas été fait)
 4. PATTERNS DÉTECTÉS (tendances sur 7 jours)
 5. DEMAIN : 3 priorités recommandées`,

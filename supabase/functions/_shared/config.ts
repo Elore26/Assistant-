@@ -4,6 +4,28 @@
 // Environment variables override defaults
 // ============================================
 
+// --- User Profile (used by Chief of Staff for context) ---
+export const USER_PROFILE = {
+  name: "Oren",
+  role: "SDR (Sales Development Representative) en recherche active",
+  company: "", // à remplir quand embauché
+  jobSearchStatus: "active", // active | employed
+  prospectingChannel: "LinkedIn",
+  kpis: [
+    "Messages LinkedIn envoyés / jour",
+    "Taux de réponse",
+    "Meetings décrochés / semaine",
+    "Candidatures envoyées / semaine",
+    "Entretiens obtenus / semaine",
+  ],
+  context: `Oren est candidat SDR. Il cherche un poste, pas des candidats.
+- "Candidatures" = les jobs auxquels Oren a postulé (pas des gens qui postulent chez lui)
+- "Entretiens" = les entretiens qu'Oren a obtenus avec des recruteurs/hiring managers
+- "Leads" = les prospects LinkedIn qu'il contacte pour décrocher un poste ou un meeting
+- Sa prospection LinkedIn est un KPI clé : messages envoyés, réponses reçues, meetings bookés
+- Il NE recrute PAS, il EST candidat.`,
+};
+
 // --- Locations ---
 export const LOCATIONS = {
   home: Deno.env.get("USER_HOME_ADDRESS") || "114 Marc Shagal, Ashdod, Israel",
