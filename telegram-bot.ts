@@ -6,8 +6,13 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { getGoogleCalendar, GCAL_COLORS } from "../_shared/google-calendar.ts";
-import { getSignalBus } from "../_shared/agent-signals.ts";
+import { getSignalBus, type AgentName } from "../_shared/agent-signals.ts";
 import { rankGoals, formatGoalIntelligence } from "../_shared/goal-engine.ts";
+import { runReActAgent, quickAgent, type AgentResult } from "../_shared/react-agent.ts";
+import { runMorningBriefing, runEveningReview } from "../_shared/chief-of-staff.ts";
+import { getGuardrails } from "../_shared/agent-guardrails.ts";
+import { getMemoryStore } from "../_shared/agent-memory.ts";
+import { sendTG, escHTML } from "../_shared/telegram.ts";
 
 // --- Types Telegram ---
 interface TelegramUpdate {
@@ -152,10 +157,10 @@ async function answerCallbackQuery(callbackId: string, text?: string): Promise<v
 // --- Inline Keyboard Helpers ---
 const MAIN_MENU: InlineKeyboardMarkup = {
   inline_keyboard: [
-    [{ text: "☀️ Briefing", callback_data: "morning_briefing" }, { text: "📋 Tasks", callback_data: "menu_tasks" }, { text: "💰 Budget", callback_data: "menu_budget" }],
+    [{ text: "☀️ Briefing", callback_data: "morning_agentic" }, { text: "📋 Tasks", callback_data: "menu_tasks" }, { text: "💰 Budget", callback_data: "menu_budget" }],
     [{ text: "💼 Carrière", callback_data: "menu_jobs" }, { text: "🚀 HiGrow", callback_data: "menu_leads" }, { text: "🏋️ Santé", callback_data: "menu_health" }],
     [{ text: "📈 Trading", callback_data: "menu_signals" }, { text: "📊 Dashboard", callback_data: "menu_dashboard" }, { text: "🎯 EOS", callback_data: "menu_eos" }],
-    [{ text: "❓ Tuto", callback_data: "tuto_main" }],
+    [{ text: "🤖 Agents", callback_data: "agent_status" }, { text: "❓ Tuto", callback_data: "tuto_main" }],
   ],
 };
 
@@ -344,52 +349,38 @@ async function handleToday(chatId: number): Promise<void> {
 async function handleHelp(chatId: number): Promise<void> {
   const text =
     `*COMMANDES*\n\n` +
-    `MISSIONS\n` +
-    `/brief agent mission\n` +
-    `/report agent\n` +
-    `/status\n\n` +
-    `TACHES\n` +
-    `/task add titre\n` +
-    `/task list\n` +
-    `/task done num\n\n` +
-    `FINANCES\n` +
-    `/expense mont cat\n` +
-    `/cash mont cat (especes)\n` +
-    `/income mont cat\n` +
-    `/budget\n\n` +
-    `SANTE\n` +
-    `/health weight kg\n` +
-    `/health workout type\n` +
-    `/health status\n\n` +
-    `APPRENTISSAGE\n` +
-    `/study topic min\n\n` +
-    `LEADS & JOBS\n` +
-    `/lead add name spec\n` +
-    `/lead list\n` +
-    `/job url [titre]\n` +
-    `/jobs\n\n` +
-    `MISSION\n` +
-    `/mission titre heure [duree]\n\n` +
-    `FOCUS\n` +
-    `/focus [min] — mode silencieux\n` +
-    `/focus off — reprendre notifs\n\n` +
-    `PLANNING V2\n` +
+    `🤖 AGENTIC\n` +
+    `/ask question — demander au Chief of Staff\n` +
+    `/agents — dashboard santé des agents\n` +
+    `/memory recherche — chercher les mémoires\n` +
+    `/morning — briefing intelligent (Chief of Staff)\n` +
+    `/review — revue de soirée (Chief of Staff)\n\n` +
+    `📋 TACHES\n` +
+    `/task add|list|done\n` +
     `/inbox — voir/trier l'inbox\n` +
     `/pomodoro — session focus 25min\n` +
     `/velocity — stats productivité\n` +
-    `/repeat titre règle — tâche récurrente\n` +
+    `/repeat titre règle — récurrente\n` +
     `/sprint domaine "obj" cible\n` +
     `/timeblock — planifier la journée\n` +
     `/tomorrow — plan de demain\n` +
-    `/subtask id titre — sous-tâche\n` +
-    `/ctx work|home|errands — filtre\n\n` +
-    `AUTRES\n` +
-    `/morning — briefing du jour + coach santé\n` +
-    `/today\n` +
-    `/review\n` +
-    `/signals\n` +
-    `/goals\n` +
-    `/tuto — guide complet interactif`;
+    `/subtask id titre\n` +
+    `/ctx work|home|errands — filtre\n` +
+    `/focus [min] — mode silencieux\n\n` +
+    `💰 FINANCES\n` +
+    `/expense mont cat · /cash mont cat\n` +
+    `/income mont cat · /budget\n\n` +
+    `🏋️ SANTE\n` +
+    `/health weight|workout|status\n` +
+    `/study topic min\n\n` +
+    `💼 CARRIERE\n` +
+    `/job url [titre] · /jobs\n` +
+    `/lead add|list · /mission titre heure\n\n` +
+    `📊 INTELLIGENCE\n` +
+    `/dashboard · /insights · /goals\n` +
+    `/scorecard · /rock · /cir\n` +
+    `/signals · /brief · /report\n\n` +
+    `_Ou écris en langage naturel !_`;
 
   await sendTelegramMessage(chatId, text);
 }
@@ -2907,8 +2898,23 @@ async function handleHigrowFollowup(chatId: number): Promise<void> {
 async function handleCallbackQuery(callbackId: string, chatId: number, data: string): Promise<void> {
   const supabase = getSupabaseClient();
 
+  // === AGENTIC BUTTONS ===
+  if (data === "morning_agentic") {
+    await answerCallbackQuery(callbackId, "☀️ Briefing en cours...");
+    await handleMorningAgentic(chatId);
+    return;
+  } else if (data === "agent_status") {
+    await answerCallbackQuery(callbackId);
+    await handleAgentStatus(chatId);
+    return;
+  } else if (data === "review_agentic") {
+    await answerCallbackQuery(callbackId, "🌙 Review en cours...");
+    await handleReviewAgentic(chatId);
+    return;
+  }
+
   // === MAIN MENU BUTTONS ===
-  if (data === "menu_main") {
+  else if (data === "menu_main") {
     await sendTelegramMessage(chatId, "📌 *OREN*", "Markdown", MAIN_MENU);
   } else if (data === "dashboard") {
     await handleDashboard(chatId);
@@ -4700,56 +4706,72 @@ async function handleReview(chatId: number): Promise<void> {
   const supabase = getSupabaseClient();
 
   try {
-    const now = new Date();
-    const dayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
+    const today = todayStr();
 
-    const { data: tasks } = await supabase
-      .from("tasks")
-      .select("*")
-      .eq("status", "completed")
-      .gte("updated_at", dayStart);
+    // Parallel data fetch (was sequential)
+    const [tasksRes, expensesRes, workoutsRes, studyRes, allTasksRes] = await Promise.all([
+      supabase.from("tasks").select("title, domain, priority")
+        .eq("status", "completed").gte("completed_at", today),
+      supabase.from("finance_logs").select("amount, category")
+        .eq("transaction_type", "expense").gte("transaction_date", today),
+      supabase.from("health_logs").select("workout_type, duration_minutes")
+        .eq("log_type", "workout").gte("log_date", today),
+      supabase.from("study_sessions").select("topic, duration_minutes")
+        .gte("session_date", today).neq("topic", "agent_analysis"),
+      supabase.from("tasks").select("status")
+        .eq("due_date", today),
+    ]);
 
-    const { data: expenses } = await supabase
-      .from("finance_logs")
-      .select("*")
-      .eq("transaction_type", "expense")
-      .gte("transaction_date", dayStart.split('T')[0]);
+    const tasks = tasksRes.data || [];
+    const expenses = expensesRes.data || [];
+    const workouts = workoutsRes.data || [];
+    const study = studyRes.data || [];
+    const allTasks = allTasksRes.data || [];
 
-    const { data: workouts } = await supabase
-      .from("health_logs")
-      .select("*")
-      .eq("log_type", "workout")
-      .gte("log_date", dayStart.split('T')[0]);
+    const totalTasks = allTasks.length;
+    const doneTasks = allTasks.filter((t: any) => t.status === "done" || t.status === "completed").length;
+    const completionRate = totalTasks > 0 ? Math.round((doneTasks / totalTasks) * 100) : 0;
 
-    let text = `*EVENING REVIEW*\n\n`;
+    let text = `🌙 *EVENING REVIEW*\n━━━━━━━━━━━━━━━━━━━━\n\n`;
 
-    if (tasks && tasks.length > 0) {
-      text += `Completes (${tasks.length}):\n`;
-      tasks.slice(0, 5).forEach(t => {
-        text += `✓ ${escapeMarkdown(t.title)}\n`;
+    // Score rapide
+    const score = Math.min(12, tasks.length + workouts.length * 2 + Math.min(2, Math.floor((study.reduce((s: number, ss: any) => s + (ss.duration_minutes || 0), 0)) / 30)));
+    text += `📊 Score: *${score}/12* · Complétion: ${completionRate}%\n\n`;
+
+    if (tasks.length > 0) {
+      text += `✅ *Complétées (${tasks.length}):*\n`;
+      tasks.slice(0, 8).forEach((t: any) => {
+        const p = (t.priority || 3) <= 2 ? "●" : "○";
+        text += `  ${p} ${escapeMarkdown(t.title)}\n`;
       });
       text += `\n`;
     } else {
-      text += `-- aucune tache completee\n\n`;
+      text += `⚠️ Aucune tâche complétée\n\n`;
     }
 
-    if (expenses && expenses.length > 0) {
-      const total = expenses.reduce((sum, e) => sum + e.amount, 0);
-      text += `Depenses (${expenses.length}): *${total.toFixed(0)}₪*\n`;
-      text += `\n`;
+    if (expenses.length > 0) {
+      const total = expenses.reduce((sum: number, e: any) => sum + e.amount, 0);
+      text += `💰 Dépenses: *${total.toFixed(0)}₪* (${expenses.length} transactions)\n`;
     }
 
-    if (workouts && workouts.length > 0) {
-      text += `Workouts (${workouts.length}):\n`;
-      workouts.forEach(w => {
-        text += `${w.workout_type}  ${w.duration_minutes}min\n`;
-      });
+    if (workouts.length > 0) {
+      text += `🏋️ Workouts: ${workouts.map((w: any) => `${w.workout_type} ${w.duration_minutes}min`).join(" · ")}\n`;
     }
 
-    await sendTelegramMessage(chatId, text);
+    if (study.length > 0) {
+      const studyMin = study.reduce((s: number, ss: any) => s + (ss.duration_minutes || 0), 0);
+      text += `📚 Étude: ${studyMin}min\n`;
+    }
+
+    await sendTelegramMessage(chatId, text, "Markdown", {
+      inline_keyboard: [
+        [{ text: "🌙 Review IA", callback_data: "review_agentic" }, { text: "📊 Dashboard", callback_data: "menu_dashboard" }],
+        [{ text: "🔙 Menu", callback_data: "menu_main" }],
+      ],
+    });
   } catch (e) {
     console.error("Review error:", e);
-    await sendTelegramMessage(chatId, `error: ${String(e).substring(0, 50)}`);
+    await sendTelegramMessage(chatId, `Erreur review: ${String(e).substring(0, 50)}`);
   }
 }
 
@@ -6656,6 +6678,262 @@ Réponds UNIQUEMENT en JSON valide. Sois PRÉCIS sur les montants.`;
   }
 }
 
+// ============================================
+// AGENTIC HANDLERS — Chief of Staff Integration
+// ============================================
+
+/** /ask <question> — Free-form question to the Chief of Staff */
+async function handleAsk(chatId: number, args: string[]): Promise<void> {
+  const question = args.join(" ").trim();
+  if (!question) {
+    await sendTelegramMessage(chatId, "Usage: /ask <question>\nEx: _/ask quel domaine est en retard ?_", "Markdown");
+    return;
+  }
+
+  await sendTelegramMessage(chatId, "🤖 Le Chief of Staff réfléchit...");
+
+  try {
+    const answer = await quickAgent(
+      "morning-briefing",
+      `Tu es le Chief of Staff d'Oren — un assistant exécutif ultra-concis. Réponds en français, de manière factuelle et actionnable. Ne dépasse pas 300 mots.`,
+      question,
+      `Date: ${todayStr()}, Heure: ${getIsraelNow().toTimeString().slice(0, 5)} IST`
+    );
+    await sendTelegramMessage(chatId, `🤖 *Chief of Staff*\n\n${answer}`, "Markdown", {
+      inline_keyboard: [[{ text: "🔙 Menu", callback_data: "menu_main" }]],
+    });
+  } catch (e) {
+    console.error("Ask error:", e);
+    await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 100)}`);
+  }
+}
+
+/** /agent_status — Dashboard santé des agents */
+async function handleAgentStatus(chatId: number): Promise<void> {
+  const supabase = getSupabaseClient();
+  try {
+    const today = todayStr();
+
+    // Fetch budgets + recent executions in parallel
+    const [budgetRes, execRes] = await Promise.all([
+      supabase.from("agent_budgets")
+        .select("agent_name, tokens_used, tool_calls, estimated_cost, consecutive_failures, is_circuit_broken")
+        .eq("date", today),
+      supabase.from("agent_executions")
+        .select("agent_name, success, duration_ms, loops_count, tool_calls_count, created_at")
+        .gte("created_at", today)
+        .order("created_at", { ascending: false })
+        .limit(30),
+    ]);
+
+    const budgets = budgetRes.data || [];
+    const execs = execRes.data || [];
+
+    // Aggregate executions by agent
+    const execsByAgent: Record<string, { runs: number; success: number; avgDuration: number; lastRun: string }> = {};
+    for (const e of execs) {
+      if (!execsByAgent[e.agent_name]) {
+        execsByAgent[e.agent_name] = { runs: 0, success: 0, avgDuration: 0, lastRun: e.created_at };
+      }
+      execsByAgent[e.agent_name].runs++;
+      if (e.success) execsByAgent[e.agent_name].success++;
+      execsByAgent[e.agent_name].avgDuration += e.duration_ms || 0;
+    }
+    for (const k of Object.keys(execsByAgent)) {
+      if (execsByAgent[k].runs > 0) execsByAgent[k].avgDuration = Math.round(execsByAgent[k].avgDuration / execsByAgent[k].runs);
+    }
+
+    let msg = `🤖 *AGENT STATUS* — ${today}\n━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+    const agentNames = ["morning-briefing", "evening-review", "career", "health", "finance", "learning", "trading"];
+    for (const name of agentNames) {
+      const budget = budgets.find((b: any) => b.agent_name === name);
+      const exec = execsByAgent[name];
+      const emoji = budget?.is_circuit_broken ? "🔴" : (budget?.consecutive_failures || 0) > 0 ? "🟡" : exec ? "🟢" : "⚪";
+
+      msg += `${emoji} *${name}*`;
+      if (exec) {
+        msg += ` — ${exec.runs} runs (${exec.success}✓) · avg ${Math.round(exec.avgDuration / 1000)}s`;
+      } else {
+        msg += ` — pas encore exécuté`;
+      }
+      if (budget) {
+        msg += `\n   💰 $${budget.estimated_cost?.toFixed(3) || "0"} · ${budget.tokens_used || 0} tokens · ${budget.tool_calls || 0} tools`;
+        if (budget.is_circuit_broken) msg += ` · ⚡ CIRCUIT BROKEN`;
+      }
+      msg += `\n`;
+    }
+
+    // Total cost
+    const totalCost = budgets.reduce((s: number, b: any) => s + (b.estimated_cost || 0), 0);
+    const totalTokens = budgets.reduce((s: number, b: any) => s + (b.tokens_used || 0), 0);
+    msg += `\n📊 *Total:* $${totalCost.toFixed(3)} · ${totalTokens} tokens · ${execs.length} runs`;
+
+    await sendTelegramMessage(chatId, msg, "Markdown", {
+      inline_keyboard: [[{ text: "🔄 Refresh", callback_data: "agent_status" }, { text: "🔙 Menu", callback_data: "menu_main" }]],
+    });
+  } catch (e) {
+    console.error("AgentStatus error:", e);
+    await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 100)}`);
+  }
+}
+
+/** /memory <search> — Search agent memories */
+async function handleMemory(chatId: number, args: string[]): Promise<void> {
+  const query = args.join(" ").trim();
+  if (!query) {
+    await sendTelegramMessage(chatId, "Usage: /memory <recherche>\nEx: _/memory pattern sommeil_", "Markdown");
+    return;
+  }
+
+  try {
+    const memory = getMemoryStore("morning-briefing");
+    const results = await memory.search(query, { limit: 5 });
+
+    if (!results || results.length === 0) {
+      await sendTelegramMessage(chatId, `🧠 Aucune mémoire trouvée pour "${query}"`);
+      return;
+    }
+
+    let msg = `🧠 *MÉMOIRES* — "${query}"\n━━━━━━━━━━━━━━━━━━━━\n\n`;
+    for (const r of results) {
+      const m = r.memory;
+      const icon = m.memory_type === "episodic" ? "📅" : m.memory_type === "semantic" ? "📖" : m.memory_type === "procedural" ? "⚙️" : m.memory_type === "decision" ? "🎯" : "💡";
+      msg += `${icon} *${m.memory_type}* (importance: ${m.importance}/5)\n`;
+      msg += `${m.content.substring(0, 150)}\n`;
+      msg += `_${m.created_at?.split("T")[0] || "?"} · ${m.agent_name}_\n\n`;
+    }
+
+    await sendTelegramMessage(chatId, msg, "Markdown");
+  } catch (e) {
+    console.error("Memory search error:", e);
+    await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 100)}`);
+  }
+}
+
+/** Upgraded /morning — Uses Chief of Staff ReAct agent */
+async function handleMorningAgentic(chatId: number): Promise<void> {
+  await sendTelegramMessage(chatId, "☀️ Chief of Staff prépare ton briefing...");
+
+  try {
+    const result = await runMorningBriefing();
+
+    if (result.success && result.output) {
+      const report = `☀️ *MORNING BRIEFING — Chief of Staff*\n━━━━━━━━━━━━━━━━━━━━\n\n${result.output.substring(0, 3500)}\n\n_⚡ ${result.totalLoops} loops · ${result.totalToolCalls} tools · ${Math.round(result.durationMs / 1000)}s_`;
+      await sendTelegramMessage(chatId, report, "Markdown", {
+        inline_keyboard: [
+          [{ text: "💪 Workout", callback_data: "health_workout" }, { text: "📋 Tasks", callback_data: "menu_tasks" }],
+          [{ text: "🤖 Agent Status", callback_data: "agent_status" }, { text: "🔙 Menu", callback_data: "menu_main" }],
+        ],
+      });
+    } else {
+      // Fallback to hardcoded briefing if agent fails
+      console.error("[Morning] Agent failed, falling back to hardcoded:", result.guardrailReason || result.output);
+      await handleMorningBriefing(chatId);
+    }
+  } catch (e) {
+    console.error("[Morning] Agent error, falling back:", e);
+    await handleMorningBriefing(chatId);
+  }
+}
+
+/** Upgraded /review — Uses Chief of Staff ReAct agent */
+async function handleReviewAgentic(chatId: number): Promise<void> {
+  await sendTelegramMessage(chatId, "🌙 Chief of Staff prépare ta review...");
+
+  try {
+    const result = await runEveningReview();
+
+    if (result.success && result.output) {
+      const report = `🌙 *EVENING REVIEW — Chief of Staff*\n━━━━━━━━━━━━━━━━━━━━\n\n${result.output.substring(0, 3500)}\n\n_⚡ ${result.totalLoops} loops · ${result.totalToolCalls} tools · ${Math.round(result.durationMs / 1000)}s_`;
+      await sendTelegramMessage(chatId, report, "Markdown", {
+        inline_keyboard: [
+          [{ text: "📊 Dashboard", callback_data: "menu_dashboard" }, { text: "🤖 Agents", callback_data: "agent_status" }],
+          [{ text: "🔙 Menu", callback_data: "menu_main" }],
+        ],
+      });
+    } else {
+      console.error("[Review] Agent failed, falling back:", result.guardrailReason || result.output);
+      await handleReview(chatId);
+    }
+  } catch (e) {
+    console.error("[Review] Agent error, falling back:", e);
+    await handleReview(chatId);
+  }
+}
+
+// ============================================
+// COMMAND DISPATCH MAP — Clean routing
+// ============================================
+
+type CommandHandler = (chatId: number, args: string[]) => Promise<void>;
+
+const COMMAND_MAP: Record<string, CommandHandler> = {
+  // --- Core ---
+  "/start": (chatId) => handleStart(chatId),
+  "/help": (chatId) => handleHelp(chatId),
+  "/status": (chatId) => handleStatus(chatId),
+  "/today": (chatId) => handleToday(chatId),
+  "/brief": (chatId, args) => handleBrief(chatId, args),
+  "/report": (chatId, args) => handleReport(chatId, args),
+
+  // --- Agentic (NEW) ---
+  "/ask": (chatId, args) => handleAsk(chatId, args),
+  "/agent": (chatId) => handleAgentStatus(chatId),
+  "/agents": (chatId) => handleAgentStatus(chatId),
+  "/memory": (chatId, args) => handleMemory(chatId, args),
+
+  // --- Tasks ---
+  "/inbox": (chatId) => handleInbox(chatId),
+  "/pomodoro": (chatId, args) => handlePomodoro(chatId, args),
+  "/pomo": (chatId, args) => handlePomodoro(chatId, args),
+  "/velocity": (chatId) => handleVelocity(chatId),
+  "/vel": (chatId) => handleVelocity(chatId),
+  "/timeblock": (chatId) => handleTimeBlock(chatId),
+  "/tb": (chatId) => handleTimeBlock(chatId),
+  "/cleanup": (chatId) => handleCleanup(chatId),
+  "/tri": (chatId) => handleCleanup(chatId),
+  "/focus": (chatId, args) => handleFocus(chatId, args),
+
+  // --- Finance ---
+  "/expense": (chatId, args) => handleExpense(chatId, args, "card"),
+  "/cash": (chatId, args) => handleExpense(chatId, args, "cash"),
+  "/income": (chatId, args) => handleIncome(chatId, args),
+  "/budget": (chatId) => handleBudget(chatId),
+
+  // --- Health ---
+  "/health": (chatId, args) => handleHealth(chatId, args),
+  "/study": (chatId, args) => handleStudy(chatId, args),
+
+  // --- Career ---
+  "/lead": (chatId, args) => handleLead(chatId, args),
+  "/mission": (chatId, args) => handleMission(chatId, args),
+  "/job": (chatId, args) => handleJobAdd(chatId, args),
+  "/jobs": (chatId) => handleJobs(chatId),
+
+  // --- Trading ---
+  "/signals": (chatId) => handleTradingMain(chatId),
+
+  // --- Briefings (AGENTIC) ---
+  "/morning": (chatId) => handleMorningAgentic(chatId),
+  "/bonjour": (chatId) => handleMorningAgentic(chatId),
+  "/review": (chatId) => handleReviewAgentic(chatId),
+
+  // --- Intelligence ---
+  "/dashboard": (chatId) => handleDashboard(chatId),
+  "/d": (chatId) => handleDashboard(chatId),
+  "/insights": (chatId) => handleInsights(chatId),
+  "/goals": (chatId) => handleGoals(chatId),
+
+  // --- EOS ---
+  "/rock": (chatId, args) => handleRock(chatId, args),
+  "/rocks": (chatId, args) => handleRock(chatId, args),
+  "/scorecard": (chatId) => handleScorecard(chatId),
+  "/sc": (chatId) => handleScorecard(chatId),
+  "/cir": (chatId, args) => handleCIR(chatId, args),
+  "/cirs": (chatId, args) => handleCIR(chatId, args),
+};
+
 // --- Main Router ---
 
 serve(async (req: Request) => {
@@ -6734,63 +7012,20 @@ serve(async (req: Request) => {
 
     console.log(`[${new Date().toISOString()}] ${chatId}: ${text}`);
 
-    // Command Router
-    if (command === "/start") {
-      await handleStart(chatId);
-    } else if (command === "/help") {
-      await handleHelp(chatId);
-    } else if (command === "/status") {
-      await handleStatus(chatId);
-    } else if (command === "/today") {
-      await handleToday(chatId);
-    } else if (command === "/brief") {
-      await handleBrief(chatId, args);
-    } else if (command === "/report") {
-      await handleReport(chatId, args);
-    } else if (command === "/task") {
-      if (args[0] === "add") {
-        await handleTaskAdd(chatId, args.slice(1));
-      } else if (args[0] === "list") {
-        await handleTaskList(chatId);
-      } else if (args[0] === "done") {
-        await handleTaskDone(chatId, args.slice(1));
-      } else {
-        await sendTelegramMessage(chatId, `Format: /task add|list|done`);
-      }
-    } else if (command === "/expense") {
-      await handleExpense(chatId, args, "card");
-    } else if (command === "/cash") {
-      await handleExpense(chatId, args, "cash");
-    } else if (command === "/income") {
-      await handleIncome(chatId, args);
-    } else if (command === "/budget") {
-      await handleBudget(chatId);
-    } else if (command === "/health") {
-      await handleHealth(chatId, args);
-    } else if (command === "/study") {
-      await handleStudy(chatId, args);
-    } else if (command === "/lead") {
-      await handleLead(chatId, args);
-    } else if (command === "/mission") {
-      await handleMission(chatId, args);
-    } else if (command === "/job") {
-      await handleJobAdd(chatId, args);
-    } else if (command === "/jobs") {
-      await handleJobs(chatId);
-    } else if (command === "/signals") {
-      await handleTradingMain(chatId);
-    } else if (command === "/morning" || command === "/bonjour") {
-      await handleMorningBriefing(chatId);
-    } else if (command === "/dashboard" || command === "/d") {
-      await handleDashboard(chatId);
-    } else if (command === "/review") {
-      await handleReview(chatId);
-    } else if (command === "/insights") {
-      await handleInsights(chatId);
-    } else if (command === "/goals") {
-      await handleGoals(chatId);
-    } else if (command === "/goal") {
-      // /goal update <domain> <value> — Quick metric update
+    // Command Router — Dispatch Map (O(1) lookup)
+    const handler = COMMAND_MAP[command];
+
+    if (handler) {
+      await handler(chatId, args);
+    }
+    // Commands with sub-routing (not in dispatch map)
+    else if (command === "/task") {
+      if (args[0] === "add") await handleTaskAdd(chatId, args.slice(1));
+      else if (args[0] === "list") await handleTaskList(chatId);
+      else if (args[0] === "done") await handleTaskDone(chatId, args.slice(1));
+      else await sendTelegramMessage(chatId, `Format: /task add|list|done`);
+    }
+    else if (command === "/goal") {
       if (args[0] === "update" && args[1] && args[2]) {
         const domain = args[1].toLowerCase();
         const newValue = parseFloat(args[2]);
@@ -6814,34 +7049,22 @@ serve(async (req: Request) => {
       } else {
         await sendTelegramMessage(chatId, "Usage:\n/goals — Voir les objectifs\n/goal update <domaine> <valeur>\nEx: /goal update career 45\nEx: /goal update health 72.5");
       }
-    } else if (command === "/focus") {
-      await handleFocus(chatId, args);
-    } else if (command === "/cleanup" || command === "/tri") {
-      await handleCleanup(chatId);
     }
-    // === TASK MANAGEMENT V2 COMMANDS ===
-    else if (command === "/inbox") {
-      await handleInbox(chatId);
-    } else if (command === "/pomodoro" || command === "/pomo") {
-      await handlePomodoro(chatId, args);
-    } else if (command === "/velocity" || command === "/vel") {
-      await handleVelocity(chatId);
-    } else if (command === "/repeat" || command === "/recurring") {
+    else if (command === "/repeat" || command === "/recurring") {
       if (args.length === 0) await handleRecurringList(chatId);
       else await handleRecurringAdd(chatId, args);
-    } else if (command === "/sprint") {
+    }
+    else if (command === "/sprint") {
       if (args.length === 0) await handleSprintGoals(chatId);
       else await handleSprintCreate(chatId, args);
-    } else if (command === "/timeblock" || command === "/tb") {
-      await handleTimeBlock(chatId);
-    } else if (command === "/tomorrow" || command === "/demain") {
+    }
+    else if (command === "/tomorrow" || command === "/demain") {
       await handleTomorrowPlan(chatId);
-    } else if (command === "/subtask" || command === "/sub") {
-      // /subtask parentId titre
+    }
+    else if (command === "/subtask" || command === "/sub") {
       if (args.length >= 2) {
         const parentRef = args[0];
         const subTitle = args.slice(1).join(" ");
-        // Find parent by short ID prefix
         const supabase = getSupabaseClient();
         const { data: parents } = await supabase.from("tasks")
           .select("id").in("status", ["pending", "in_progress"])
@@ -6852,24 +7075,22 @@ serve(async (req: Request) => {
       } else {
         await sendTelegramMessage(chatId, "Format: /subtask id_parent titre\nEx: /subtask abc123 Préparer le CV");
       }
-    } else if (command === "/context" || command === "/ctx") {
+    }
+    else if (command === "/context" || command === "/ctx") {
       if (args.length > 0 && TASK_CONTEXTS.includes(args[0] as any)) {
         await handleTasksByContext(chatId, args[0]);
       } else {
         await sendTelegramMessage(chatId, `Contextes: ${TASK_CONTEXTS.map(c => `${CONTEXT_EMOJI[c]} ${c}`).join(', ')}\nEx: /ctx work`);
       }
-    } else if (command === "/rock" || command === "/rocks") {
-      await handleRock(chatId, args);
-    } else if (command === "/scorecard" || command === "/sc") {
-      await handleScorecard(chatId);
-    } else if (command === "/cir" || command === "/cirs") {
-      await handleCIR(chatId, args);
-    } else if (command === "/tuto" || command === "/tutorial" || command === "/guide") {
+    }
+    else if (command === "/tuto" || command === "/tutorial" || command === "/guide") {
       const page = TUTO_PAGES["tuto_main"];
       await sendTelegramMessage(chatId, page.text, "HTML", page.buttons);
-    } else if (command.startsWith("/")) {
-      await sendTelegramMessage(chatId, `? commande inconnue — /help`);
-    } else {
+    }
+    else if (command.startsWith("/")) {
+      await sendTelegramMessage(chatId, `❓ commande inconnue — /help`);
+    }
+    else {
       // Natural language processing
       await handleNaturalLanguage(chatId, text);
     }
