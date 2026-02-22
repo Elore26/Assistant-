@@ -2951,53 +2951,87 @@ async function handleCallbackQuery(callbackId: string, chatId: number, data: str
     await sendTelegramMessage(chatId, "Format: /mission titre heure [durée]\nEx: _Rdv dentiste 14:00 60_", "Markdown");
   }
   // === CLEANUP CALLBACK ===
-  else if (data.startsWith("cleanup_archive_")) {
+  // === SMART TRIAGE CALLBACKS ===
+  else if (data.startsWith("tri_done_") || data.startsWith("tri_cancel_")) {
     try {
-      // Archive old tasks by setting status to 'completed' with a special note
-      const twoWeeksAgo = new Date(Date.now() - 14 * 86400000).toISOString().split("T")[0];
+      const isDone = data.startsWith("tri_done_");
+      const cat = data.replace(isDone ? "tri_done_" : "tri_cancel_", "");
+      const today = todayStr();
+      const now = new Date().toISOString();
 
-      const { data: oldTasks, error } = await supabase.from("tasks")
-        .select("id")
+      // Build category filter regex (same as handleCleanup)
+      const catFilters: Record<string, RegExp> = {
+        workout: /push|pull|legs|cardio|workout|musculation|sport/i,
+        routine: /pesée|repas|prépar|routine|jeûne|vitamines|méditation|journal/i,
+        rdv: /rendez-vous|rdv|meeting|appel|call/i,
+        career: /career|cv|offre|candidat|linkedin|entretien|interview|postuler/i,
+      };
+
+      // Fetch all overdue tasks
+      const { data: overdue } = await supabase.from("tasks")
+        .select("id, title, priority, context")
         .in("status", ["pending", "in_progress"])
-        .or(`due_date.lt.${twoWeeksAgo},due_date.is.null`)
-        .order("created_at", { ascending: true })
-        .limit(50);
+        .lt("due_date", today)
+        .limit(200);
 
-      if (error || !oldTasks || oldTasks.length === 0) {
-        await sendTelegramMessage(chatId, "✅ Aucune tâche à archiver.");
+      if (!overdue || overdue.length === 0) {
+        await sendTelegramMessage(chatId, "✅ Aucune tâche en retard.");
         return;
       }
 
-      // Filter only truly old ones
-      const reallyOld = oldTasks.filter((t: any) => {
-        if (!t.due_date) {
-          // Check created_at via separate query is complex, so trust the initial filter
-          return true;
-        }
-        return t.due_date < twoWeeksAgo;
-      });
+      let toUpdate: string[];
 
-      if (reallyOld.length === 0) {
-        await sendTelegramMessage(chatId, "✅ Aucune tâche à archiver.");
+      if (cat === "all") {
+        toUpdate = overdue.map((t: any) => t.id);
+      } else {
+        // Filter by category
+        toUpdate = overdue.filter((t: any) => {
+          const title = (t.title || "").toLowerCase();
+          if (cat === "important") return (t.priority || 3) <= 2 && !Object.values(catFilters).some(r => r.test(title));
+          if (cat === "other") {
+            return !Object.values(catFilters).some(r => r.test(title)) && (t.priority || 3) > 2;
+          }
+          return catFilters[cat]?.test(title) || (cat === "career" && t.context === "work");
+        }).map((t: any) => t.id);
+      }
+
+      if (toUpdate.length === 0) {
+        await sendTelegramMessage(chatId, "✅ Aucune tâche à traiter dans cette catégorie.");
         return;
       }
 
-      const taskIds = reallyOld.map((t: any) => t.id);
+      const newStatus = isDone ? "completed" : "cancelled";
+      const updateData: any = { status: newStatus, updated_at: now };
+      if (isDone) updateData.completed_at = now;
 
-      // Archive by setting status to 'cancelled' (not completed, to not mess with stats)
       const { error: updateError } = await supabase.from("tasks")
-        .update({ status: "cancelled", updated_at: new Date().toISOString() })
-        .in("id", taskIds);
+        .update(updateData)
+        .in("id", toUpdate);
 
       if (updateError) {
-        await sendTelegramMessage(chatId, `❌ Erreur lors de l'archivage: ${String(updateError).substring(0, 100)}`);
+        await sendTelegramMessage(chatId, `❌ Erreur: ${String(updateError).substring(0, 100)}`);
         return;
       }
 
-      await sendTelegramMessage(chatId, `✅ *${taskIds.length} tâches archivées*\n\nElles ont été marquées comme annulées et ne pollueront plus ton score quotidien.`, "Markdown");
+      const remaining = overdue.length - toUpdate.length;
+      const icon = isDone ? "✅" : "🗑";
+      const action = isDone ? "marquées faites" : "archivées";
+      let msg = `${icon} *${toUpdate.length} tâches ${action}*`;
+      if (isDone) msg += `\n+${toUpdate.length} au compteur productivité !`;
+      if (remaining > 0) msg += `\n\n${remaining} tâches restantes en retard.`;
+      else msg += `\n\n🎉 Plus aucune tâche en retard !`;
+
+      await sendTelegramMessage(chatId, msg, "Markdown", {
+        inline_keyboard: remaining > 0
+          ? [[{ text: "🧹 Continuer le tri", callback_data: "cleanup" }, { text: "🔙 Menu", callback_data: "menu_main" }]]
+          : [[{ text: "📋 Mes tâches", callback_data: "menu_tasks" }, { text: "🔙 Menu", callback_data: "menu_main" }]],
+      });
     } catch (e) {
       await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 100)}`);
     }
+  }
+  else if (data === "cleanup" || data.startsWith("cleanup_archive_")) {
+    await handleCleanup(chatId);
   }
   // === TASK MANAGEMENT V2 CALLBACKS ===
   // --- Inbox ---
@@ -4963,71 +4997,112 @@ async function handleFocus(chatId: number, args: string[]): Promise<void> {
   }
 }
 
-// ─── CLEANUP OLD TASKS ───────────────────────────────────────────────────
+// ─── SMART TASK TRIAGE (replaces old cleanup) ─────────────────────────────
 async function handleCleanup(chatId: number): Promise<void> {
   const supabase = getSupabaseClient();
 
   try {
     const today = todayStr();
-    const twoWeeksAgo = new Date(Date.now() - 14 * 86400000).toISOString().split("T")[0];
 
-    // Find old pending tasks: no due_date OR due_date < 14 days ago
-    const { data: oldTasks } = await supabase.from("tasks")
-      .select("id, title, created_at, due_date, priority")
+    // Fetch ALL overdue tasks (not just 14+ days)
+    const { data: overdue } = await supabase.from("tasks")
+      .select("id, title, due_date, priority, context, recurrence_rule, recurrence_source_id, reschedule_count, created_at")
       .in("status", ["pending", "in_progress"])
-      .or(`due_date.lt.${twoWeeksAgo},due_date.is.null`)
-      .order("created_at", { ascending: true })
-      .limit(50);
+      .lt("due_date", today)
+      .order("due_date", { ascending: true })
+      .limit(200);
 
-    if (!oldTasks || oldTasks.length === 0) {
-      await sendTelegramMessage(chatId, "✅ Aucune vieille tâche à nettoyer.\nToutes tes tâches sont récentes ou planifiées.");
+    if (!overdue || overdue.length === 0) {
+      await sendTelegramMessage(chatId, "✅ Aucune tâche en retard ! Tout est clean.");
       return;
     }
 
-    // Filter only truly old ones (created > 14 days ago if no due_date)
-    const reallyOld = oldTasks.filter((t: any) => {
-      if (t.due_date && t.due_date < twoWeeksAgo) return true;
-      if (!t.due_date && t.created_at < twoWeeksAgo + "T00:00:00") return true;
-      return false;
-    });
-
-    if (reallyOld.length === 0) {
-      await sendTelegramMessage(chatId, "✅ Aucune vieille tâche à nettoyer.");
-      return;
-    }
-
-    let text = `🧹 *NETTOYAGE — ${reallyOld.length} vieilles tâches*\n\n`;
-    text += `Ces tâches ont plus de 14 jours ou sont en retard depuis longtemps:\n\n`;
-
-    reallyOld.slice(0, 20).forEach((t: any, i: number) => {
-      const age = Math.floor((Date.now() - new Date(t.created_at).getTime()) / 86400000);
-      const p = (t.priority || 3) <= 1 ? "🔴" : (t.priority || 3) === 2 ? "🟠" : "🟡";
-      text += `${i + 1}. ${p} ${t.title.substring(0, 60)}\n`;
-      text += `   _Créée il y a ${age}j${t.due_date ? `, due: ${t.due_date}` : ""}_\n`;
-    });
-
-    if (reallyOld.length > 20) {
-      text += `\n_+ ${reallyOld.length - 20} autres tâches..._\n`;
-    }
-
-    text += `\n*Options:*\n`;
-    text += `• *Archiver tout* → elles disparaissent de ta liste\n`;
-    text += `• Annuler → garder comme elles sont`;
-
-    const taskIds = reallyOld.map((t: any) => t.id).join(",");
-    const buttons: InlineKeyboardMarkup = {
-      inline_keyboard: [
-        [
-          { text: "🗑️ Archiver tout", callback_data: `cleanup_archive_${taskIds.substring(0, 50)}` },
-          { text: "❌ Annuler", callback_data: "menu_main" },
-        ],
-      ],
+    // Categorize tasks
+    const categories: Record<string, Array<any>> = {
+      workout: [],   // PUSH/PULL/LEGS/Cardio workouts
+      routine: [],   // Recurring daily routines (pesée, repas, etc.)
+      rdv: [],       // Rendez-vous / meetings
+      career: [],    // Career-related
+      important: [], // Priority 1-2
+      other: [],     // Everything else
     };
 
-    await sendTelegramMessage(chatId, text, "Markdown", buttons);
+    for (const t of overdue) {
+      const title = (t.title || "").toLowerCase();
+      if (/push|pull|legs|cardio|workout|musculation|sport/.test(title)) {
+        categories.workout.push(t);
+      } else if (/pesée|repas|prépar|routine|jeûne|vitamines|méditation|journal/.test(title)) {
+        categories.routine.push(t);
+      } else if (/rendez-vous|rdv|meeting|appel|call/.test(title)) {
+        categories.rdv.push(t);
+      } else if (/career|cv|offre|candidat|linkedin|entretien|interview|postuler/.test(title) || t.context === "work") {
+        categories.career.push(t);
+      } else if ((t.priority || 3) <= 2) {
+        categories.important.push(t);
+      } else {
+        categories.other.push(t);
+      }
+    }
+
+    const catLabels: Record<string, string> = {
+      workout: "🏋️ Workouts",
+      routine: "🔁 Routines quotidiennes",
+      rdv: "📅 Rendez-vous",
+      career: "💼 Carrière",
+      important: "🔴 Prioritaires",
+      other: "📦 Autres",
+    };
+
+    let text = `🧹 *TRI INTELLIGENT — ${overdue.length} tâches en retard*\n\n`;
+
+    const buttons: Array<Array<{ text: string; callback_data: string }>> = [];
+
+    for (const [cat, tasks] of Object.entries(categories)) {
+      if (tasks.length === 0) continue;
+
+      const oldest = tasks[tasks.length - 1];
+      const ageOldest = Math.floor((Date.now() - new Date(oldest.due_date || oldest.created_at).getTime()) / 86400000);
+
+      text += `${catLabels[cat]} *(${tasks.length})*\n`;
+      // Show first 3 examples
+      tasks.slice(0, 3).forEach((t: any) => {
+        const age = Math.floor((Date.now() - new Date(t.due_date || t.created_at).getTime()) / 86400000);
+        text += `  ${t.title.substring(0, 45)} _(${age}j)_\n`;
+      });
+      if (tasks.length > 3) text += `  _+${tasks.length - 3} autres..._\n`;
+      text += `\n`;
+
+      // Smart action suggestion per category
+      if (cat === "workout" || cat === "routine") {
+        // These are almost certainly done or obsolete
+        buttons.push([
+          { text: `✅ ${catLabels[cat]} → Faits (${tasks.length})`, callback_data: `tri_done_${cat}` },
+        ]);
+      } else if (cat === "rdv") {
+        buttons.push([
+          { text: `✅ Faits (${tasks.length})`, callback_data: `tri_done_${cat}` },
+          { text: `🗑 Annulés`, callback_data: `tri_cancel_${cat}` },
+        ]);
+      } else {
+        buttons.push([
+          { text: `✅ Faits`, callback_data: `tri_done_${cat}` },
+          { text: `🗑 Archiver`, callback_data: `tri_cancel_${cat}` },
+        ]);
+      }
+    }
+
+    text += `💡 _Les workouts et routines passés sont probablement faits.\nLes RDV passés ont eu lieu ou ont été annulés._`;
+
+    buttons.push([
+      { text: "✅ TOUT marquer fait", callback_data: "tri_done_all" },
+      { text: "🗑 TOUT archiver", callback_data: "tri_cancel_all" },
+    ]);
+    buttons.push([{ text: "🔙 Menu", callback_data: "menu_main" }]);
+
+    await sendTelegramMessage(chatId, text, "Markdown", { inline_keyboard: buttons });
 
   } catch (e) {
-    console.error("Cleanup error:", e);
+    console.error("Triage error:", e);
     await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 100)}`);
   }
 }
@@ -6644,7 +6719,7 @@ serve(async (req: Request) => {
       }
     } else if (command === "/focus") {
       await handleFocus(chatId, args);
-    } else if (command === "/cleanup") {
+    } else if (command === "/cleanup" || command === "/tri") {
       await handleCleanup(chatId);
     }
     // === TASK MANAGEMENT V2 COMMANDS ===
