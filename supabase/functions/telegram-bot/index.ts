@@ -2952,6 +2952,44 @@ async function handleCallbackQuery(callbackId: string, chatId: number, data: str
   }
   // === CLEANUP CALLBACK ===
   // === SMART TRIAGE CALLBACKS ===
+  // --- Per-category page: tricat_{cat}_{page} ---
+  else if (data.startsWith("tricat_")) {
+    const parts = data.replace("tricat_", "").split("_");
+    const cat = parts.slice(0, -1).join("_"); // handle multi-word cats
+    const page = parseInt(parts[parts.length - 1]) || 0;
+    await handleTriagePage(chatId, cat, page);
+  }
+  // --- Individual task done: trid_{taskId} ---
+  else if (data.startsWith("trid_")) {
+    try {
+      const taskId = data.replace("trid_", "");
+      const now = new Date().toISOString();
+      const { data: task } = await supabase.from("tasks").select("title").eq("id", taskId).single();
+      await supabase.from("tasks").update({ status: "completed", completed_at: now, updated_at: now }).eq("id", taskId);
+      const title = task?.title || "Tâche";
+      await sendTelegramMessage(chatId, `✅ *${title.substring(0, 50)}* — fait !`, "Markdown", {
+        inline_keyboard: [[{ text: "🧹 Continuer le tri", callback_data: "cleanup" }, { text: "🔙 Menu", callback_data: "menu_main" }]],
+      });
+    } catch (e) {
+      await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 100)}`);
+    }
+  }
+  // --- Individual task archive: trix_{taskId} ---
+  else if (data.startsWith("trix_")) {
+    try {
+      const taskId = data.replace("trix_", "");
+      const now = new Date().toISOString();
+      const { data: task } = await supabase.from("tasks").select("title").eq("id", taskId).single();
+      await supabase.from("tasks").update({ status: "cancelled", updated_at: now }).eq("id", taskId);
+      const title = task?.title || "Tâche";
+      await sendTelegramMessage(chatId, `🗑 *${title.substring(0, 50)}* — archivée`, "Markdown", {
+        inline_keyboard: [[{ text: "🧹 Continuer le tri", callback_data: "cleanup" }, { text: "🔙 Menu", callback_data: "menu_main" }]],
+      });
+    } catch (e) {
+      await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 100)}`);
+    }
+  }
+  // --- Bulk done/cancel by category: tri_done_{cat} / tri_cancel_{cat} ---
   else if (data.startsWith("tri_done_") || data.startsWith("tri_cancel_")) {
     try {
       const isDone = data.startsWith("tri_done_");
@@ -2959,15 +2997,6 @@ async function handleCallbackQuery(callbackId: string, chatId: number, data: str
       const today = todayStr();
       const now = new Date().toISOString();
 
-      // Build category filter regex (same as handleCleanup)
-      const catFilters: Record<string, RegExp> = {
-        workout: /push|pull|legs|cardio|workout|musculation|sport/i,
-        routine: /pesée|repas|prépar|routine|jeûne|vitamines|méditation|journal/i,
-        rdv: /rendez-vous|rdv|meeting|appel|call/i,
-        career: /career|cv|offre|candidat|linkedin|entretien|interview|postuler/i,
-      };
-
-      // Fetch all overdue tasks
       const { data: overdue } = await supabase.from("tasks")
         .select("id, title, priority, context")
         .in("status", ["pending", "in_progress"])
@@ -2979,45 +3008,25 @@ async function handleCallbackQuery(callbackId: string, chatId: number, data: str
         return;
       }
 
-      let toUpdate: string[];
-
-      if (cat === "all") {
-        toUpdate = overdue.map((t: any) => t.id);
-      } else {
-        // Filter by category
-        toUpdate = overdue.filter((t: any) => {
-          const title = (t.title || "").toLowerCase();
-          if (cat === "important") return (t.priority || 3) <= 2 && !Object.values(catFilters).some(r => r.test(title));
-          if (cat === "other") {
-            return !Object.values(catFilters).some(r => r.test(title)) && (t.priority || 3) > 2;
-          }
-          return catFilters[cat]?.test(title) || (cat === "career" && t.context === "work");
-        }).map((t: any) => t.id);
-      }
+      const toUpdate = cat === "all"
+        ? overdue.map((t: any) => t.id)
+        : overdue.filter((t: any) => triageCategory(t) === cat).map((t: any) => t.id);
 
       if (toUpdate.length === 0) {
-        await sendTelegramMessage(chatId, "✅ Aucune tâche à traiter dans cette catégorie.");
+        await sendTelegramMessage(chatId, "✅ Catégorie déjà vide.");
         return;
       }
 
-      const newStatus = isDone ? "completed" : "cancelled";
-      const updateData: any = { status: newStatus, updated_at: now };
+      const updateData: any = { status: isDone ? "completed" : "cancelled", updated_at: now };
       if (isDone) updateData.completed_at = now;
 
-      const { error: updateError } = await supabase.from("tasks")
-        .update(updateData)
-        .in("id", toUpdate);
-
-      if (updateError) {
-        await sendTelegramMessage(chatId, `❌ Erreur: ${String(updateError).substring(0, 100)}`);
-        return;
-      }
+      await supabase.from("tasks").update(updateData).in("id", toUpdate);
 
       const remaining = overdue.length - toUpdate.length;
       const icon = isDone ? "✅" : "🗑";
       const action = isDone ? "marquées faites" : "archivées";
       let msg = `${icon} *${toUpdate.length} tâches ${action}*`;
-      if (isDone) msg += `\n+${toUpdate.length} au compteur productivité !`;
+      if (isDone) msg += `\n+${toUpdate.length} au compteur !`;
       if (remaining > 0) msg += `\n\n${remaining} tâches restantes en retard.`;
       else msg += `\n\n🎉 Plus aucune tâche en retard !`;
 
@@ -4998,15 +5007,33 @@ async function handleFocus(chatId: number, args: string[]): Promise<void> {
 }
 
 // ─── SMART TASK TRIAGE (replaces old cleanup) ─────────────────────────────
+const TRIAGE_CATS = ["workout", "routine", "rdv", "career", "important", "other"] as const;
+const TRIAGE_CAT_LABELS: Record<string, string> = {
+  workout: "🏋️ Workouts",
+  routine: "🔁 Routines",
+  rdv: "📅 Rendez-vous",
+  career: "💼 Carrière",
+  important: "🔴 Prioritaires",
+  other: "📦 Autres",
+};
+
+function triageCategory(t: any): string {
+  const title = (t.title || "").toLowerCase();
+  if (/push|pull|legs|cardio|workout|musculation|sport/.test(title)) return "workout";
+  if (/pesée|repas|prépar|routine|jeûne|vitamines|méditation|journal/.test(title)) return "routine";
+  if (/rendez-vous|rdv|meeting|appel|call/.test(title)) return "rdv";
+  if (/career|cv|offre|candidat|linkedin|entretien|interview|postuler/.test(title) || t.context === "work") return "career";
+  if ((t.priority || 3) <= 2) return "important";
+  return "other";
+}
+
+// Entry point: show category summary + drill-down buttons
 async function handleCleanup(chatId: number): Promise<void> {
   const supabase = getSupabaseClient();
-
   try {
     const today = todayStr();
-
-    // Fetch ALL overdue tasks (not just 14+ days)
     const { data: overdue } = await supabase.from("tasks")
-      .select("id, title, due_date, priority, context, recurrence_rule, recurrence_source_id, reschedule_count, created_at")
+      .select("id, title, due_date, priority, context")
       .in("status", ["pending", "in_progress"])
       .lt("due_date", today)
       .order("due_date", { ascending: true })
@@ -5017,92 +5044,104 @@ async function handleCleanup(chatId: number): Promise<void> {
       return;
     }
 
-    // Categorize tasks
-    const categories: Record<string, Array<any>> = {
-      workout: [],   // PUSH/PULL/LEGS/Cardio workouts
-      routine: [],   // Recurring daily routines (pesée, repas, etc.)
-      rdv: [],       // Rendez-vous / meetings
-      career: [],    // Career-related
-      important: [], // Priority 1-2
-      other: [],     // Everything else
-    };
-
+    // Count per category
+    const counts: Record<string, number> = {};
     for (const t of overdue) {
-      const title = (t.title || "").toLowerCase();
-      if (/push|pull|legs|cardio|workout|musculation|sport/.test(title)) {
-        categories.workout.push(t);
-      } else if (/pesée|repas|prépar|routine|jeûne|vitamines|méditation|journal/.test(title)) {
-        categories.routine.push(t);
-      } else if (/rendez-vous|rdv|meeting|appel|call/.test(title)) {
-        categories.rdv.push(t);
-      } else if (/career|cv|offre|candidat|linkedin|entretien|interview|postuler/.test(title) || t.context === "work") {
-        categories.career.push(t);
-      } else if ((t.priority || 3) <= 2) {
-        categories.important.push(t);
-      } else {
-        categories.other.push(t);
-      }
+      const cat = triageCategory(t);
+      counts[cat] = (counts[cat] || 0) + 1;
     }
 
-    const catLabels: Record<string, string> = {
-      workout: "🏋️ Workouts",
-      routine: "🔁 Routines quotidiennes",
-      rdv: "📅 Rendez-vous",
-      career: "💼 Carrière",
-      important: "🔴 Prioritaires",
-      other: "📦 Autres",
-    };
-
-    let text = `🧹 *TRI INTELLIGENT — ${overdue.length} tâches en retard*\n\n`;
+    let text = `🧹 *TRI — ${overdue.length} tâches en retard*\n\n`;
+    text += `Choisis une catégorie pour trier une par une:\n\n`;
 
     const buttons: Array<Array<{ text: string; callback_data: string }>> = [];
 
-    for (const [cat, tasks] of Object.entries(categories)) {
-      if (tasks.length === 0) continue;
-
-      const oldest = tasks[tasks.length - 1];
-      const ageOldest = Math.floor((Date.now() - new Date(oldest.due_date || oldest.created_at).getTime()) / 86400000);
-
-      text += `${catLabels[cat]} *(${tasks.length})*\n`;
-      // Show first 3 examples
-      tasks.slice(0, 3).forEach((t: any) => {
-        const age = Math.floor((Date.now() - new Date(t.due_date || t.created_at).getTime()) / 86400000);
-        text += `  ${t.title.substring(0, 45)} _(${age}j)_\n`;
-      });
-      if (tasks.length > 3) text += `  _+${tasks.length - 3} autres..._\n`;
-      text += `\n`;
-
-      // Smart action suggestion per category
-      if (cat === "workout" || cat === "routine") {
-        // These are almost certainly done or obsolete
-        buttons.push([
-          { text: `✅ ${catLabels[cat]} → Faits (${tasks.length})`, callback_data: `tri_done_${cat}` },
-        ]);
-      } else if (cat === "rdv") {
-        buttons.push([
-          { text: `✅ Faits (${tasks.length})`, callback_data: `tri_done_${cat}` },
-          { text: `🗑 Annulés`, callback_data: `tri_cancel_${cat}` },
-        ]);
-      } else {
-        buttons.push([
-          { text: `✅ Faits`, callback_data: `tri_done_${cat}` },
-          { text: `🗑 Archiver`, callback_data: `tri_cancel_${cat}` },
-        ]);
-      }
+    for (const cat of TRIAGE_CATS) {
+      const n = counts[cat] || 0;
+      if (n === 0) continue;
+      text += `${TRIAGE_CAT_LABELS[cat]}: *${n}*\n`;
+      buttons.push([
+        { text: `${TRIAGE_CAT_LABELS[cat]} (${n})`, callback_data: `tricat_${cat}_0` },
+        { text: `✅ Tous faits`, callback_data: `tri_done_${cat}` },
+      ]);
     }
 
-    text += `💡 _Les workouts et routines passés sont probablement faits.\nLes RDV passés ont eu lieu ou ont été annulés._`;
-
     buttons.push([
-      { text: "✅ TOUT marquer fait", callback_data: "tri_done_all" },
+      { text: "✅ TOUT fait", callback_data: "tri_done_all" },
       { text: "🗑 TOUT archiver", callback_data: "tri_cancel_all" },
     ]);
     buttons.push([{ text: "🔙 Menu", callback_data: "menu_main" }]);
 
     await sendTelegramMessage(chatId, text, "Markdown", { inline_keyboard: buttons });
-
   } catch (e) {
     console.error("Triage error:", e);
+    await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 100)}`);
+  }
+}
+
+// Show individual tasks for a category with ✅/❌ per task, paginated
+const TRIAGE_PAGE_SIZE = 8;
+async function handleTriagePage(chatId: number, cat: string, page: number): Promise<void> {
+  const supabase = getSupabaseClient();
+  try {
+    const today = todayStr();
+    const { data: overdue } = await supabase.from("tasks")
+      .select("id, title, due_date, priority, context")
+      .in("status", ["pending", "in_progress"])
+      .lt("due_date", today)
+      .order("due_date", { ascending: true })
+      .limit(200);
+
+    if (!overdue || overdue.length === 0) {
+      await sendTelegramMessage(chatId, "✅ Plus aucune tâche en retard !");
+      return;
+    }
+
+    // Filter to this category
+    const tasks = overdue.filter((t: any) => triageCategory(t) === cat);
+
+    if (tasks.length === 0) {
+      await sendTelegramMessage(chatId, `✅ ${TRIAGE_CAT_LABELS[cat]} — tout est traité !`, "Markdown", {
+        inline_keyboard: [[{ text: "🧹 Retour tri", callback_data: "cleanup" }, { text: "🔙 Menu", callback_data: "menu_main" }]],
+      });
+      return;
+    }
+
+    const totalPages = Math.ceil(tasks.length / TRIAGE_PAGE_SIZE);
+    const safePage = Math.min(page, totalPages - 1);
+    const pageTasks = tasks.slice(safePage * TRIAGE_PAGE_SIZE, (safePage + 1) * TRIAGE_PAGE_SIZE);
+
+    let text = `${TRIAGE_CAT_LABELS[cat]} *— ${tasks.length} en retard*`;
+    if (totalPages > 1) text += ` (page ${safePage + 1}/${totalPages})`;
+    text += `\n\n`;
+
+    const buttons: Array<Array<{ text: string; callback_data: string }>> = [];
+
+    for (const t of pageTasks) {
+      const age = Math.floor((Date.now() - new Date(t.due_date || t.created_at).getTime()) / 86400000);
+      const shortTitle = (t.title || "?").substring(0, 35);
+      text += `• ${shortTitle} _(${age}j)_\n`;
+
+      // Each task gets a row: ✅ Done | ❌ Archive
+      const shortId = t.id.substring(0, 8); // UUID first 8 chars for callback_data (< 64 bytes)
+      buttons.push([
+        { text: `✅ ${shortTitle.substring(0, 25)}`, callback_data: `trid_${t.id}` },
+        { text: `❌`, callback_data: `trix_${t.id}` },
+      ]);
+    }
+
+    // Navigation row
+    const navRow: Array<{ text: string; callback_data: string }> = [];
+    if (safePage > 0) navRow.push({ text: "⬅️ Préc.", callback_data: `tricat_${cat}_${safePage - 1}` });
+    navRow.push({ text: `✅ Tous ${TRIAGE_CAT_LABELS[cat]}`, callback_data: `tri_done_${cat}` });
+    if (safePage < totalPages - 1) navRow.push({ text: "Suiv. ➡️", callback_data: `tricat_${cat}_${safePage + 1}` });
+    buttons.push(navRow);
+
+    buttons.push([{ text: "🧹 Retour tri", callback_data: "cleanup" }, { text: "🔙 Menu", callback_data: "menu_main" }]);
+
+    await sendTelegramMessage(chatId, text, "Markdown", { inline_keyboard: buttons });
+  } catch (e) {
+    console.error("TriagePage error:", e);
     await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 100)}`);
   }
 }
