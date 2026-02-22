@@ -13,6 +13,7 @@ import { progressBar, trend, simpleProgressBar } from "../_shared/formatting.ts"
 import { DOMAIN_EMOJIS, TOMORROW_SCHEDULE, FAIL_REASON_LABELS } from "../_shared/config.ts";
 import { buildScorecard, formatScorecardHTML } from "../_shared/scorecard.ts";
 import { rankGoals, type GoalRanked } from "../_shared/goal-engine.ts";
+import { learnPatterns, generateBotRetro, formatRetro } from "../_shared/intelligence-engine.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") || "";
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
@@ -881,6 +882,11 @@ Data-driven, focus sur les goals. Max 150 mots.`,
       }).then(() => {}).catch(() => {});
     } catch (_) {}
 
+    // ─── DAILY PATTERN LEARNING (update behavioral patterns) ───
+    try {
+      await learnPatterns(supabase);
+    } catch (e) { console.error("[Intelligence] Daily learning:", e); }
+
     // ============================================
     // SUNDAY: L10 WEEKLY REVIEW (merged from weekly-planning)
     // ============================================
@@ -1099,6 +1105,18 @@ Faits + solutions seulement. Max 150 mots.`,
         if (carryCount > 0) {
           await sendTG(`✅ ${carryCount} tâche(s) prioritaire(s) reportée(s) à demain.`);
         }
+
+        // ─── BOT SELF-RETRO + PATTERN LEARNING ─────────────────
+        try {
+          const patternsLearned = await learnPatterns(supabase);
+          const retro = await generateBotRetro(supabase);
+          const retroMsg = formatRetro(retro);
+          if (patternsLearned > 0) {
+            await sendTG(retroMsg + `\n\n<i>📈 ${patternsLearned} patterns mis à jour</i>`);
+          } else {
+            await sendTG(retroMsg);
+          }
+        } catch (retroErr) { console.error("[Retro] Error:", retroErr); }
 
         await sendTG(
           `<b>✨ Bonne semaine Oren !</b>\nFocus sur les Rocks. 3 tâches max par jour.`,

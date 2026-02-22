@@ -3,6 +3,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { getSignalBus } from "../_shared/agent-signals.ts";
 import { getIsraelNow, todayStr, timeStr } from "../_shared/timezone.ts";
 import { sendTG, escHTML } from "../_shared/telegram.ts";
+import { analyzeReminderEffectiveness } from "../_shared/intelligence-engine.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") || "";
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
@@ -103,6 +104,16 @@ serve(async (_req: Request) => {
         const ids = upcoming.map(t => t.id);
         await supabase.from("tasks").update({ reminder_sent: true }).in("id", ids);
       }
+
+      // Track reminder effectiveness
+      for (const t of filteredUpcoming) {
+        try {
+          await supabase.from("reminder_effectiveness").insert({
+            task_id: t.id, reminder_type: "upcoming",
+            hour_sent: now.getHours(), day_of_week: dow,
+          });
+        } catch (_) {}
+      }
     }
 
     // ─── 2. MISSED tasks (due 30-90 min ago, still pending) ───────
@@ -149,6 +160,16 @@ serve(async (_req: Request) => {
         // Mark missed tasks as reminded to prevent duplicate nudges
         const missedIds = missed.map((t: any) => t.id);
         await supabase.from("tasks").update({ reminder_sent: true }).in("id", missedIds);
+
+        // Track reminder effectiveness
+        for (const t of missed) {
+          try {
+            await supabase.from("reminder_effectiveness").insert({
+              task_id: t.id, reminder_type: "missed",
+              hour_sent: now.getHours(), day_of_week: dow,
+            });
+          } catch (_) {}
+        }
       }
     }
 
@@ -550,6 +571,13 @@ serve(async (_req: Request) => {
           reminderCount++;
         }
       } catch (ibxErr) { console.error("[Inbox] Reminder error:", ibxErr); }
+    }
+
+    // ─── 7. BACKFILL REMINDER EFFECTIVENESS (once/hour) ────────
+    if (now.getMinutes() < 15) {
+      try {
+        await analyzeReminderEffectiveness(supabase);
+      } catch (e) { console.error("[Intelligence] Effectiveness backfill:", e); }
     }
 
     return new Response(

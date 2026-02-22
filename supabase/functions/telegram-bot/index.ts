@@ -3413,15 +3413,73 @@ async function handleCallbackQuery(callbackId: string, chatId: number, data: str
     try {
       const { error } = await supabase.from("tasks").update({ status: "completed", completed_at: new Date().toISOString() }).eq("id", taskId);
       if (error) throw error;
-      await sendTelegramMessage(chatId, `✓ Tache terminee`);
+
       // Spawn next recurrence if applicable
+      let fullTask: any = null;
       try {
-        const { data: fullTask } = await supabase.from("tasks").select("*").eq("id", taskId).single();
-        if (fullTask?.recurrence_rule) await spawnNextRecurrence(supabase, fullTask);
+        const { data: ft } = await supabase.from("tasks").select("*").eq("id", taskId).single();
+        fullTask = ft;
+        if (ft?.recurrence_rule) await spawnNextRecurrence(supabase, ft);
       } catch (_) {}
+
+      // Micro-feedback: 20% chance (or always for tasks with duration estimate)
+      const showFeedback = fullTask?.duration_minutes || Math.random() < 0.2;
+      if (showFeedback) {
+        const shortId = taskId.substring(0, 8);
+        await sendTelegramMessage(chatId, `✅ *Fait !* Ça a pris combien de temps ?`, "Markdown", {
+          inline_keyboard: [
+            [
+              { text: "⚡ 15min", callback_data: `fb_dur_${taskId}_15` },
+              { text: "⏱ 30min", callback_data: `fb_dur_${taskId}_30` },
+              { text: "🕐 1h", callback_data: `fb_dur_${taskId}_60` },
+              { text: "🕑 +1h", callback_data: `fb_dur_${taskId}_90` },
+            ],
+            [{ text: "⏭ Passer", callback_data: "fb_skip" }],
+          ],
+        });
+      } else {
+        await sendTelegramMessage(chatId, `✓ Tache terminee`);
+      }
     } catch (e) {
       await sendTelegramMessage(chatId, `error: ${String(e).substring(0, 50)}`);
     }
+  }
+  // Micro-feedback: duration response
+  else if (data.startsWith("fb_dur_")) {
+    try {
+      const parts = data.replace("fb_dur_", "").split("_");
+      const dur = parseInt(parts.pop()!, 10);
+      const taskId = parts.join("_");
+      await supabase.from("task_feedback").insert({ task_id: taskId, actual_duration_minutes: dur });
+      await sendTelegramMessage(chatId, `👍 Noté ! C'était:`, "Markdown", {
+        inline_keyboard: [
+          [
+            { text: "😎 Facile", callback_data: `fb_diff_${taskId}_easy` },
+            { text: "👌 Normal", callback_data: `fb_diff_${taskId}_normal` },
+            { text: "😤 Dur", callback_data: `fb_diff_${taskId}_hard` },
+          ],
+          [{ text: "⏭ Passer", callback_data: "fb_skip" }],
+        ],
+      });
+    } catch (_) {
+      await sendTelegramMessage(chatId, `✓ Noté`);
+    }
+  }
+  // Micro-feedback: difficulty response
+  else if (data.startsWith("fb_diff_")) {
+    try {
+      const parts = data.replace("fb_diff_", "").split("_");
+      const difficulty = parts.pop()!;
+      const taskId = parts.join("_");
+      await supabase.from("task_feedback").update({ difficulty }).eq("task_id", taskId);
+      await sendTelegramMessage(chatId, `📊 Merci ! Ces données améliorent mes prédictions.`);
+    } catch (_) {
+      await sendTelegramMessage(chatId, `✓`);
+    }
+  }
+  // Micro-feedback: skip
+  else if (data === "fb_skip") {
+    await sendTelegramMessage(chatId, `✓ Tache terminee`);
   }
   // Mission at specific time
   else if (data.startsWith("mission_at_")) {

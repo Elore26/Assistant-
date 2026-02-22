@@ -7,6 +7,7 @@ import { getIsraelNow, todayStr, daysAgo, DAYS_FR } from "../_shared/timezone.ts
 import { callOpenAI } from "../_shared/openai.ts";
 import { sendTG, escHTML } from "../_shared/telegram.ts";
 import { rankGoals, analyzeBrainTrend, detectGoalRockMisalignment, generateGoalNudges, buildGoalIntelligenceContext } from "../_shared/goal-engine.ts";
+import { predictTasks, formatAtRiskTasks } from "../_shared/intelligence-engine.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") || "";
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
@@ -559,18 +560,19 @@ serve(async (req: Request) => {
     // Tasks for today - fetch ALL pending tasks, not just today's
     let scheduledTasks: any[] = [];
     let allTasks: any[] = [];
+    let overdueTasks: any[] = [];
     let top3: any[] = [];
     try {
       // Today's tasks
-      const { data } = await supabase.from("tasks").select("id, title, priority, status, due_time, duration_minutes, agent_type")
+      const { data } = await supabase.from("tasks").select("id, title, priority, status, due_time, duration_minutes, agent_type, context, reschedule_count")
         .eq("due_date", today).in("status", ["pending", "in_progress"]).order("priority", { ascending: true });
       allTasks = data || [];
       scheduledTasks = allTasks.filter((t: any) => t.due_time);
 
       // Also fetch overdue tasks (past due_date, still pending)
-      const { data: overdue } = await supabase.from("tasks").select("id, title, priority, status, due_time, duration_minutes, agent_type")
+      const { data: overdue } = await supabase.from("tasks").select("id, title, priority, status, due_time, duration_minutes, agent_type, context, reschedule_count")
         .lt("due_date", today).in("status", ["pending", "in_progress"]).order("priority", { ascending: true }).limit(5);
-      const overdueTasks = overdue || [];
+      overdueTasks = overdue || [];
 
       // Smart "Les 3 du jour" selection
       // Priority: 1) overdue tasks, 2) today's high priority, 3) today's scheduled
@@ -1025,6 +1027,16 @@ Max 8 lignes, data-driven, focus sur le goal le plus en retard.`,
         msg += `${p} ${escHTML(t.title)}${time}\n`;
       });
     }
+
+    // ─── PREDICTIVE SCORING: tasks at risk ─────────────────
+    try {
+      const allTasksForPred = [...allTasks, ...(overdueTasks || [])];
+      if (allTasksForPred.length > 0) {
+        const predictions = await predictTasks(supabase, allTasksForPred, day, now.getHours());
+        const atRiskMsg = formatAtRiskTasks(predictions);
+        if (atRiskMsg) msg += atRiskMsg;
+      }
+    } catch (e) { console.error("[Intelligence] Prediction error:", e); }
 
     // Add overnight alerts if any
     if (overnightAlerts) {
