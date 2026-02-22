@@ -53,8 +53,8 @@ export class AgentMemoryStore {
       Deno.env.get("SUPABASE_URL") ?? "",
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? ""
     );
-    // Auto-detect pgvector availability
-    this.usePgVector = false; // Will be true after Phase 2 migration
+    // pgvector enabled — set via env or auto-detect
+    this.usePgVector = Deno.env.get("ENABLE_PGVECTOR") === "true";
   }
 
   // ─── STORE: Save a new memory ─────────────────────────────────────
