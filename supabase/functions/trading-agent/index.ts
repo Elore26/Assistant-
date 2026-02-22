@@ -10,36 +10,11 @@ import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { getGoogleCalendar, GCAL_COLORS } from "../_shared/google-calendar.ts";
 import { robustFetch, robustFetchJSON } from "../_shared/robust-fetch.ts";
+import { callOpenAI } from "../_shared/openai.ts";
+import { sendTG } from "../_shared/telegram.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") || "";
 const SUPABASE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
-const BOT_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN") || "";
-const CHAT_ID = Deno.env.get("TELEGRAM_CHAT_ID") || "775360436";
-
-// =============================================
-// OPENAI INTEGRATION
-// =============================================
-async function callOpenAI(systemPrompt: string, userContent: string, maxTokens = 600): Promise<string> {
-  const apiKey = Deno.env.get("OPENAI_API_KEY");
-  if (!apiKey) return "";
-  try {
-    const response = await robustFetch("https://api.openai.com/v1/chat/completions", {
-      timeoutMs: 15000,
-      retries: 1,
-      init: {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
-        body: JSON.stringify({
-          model: "gpt-4o-mini", temperature: 0.5, max_tokens: maxTokens,
-          messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userContent }],
-        }),
-      },
-    });
-    if (!response.ok) return "";
-    const data = await response.json();
-    return data.choices?.[0]?.message?.content || "";
-  } catch (e) { console.error("OpenAI error:", e); return ""; }
-}
 
 // =============================================
 // TYPES
@@ -1265,38 +1240,12 @@ function formatTradingAnalysis(a: AnalysisResult): string {
 }
 
 // =============================================
-// TELEGRAM
-// =============================================
-async function sendTG(text: string): Promise<boolean> {
-  if (!BOT_TOKEN) return false;
-  const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
-  try {
-    let res = await robustFetch(url, {
-      timeoutMs: 10000,
-      retries: 2,
-      init: {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chat_id: CHAT_ID, text, parse_mode: "HTML", disable_web_page_preview: true }),
-      },
-    });
-    if (!res.ok) {
-      const plain = text.replace(/<[^>]+>/g, "");
-      res = await robustFetch(url, {
-        timeoutMs: 10000,
-        retries: 1,
-        init: {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ chat_id: CHAT_ID, text: plain }),
-        },
-      });
-    }
-    return res.ok;
-  } catch (e) {
-    console.error("Telegram send error:", e);
-    return false;
-  }
+// sendTG imported from _shared/telegram.ts
+
+function isNightInIsrael(): boolean {
+  const now = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Jerusalem" }));
+  const hour = now.getHours();
+  return hour >= 22 || hour < 7;
 }
 
 // =============================================
@@ -1578,7 +1527,31 @@ Style: direct, chiffres précis, pas de généralités. Emojis autorisés.`,
       }
     } catch (e) { console.error("Stats error:", e); }
 
-    await sendTG(fullMsg);
+    // --- Send notification with button instead of full analysis ---
+    // Night guard: no Telegram messages between 22h-07h Israel time
+    if (!isNightInIsrael()) {
+      // Build short summary for notification
+      const summaryParts = analyses.map(a => {
+        const dir = a.trend1D.direction === "HAUSSIER" ? "▲" : a.trend1D.direction === "BAISSIER" ? "▼" : "↔";
+        const sigText = a.signal ? `${a.signal.type} (${a.signal.confidence}%)` : "HOLD";
+        return `${a.symbol} ${dir} $${fmt(a.price)} — ${sigText}`;
+      });
+      const activeSignals = analyses.filter(a => a.signal).length;
+      const typeLabel = isSundayEvening ? "📊 Analyse Hebdo" : isTradingDay ? "📈 Analyse Trading" : "👁 Observation";
+      let notif = `<b>${typeLabel}</b>\n`;
+      notif += summaryParts.join("\n");
+      if (activeSignals > 0) notif += `\n\n🔔 <b>${activeSignals} signal(s) actif(s)</b>`;
+      else notif += `\nPas de signal`;
+
+      await sendTG(notif, {
+        buttons: [
+          [{ text: "📊 Voir l'analyse complète", callback_data: "trading_last" }],
+          [{ text: "📋 Plans semaine", callback_data: "trading_plans" }, { text: "🔙 Menu", callback_data: "menu_signals" }],
+        ],
+      });
+    } else {
+      console.log("[Trading] Night mode — analysis saved to DB, no Telegram notification");
+    }
 
     // =============================================
     // GOOGLE CALENDAR SYNC — Trading Signals + Weekly Plans
@@ -1608,21 +1581,35 @@ Style: direct, chiffres précis, pas de généralités. Emojis autorisés.`,
       }
     } catch (e) { console.error("GCal trading sync error:", e); }
 
-    // Save to DB
+    // Save to DB (with deduplication — skip symbols already analyzed today)
     const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
-    for (const a of analyses) {
+    const todayDate = new Date().toISOString().split("T")[0];
+    const { data: existingSignals } = await supabase.from("trading_signals")
+      .select("symbol").gte("created_at", todayDate + "T00:00:00")
+      .not("symbol", "in", "(PLAN,CONFIG)");
+    const alreadySaved = new Set((existingSignals || []).map((s: any) => s.symbol));
+
+    for (let i = 0; i < analyses.length; i++) {
+      const a = analyses[i];
+      if (alreadySaved.has(a.symbol)) {
+        console.log(`[Trading] ${a.symbol} already saved today, skipping`);
+        continue;
+      }
+      const notesObj: any = {
+        trend1D: a.trend1D.structure,
+        trend4H: a.trend4H.structure,
+        context: a.context,
+        confluence: a.confluence.score,
+        ema200: a.priceVsEma,
+        signal: a.signal,
+      };
+      // Store full analysis text on first entry for easy retrieval
+      if (i === 0) notesObj.full_message = fullMsg;
       await supabase.from("trading_signals").insert({
         symbol: a.symbol,
         signal_type: a.signal?.type || "HOLD",
         confidence: a.signal?.confidence || a.confluence.score * 10,
-        notes: JSON.stringify({
-          trend1D: a.trend1D.structure,
-          trend4H: a.trend4H.structure,
-          context: a.context,
-          confluence: a.confluence.score,
-          ema200: a.priceVsEma,
-          signal: a.signal,
-        }),
+        notes: JSON.stringify(notesObj),
         created_at: new Date().toISOString(),
       });
     }

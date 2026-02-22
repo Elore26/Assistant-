@@ -76,9 +76,7 @@ interface MonthlySummary {
 
 // ─── Date Helpers ───────────────────────────────────────────────────────
 function getIsraeliDate(): Date {
-  const now = new Date();
-  const utcDate = new Date(now.getTime() + now.getTimezoneOffset() * 60000);
-  return new Date(utcDate.getTime() + 2 * 60 * 60 * 1000);
+  return new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Jerusalem" }));
 }
 
 function dateStr(d: Date): string {
@@ -391,6 +389,14 @@ async function processFinanceAgent(): Promise<any> {
   const targetSavingsRate = 20;
 
   try {
+    // --- Deduplication: skip if already processed today ---
+    const { data: existingReport } = await supabase.from("finance_reports")
+      .select("id").eq("report_date", today).limit(1);
+    if (existingReport && existingReport.length > 0) {
+      console.log(`[Finance] Already processed today (${today}), skipping duplicate`);
+      return { success: true, type: "skipped_duplicate", date: today };
+    }
+
     const signals = getSignalBus("finance");
 
     // ─── Fetch all data in parallel ─────────────────────────────

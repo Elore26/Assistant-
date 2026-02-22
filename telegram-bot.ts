@@ -6,7 +6,13 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { getGoogleCalendar, GCAL_COLORS } from "../_shared/google-calendar.ts";
-import { getSignalBus } from "../_shared/agent-signals.ts";
+import { getSignalBus, type AgentName } from "../_shared/agent-signals.ts";
+import { rankGoals, formatGoalIntelligence } from "../_shared/goal-engine.ts";
+import { runReActAgent, quickAgent, type AgentResult } from "../_shared/react-agent.ts";
+import { runMorningBriefing, runEveningReview } from "../_shared/chief-of-staff.ts";
+import { getGuardrails } from "../_shared/agent-guardrails.ts";
+import { getMemoryStore } from "../_shared/agent-memory.ts";
+import { sendTG, escHTML } from "../_shared/telegram.ts";
 
 // --- Types Telegram ---
 interface TelegramUpdate {
@@ -151,11 +157,10 @@ async function answerCallbackQuery(callbackId: string, text?: string): Promise<v
 // --- Inline Keyboard Helpers ---
 const MAIN_MENU: InlineKeyboardMarkup = {
   inline_keyboard: [
-    [{ text: "☀️ Briefing", callback_data: "morning_briefing" }, { text: "📋 Tasks", callback_data: "menu_tasks" }, { text: "💰 Budget", callback_data: "menu_budget" }],
-    [{ text: "🏋️ Santé", callback_data: "menu_health" }, { text: "💼 Carrière", callback_data: "menu_jobs" }, { text: "🚀 HiGrow", callback_data: "menu_leads" }],
-    [{ text: "📈 Trading", callback_data: "menu_signals" }, { text: "🧠 Insights", callback_data: "menu_insights" }, { text: "🎯 Goals", callback_data: "menu_goals" }],
-    [{ text: "🌙 Plan demain", callback_data: "menu_tomorrow" }, { text: "🍅 Pomodoro", callback_data: "menu_pomodoro" }, { text: "📊 Vélocité", callback_data: "menu_velocity" }],
-    [{ text: "❓ Tuto — Guide complet", callback_data: "tuto_main" }],
+    [{ text: "☀️ Briefing", callback_data: "morning_agentic" }, { text: "📋 Tasks", callback_data: "menu_tasks" }, { text: "💰 Budget", callback_data: "menu_budget" }],
+    [{ text: "💼 Carrière", callback_data: "menu_jobs" }, { text: "🚀 HiGrow", callback_data: "menu_leads" }, { text: "🏋️ Santé", callback_data: "menu_health" }],
+    [{ text: "📈 Trading", callback_data: "menu_signals" }, { text: "📊 Dashboard", callback_data: "menu_dashboard" }, { text: "🎯 EOS", callback_data: "menu_eos" }],
+    [{ text: "🤖 Agents", callback_data: "agent_status" }, { text: "❓ Tuto", callback_data: "tuto_main" }],
   ],
 };
 
@@ -344,52 +349,38 @@ async function handleToday(chatId: number): Promise<void> {
 async function handleHelp(chatId: number): Promise<void> {
   const text =
     `*COMMANDES*\n\n` +
-    `MISSIONS\n` +
-    `/brief agent mission\n` +
-    `/report agent\n` +
-    `/status\n\n` +
-    `TACHES\n` +
-    `/task add titre\n` +
-    `/task list\n` +
-    `/task done num\n\n` +
-    `FINANCES\n` +
-    `/expense mont cat\n` +
-    `/cash mont cat (especes)\n` +
-    `/income mont cat\n` +
-    `/budget\n\n` +
-    `SANTE\n` +
-    `/health weight kg\n` +
-    `/health workout type\n` +
-    `/health status\n\n` +
-    `APPRENTISSAGE\n` +
-    `/study topic min\n\n` +
-    `LEADS & JOBS\n` +
-    `/lead add name spec\n` +
-    `/lead list\n` +
-    `/job url [titre]\n` +
-    `/jobs\n\n` +
-    `MISSION\n` +
-    `/mission titre heure [duree]\n\n` +
-    `FOCUS\n` +
-    `/focus [min] — mode silencieux\n` +
-    `/focus off — reprendre notifs\n\n` +
-    `PLANNING V2\n` +
+    `🤖 AGENTIC\n` +
+    `/ask question — demander au Chief of Staff\n` +
+    `/agents — dashboard santé des agents\n` +
+    `/memory recherche — chercher les mémoires\n` +
+    `/morning — briefing intelligent (Chief of Staff)\n` +
+    `/review — revue de soirée (Chief of Staff)\n\n` +
+    `📋 TACHES\n` +
+    `/task add|list|done\n` +
     `/inbox — voir/trier l'inbox\n` +
     `/pomodoro — session focus 25min\n` +
     `/velocity — stats productivité\n` +
-    `/repeat titre règle — tâche récurrente\n` +
+    `/repeat titre règle — récurrente\n` +
     `/sprint domaine "obj" cible\n` +
     `/timeblock — planifier la journée\n` +
     `/tomorrow — plan de demain\n` +
-    `/subtask id titre — sous-tâche\n` +
-    `/ctx work|home|errands — filtre\n\n` +
-    `AUTRES\n` +
-    `/morning — briefing du jour + coach santé\n` +
-    `/today\n` +
-    `/review\n` +
-    `/signals\n` +
-    `/goals\n` +
-    `/tuto — guide complet interactif`;
+    `/subtask id titre\n` +
+    `/ctx work|home|errands — filtre\n` +
+    `/focus [min] — mode silencieux\n\n` +
+    `💰 FINANCES\n` +
+    `/expense mont cat · /cash mont cat\n` +
+    `/income mont cat · /budget\n\n` +
+    `🏋️ SANTE\n` +
+    `/health weight|workout|status\n` +
+    `/study topic min\n\n` +
+    `💼 CARRIERE\n` +
+    `/job url [titre] · /jobs\n` +
+    `/lead add|list · /mission titre heure\n\n` +
+    `📊 INTELLIGENCE\n` +
+    `/dashboard · /insights · /goals\n` +
+    `/scorecard · /rock · /cir\n` +
+    `/signals · /brief · /report\n\n` +
+    `_Ou écris en langage naturel !_`;
 
   await sendTelegramMessage(chatId, text);
 }
@@ -423,15 +414,21 @@ async function handleTaskAdd(chatId: number, args: string[]): Promise<void> {
   const supabase = getSupabaseClient();
 
   try {
-    const { error } = await supabase.from("tasks").insert({
+    const { data: inserted, error } = await supabase.from("tasks").insert({
       title: title.substring(0, 100),
       status: "pending",
       priority: 3,
       created_at: new Date().toISOString(),
-    });
+    }).select("id").single();
 
     if (error) throw error;
-    await sendTelegramMessage(chatId, `+ Tache: *${escapeMarkdown(title)}*`);
+    const taskId = inserted.id;
+    await sendTelegramMessage(chatId, `✅ Tâche ajoutée: *${escapeMarkdown(title)}*\n\n🏷 Quel contexte ?`, "Markdown", {
+      inline_keyboard: [
+        TASK_CONTEXTS.map(c => ({ text: `${CONTEXT_EMOJI[c]} ${c}`, callback_data: `task_setctx_${taskId}_${c}` })),
+        [{ text: "⏭ Pas de contexte", callback_data: `task_setctx_${taskId}_none` }],
+      ],
+    });
   } catch (e) {
     console.error("Task add error:", e);
     await sendTelegramMessage(chatId, `error: ${String(e).substring(0, 50)}`);
@@ -446,7 +443,8 @@ async function handleTaskList(chatId: number): Promise<void> {
       .from("tasks")
       .select("*")
       .in("status", ["pending", "in_progress"])
-      .order("priority", { ascending: true });
+      .order("priority", { ascending: true })
+      .limit(50);
 
     if (error) throw error;
 
@@ -509,7 +507,8 @@ async function handleTaskDone(chatId: number, args: string[]): Promise<void> {
       .from("tasks")
       .select("id, title")
       .in("status", ["pending", "in_progress"])
-      .order("created_at", { ascending: true });
+      .order("created_at", { ascending: true })
+      .limit(50);
 
     if (selectError) throw selectError;
     if (!data || num > data.length) {
@@ -843,7 +842,8 @@ async function handleLead(chatId: number, args: string[]): Promise<void> {
       const { data, error } = await supabase
         .from("leads")
         .select("*")
-        .order("created_at", { ascending: false });
+        .order("created_at", { ascending: false })
+        .limit(50);
 
       if (error) throw error;
 
@@ -1625,10 +1625,10 @@ async function handleVelocity(chatId: number): Promise<void> {
     const topContext = Object.entries(contextCounts).sort((a, b) => b[1] - a[1])[0];
 
     let text = `📊 *VÉLOCITÉ* — 7 derniers jours\n\n`;
-    text += `✅ Complétées: *${thisWeekCount}* ${deltaStr} vs sem\\. dernière\n`;
+    text += `✅ Complétées: *${thisWeekCount}* ${deltaStr} vs sem. dernière\n`;
     text += `📝 Créées: ${created.length} · Ratio: ${completionRate}%\n`;
     if (totalPomodoros > 0) {
-      text += `🍅 Pomodoros: ${totalPomodoros} \\(${Math.round(deepWorkMin / 60)}h deep work\\)\n`;
+      text += `🍅 Pomodoros: ${totalPomodoros} (${Math.round(deepWorkMin / 60)}h deep work)\n`;
     }
     text += `\n`;
 
@@ -1641,21 +1641,21 @@ async function handleVelocity(chatId: number): Promise<void> {
     });
 
     if (bestDayIdx) {
-      text += `\n💪 Meilleur jour: *${dayNames[Number(bestDayIdx[0])]}* \\(${bestDayIdx[1]}\\)\n`;
+      text += `\n💪 Meilleur jour: *${dayNames[Number(bestDayIdx[0])]}* (${bestDayIdx[1]})\n`;
     }
     if (topContext) {
-      text += `🏷 Top contexte: ${CONTEXT_EMOJI[topContext[0]] || "📌"} ${topContext[0]} \\(${topContext[1]}\\)\n`;
+      text += `🏷 Top contexte: ${CONTEXT_EMOJI[topContext[0]] || "📌"} ${topContext[0]} (${topContext[1]})\n`;
     }
 
     // Most rescheduled
     if (rescheduled.length > 0) {
       text += `\n⚠️ *Plus reportées:*\n`;
       rescheduled.forEach((t: any) => {
-        text += `  ↻ x${t.reschedule_count} ${escapeMarkdown(t.title)}\n`;
+        text += `  ↻ x${t.reschedule_count} ${t.title}\n`;
       });
     }
 
-    await sendTelegramMessage(chatId, text, "MarkdownV2", {
+    await sendTelegramMessage(chatId, text, "Markdown", {
       inline_keyboard: [
         [{ text: "📋 Tâches", callback_data: "menu_tasks" }, { text: "🎯 Sprint", callback_data: "menu_sprint" }],
         [{ text: "🔙 Menu", callback_data: "menu_main" }],
@@ -1797,7 +1797,8 @@ async function handleTimeBlock(chatId: number): Promise<void> {
     const { data: tasks } = await supabase.from("tasks")
       .select("id, title, priority, duration_minutes, energy_level, due_time, context")
       .eq("due_date", today).in("status", ["pending", "in_progress"])
-      .order("priority", { ascending: true });
+      .order("priority", { ascending: true })
+      .limit(20);
 
     const unscheduled = (tasks || []).filter((t: any) => !t.due_time);
     const scheduled = (tasks || []).filter((t: any) => t.due_time);
@@ -2051,7 +2052,7 @@ async function handleTomorrowPlan(chatId: number): Promise<void> {
         const src = t.source === "overdue" ? " ⚠️" : t.source === "priority" ? " ⭐" : "";
         const time = t.due_time ? `${t.due_time.substring(0, 5)} ` : "";
         const rInfo = (t.reschedule_count || 0) > 0 ? ` (x${t.reschedule_count})` : "";
-        text += `${i + 1}\\. ${p} ${time}${escapeMarkdown(t.title)}${ctx}${src}${rInfo}\n`;
+        text += `${i + 1}. ${p} ${time}${t.title}${ctx}${src}${rInfo}\n`;
       });
     }
 
@@ -2067,7 +2068,7 @@ async function handleTomorrowPlan(chatId: number): Promise<void> {
       { text: "🔙 Menu", callback_data: "menu_main" },
     ]);
 
-    await sendTelegramMessage(chatId, text, "MarkdownV2", { inline_keyboard: buttons });
+    await sendTelegramMessage(chatId, text, "Markdown", { inline_keyboard: buttons });
 
     // Store the plan
     const taskIds = allSuggested.map((t: any) => t.id);
@@ -2131,31 +2132,19 @@ async function handleTasksMainV2(chatId: number): Promise<void> {
       });
     });
 
-    // New sub-menu buttons
+    // Sub-menu buttons (simplified)
     buttons.push([
       { text: "📥 Inbox", callback_data: "menu_inbox" },
-      { text: "📅 Planifier", callback_data: "tasks_schedule" },
+      { text: "🍅 Pomodoro", callback_data: "menu_pomodoro" },
       { text: "✓ Terminées", callback_data: "tasks_completed" },
     ]);
-    buttons.push([
-      { text: "🍅 Pomodoro", callback_data: "menu_pomodoro" },
-      { text: "📊 Vélocité", callback_data: "menu_velocity" },
-    ]);
-    buttons.push([
-      { text: "🔄 Récurrentes", callback_data: "menu_recurring" },
-      { text: "🎯 Sprint", callback_data: "menu_sprint" },
-    ]);
-
-    // Context filter buttons
     buttons.push([
       { text: "💼", callback_data: "ctx_work" },
       { text: "🏠", callback_data: "ctx_home" },
       { text: "🛒", callback_data: "ctx_errands" },
       { text: "🏋️", callback_data: "ctx_health" },
-      { text: "📚", callback_data: "ctx_learning" },
+      { text: "🔙 Menu", callback_data: "menu_main" },
     ]);
-
-    buttons.push([{ text: "🔙 Menu", callback_data: "menu_main" }]);
 
     await sendTelegramMessage(chatId, text, "Markdown", { inline_keyboard: buttons });
   } catch (e) {
@@ -2247,8 +2236,7 @@ async function handleBudgetMain(chatId: number): Promise<void> {
 
     await sendTelegramMessage(chatId, text, "Markdown", {
       inline_keyboard: [
-        [{ text: "📊 Analyse", callback_data: "budget_analyse" }, { text: "📈 Tendances", callback_data: "budget_trends" }],
-        [{ text: "➕ Dépense", callback_data: "budget_add_expense" }, { text: "➕ Revenu", callback_data: "budget_add_income" }],
+        [{ text: "📊 Analyse IA", callback_data: "budget_analyse" }, { text: "➕ Dépense", callback_data: "budget_add_expense" }],
         [{ text: "🔙 Menu", callback_data: "menu_main" }],
       ],
     });
@@ -2303,8 +2291,8 @@ async function handleBudgetAnalyse(chatId: number): Promise<void> {
 
     await sendTelegramMessage(chatId, text, "Markdown", {
       inline_keyboard: [
-        [{ text: "📈 Tendances", callback_data: "budget_trends" }],
-        [{ text: "💰 Budget", callback_data: "menu_budget" }, { text: "🔙 Menu", callback_data: "menu_main" }],
+        [{ text: "📈 vs mois dernier", callback_data: "budget_trends" }, { text: "💰 Budget", callback_data: "menu_budget" }],
+        [{ text: "🔙 Menu", callback_data: "menu_main" }],
       ],
     });
   } catch (e) {
@@ -2419,8 +2407,7 @@ async function handleHealthMain(chatId: number): Promise<void> {
 
     await sendTelegramMessage(chatId, text, "Markdown", {
       inline_keyboard: [
-        [{ text: "🍽 Repas", callback_data: "health_meals" }, { text: "💪 Workout", callback_data: "health_workout" }],
-        [{ text: "📋 Programme", callback_data: "health_program" }],
+        [{ text: "💪 Workout", callback_data: "health_workout" }, { text: "🍽 Repas", callback_data: "health_meals" }],
         [{ text: "🔙 Menu", callback_data: "menu_main" }],
       ],
     });
@@ -2500,28 +2487,17 @@ async function handleHealthWorkout(chatId: number): Promise<void> {
       `• Sommeil priorité`,
   };
 
-  const text = EXERCISES[ws.type] || `Workout: ${ws.type}`;
-  await sendTelegramMessage(chatId, text, "Markdown", {
-    inline_keyboard: [[{ text: "🏋️ Santé", callback_data: "menu_health" }, { text: "🔙 Menu", callback_data: "menu_main" }]],
-  });
-}
-
-// --- HEALTH PROGRAM (weekly view) ---
-async function handleHealthProgram(chatId: number): Promise<void> {
+  // Append weekly programme summary
   const dayLabels = ["Dim", "Lun", "Mar", "Mer", "Jeu", "Ven", "Sam"];
-  const now = getIsraelNow();
-  const today = now.getDay();
-
-  let text = `*📋 PROGRAMME SEMAINE*\n\n`;
+  const todayIdx = getIsraelNow().getDay();
+  let fullText = (EXERCISES[ws.type] || `Workout: ${ws.type}`) + `\n\n*📋 SEMAINE:*\n`;
   for (let i = 0; i < 7; i++) {
-    const ws = WORKOUT_SCHEDULE_BOT[i];
-    const marker = i === today ? "👉 " : "   ";
-    const name = ws.type.charAt(0).toUpperCase() + ws.type.slice(1);
-    text += `${marker}${dayLabels[i]}  *${name}*  ${ws.time}\n`;
+    const w = WORKOUT_SCHEDULE_BOT[i];
+    const marker = i === todayIdx ? "👉" : "  ";
+    fullText += `${marker} ${dayLabels[i]} ${w.type.charAt(0).toUpperCase() + w.type.slice(1)} ${w.time}\n`;
   }
-  text += `\nJeûne 16:8 — Fenêtre 12h-20h`;
 
-  await sendTelegramMessage(chatId, text, "Markdown", {
+  await sendTelegramMessage(chatId, fullText, "Markdown", {
     inline_keyboard: [[{ text: "🏋️ Santé", callback_data: "menu_health" }, { text: "🔙 Menu", callback_data: "menu_main" }]],
   });
 }
@@ -2605,9 +2581,8 @@ async function handleMorningBriefing(chatId: number): Promise<void> {
 
     await sendTelegramMessage(chatId, text, "Markdown", {
       inline_keyboard: [
-        [{ text: "💪 Mon Sport", callback_data: "morning_sport" }, { text: "🍽 Ma Nutrition", callback_data: "morning_nutrition" }],
-        [{ text: "📋 Toutes mes tâches", callback_data: "menu_tasks" }, { text: "💼 Offres", callback_data: "menu_jobs" }],
-        [{ text: "📌 Menu complet", callback_data: "menu_main" }],
+        [{ text: "💪 Workout", callback_data: "health_workout" }, { text: "📋 Tasks", callback_data: "menu_tasks" }],
+        [{ text: "🔙 Menu", callback_data: "menu_main" }],
       ],
     });
   } catch (e) {
@@ -2749,21 +2724,25 @@ async function handleMorningNutrition(chatId: number): Promise<void> {
 async function handleCareerMain(chatId: number): Promise<void> {
   const supabase = getSupabaseClient();
   try {
-    const { data: jobs } = await supabase.from("job_listings").select("status")
-      .in("status", ["new", "saved", "applied", "interviewed", "offer", "rejected"]);
-    const all = jobs || [];
+    const fiveDaysAgo = new Date(Date.now() - 5 * 86400000).toISOString().split("T")[0];
+    const [jobsRes, goalRes, staleRes] = await Promise.all([
+      supabase.from("job_listings").select("status")
+        .in("status", ["new", "saved", "applied", "interviewed", "offer", "rejected"]).limit(500),
+      supabase.from("goals").select("deadline")
+        .eq("domain", "career").eq("status", "active").limit(1),
+      supabase.from("job_listings").select("title, company")
+        .eq("status", "applied").lte("applied_date", fiveDaysAgo).limit(3),
+    ]);
+    const all = jobsRes.data || [];
+    const stale = staleRes.data || [];
 
     const newCount = all.filter((j: any) => j.status === "new" || j.status === "saved").length;
     const applied = all.filter((j: any) => j.status === "applied").length;
     const interviews = all.filter((j: any) => j.status === "interviewed").length;
     const offers = all.filter((j: any) => j.status === "offer").length;
 
-    // Deadline from goals
-    const { data: careerGoal } = await supabase.from("goals").select("deadline")
-      .eq("domain", "career").eq("status", "active").limit(1);
-    const deadline = careerGoal?.[0]?.deadline;
+    const deadline = goalRes.data?.[0]?.deadline;
     const daysLeft = deadline ? Math.ceil((new Date(deadline).getTime() - Date.now()) / 86400000) : null;
-
     const urgency = interviews === 0 && daysLeft !== null && daysLeft < 120 ? "🔴" : interviews > 0 ? "🟢" : "🟡";
 
     let text = `💼 *CARRIÈRE*\n\n`;
@@ -2773,13 +2752,17 @@ async function handleCareerMain(chatId: number): Promise<void> {
     text += `  🎯 ${interviews} interviews · ✅ ${offers} offres\n`;
 
     if (interviews === 0 && daysLeft !== null && daysLeft < 120) {
-      text += `\n⚠️ *0 interviews planifiées — action requise*`;
+      text += `\n⚠️ *0 interviews — action requise*`;
+    }
+
+    if (stale.length > 0) {
+      text += `\n\n*📞 À relancer (>5j):*\n`;
+      stale.forEach((j: any) => { text += `  ${j.title} @ ${j.company}\n`; });
     }
 
     await sendTelegramMessage(chatId, text, "Markdown", {
       inline_keyboard: [
-        [{ text: "📋 Offres détail", callback_data: "career_pipeline" }, { text: "📅 Actions", callback_data: "career_actions" }],
-        [{ text: "➕ Ajouter offre", callback_data: "career_add_job" }],
+        [{ text: "📋 Pipeline", callback_data: "career_pipeline" }, { text: "➕ Offre", callback_data: "career_add_job" }],
         [{ text: "🔙 Menu", callback_data: "menu_main" }],
       ],
     });
@@ -2915,9 +2898,26 @@ async function handleHigrowFollowup(chatId: number): Promise<void> {
 async function handleCallbackQuery(callbackId: string, chatId: number, data: string): Promise<void> {
   const supabase = getSupabaseClient();
 
+  // === AGENTIC BUTTONS ===
+  if (data === "morning_agentic") {
+    await answerCallbackQuery(callbackId, "☀️ Briefing en cours...");
+    await handleMorningAgentic(chatId);
+    return;
+  } else if (data === "agent_status") {
+    await answerCallbackQuery(callbackId);
+    await handleAgentStatus(chatId);
+    return;
+  } else if (data === "review_agentic") {
+    await answerCallbackQuery(callbackId, "🌙 Review en cours...");
+    await handleReviewAgentic(chatId);
+    return;
+  }
+
   // === MAIN MENU BUTTONS ===
-  if (data === "menu_main") {
+  else if (data === "menu_main") {
     await sendTelegramMessage(chatId, "📌 *OREN*", "Markdown", MAIN_MENU);
+  } else if (data === "dashboard") {
+    await handleDashboard(chatId);
   } else if (data === "menu_tasks") {
     await handleTasksMainV2(chatId);
   } else if (data === "menu_budget") {
@@ -2935,6 +2935,19 @@ async function handleCallbackQuery(callbackId: string, chatId: number, data: str
   } else if (data === "menu_goals") {
     await handleGoals(chatId);
   }
+  // === DASHBOARD SUB-MENU (Insights + Goals + Vélocité) ===
+  else if (data === "menu_dashboard") {
+    await handleDashboard(chatId);
+  }
+  // === EOS SUB-MENU (Rocks + Scorecard + CIRs) ===
+  else if (data === "menu_eos") {
+    await sendTelegramMessage(chatId, "🎯 *EOS — Chief of Staff*", "Markdown", {
+      inline_keyboard: [
+        [{ text: "🪨 Rocks", callback_data: "menu_rocks" }, { text: "📊 Scorecard", callback_data: "menu_scorecard" }, { text: "🚨 CIRs", callback_data: "menu_cirs" }],
+        [{ text: "🔙 Menu", callback_data: "menu_main" }],
+      ],
+    });
+  }
   // === TASKS SUB-MENU ===
   else if (data === "tasks_completed") {
     await handleTasksCompleted(chatId);
@@ -2942,6 +2955,98 @@ async function handleCallbackQuery(callbackId: string, chatId: number, data: str
     await sendTelegramMessage(chatId, "Dis-moi ta tâche en message.\nEx: _Appeler le comptable demain 14h_", "Markdown");
   } else if (data === "tasks_schedule") {
     await sendTelegramMessage(chatId, "Format: /mission titre heure [durée]\nEx: _Rdv dentiste 14:00 60_", "Markdown");
+  }
+  // === CLEANUP CALLBACK ===
+  // === SMART TRIAGE CALLBACKS ===
+  // --- Per-category page: tricat_{cat}_{page} ---
+  else if (data.startsWith("tricat_")) {
+    const parts = data.replace("tricat_", "").split("_");
+    const cat = parts.slice(0, -1).join("_"); // handle multi-word cats
+    const page = parseInt(parts[parts.length - 1]) || 0;
+    await handleTriagePage(chatId, cat, page);
+  }
+  // --- Individual task done: trid_{taskId} ---
+  else if (data.startsWith("trid_")) {
+    try {
+      const taskId = data.replace("trid_", "");
+      const now = new Date().toISOString();
+      const { data: task } = await supabase.from("tasks").select("title").eq("id", taskId).single();
+      await supabase.from("tasks").update({ status: "completed", completed_at: now, updated_at: now }).eq("id", taskId);
+      const title = task?.title || "Tâche";
+      await sendTelegramMessage(chatId, `✅ *${title.substring(0, 50)}* — fait !`, "Markdown", {
+        inline_keyboard: [[{ text: "🧹 Continuer le tri", callback_data: "cleanup" }, { text: "🔙 Menu", callback_data: "menu_main" }]],
+      });
+    } catch (e) {
+      await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 100)}`);
+    }
+  }
+  // --- Individual task archive: trix_{taskId} ---
+  else if (data.startsWith("trix_")) {
+    try {
+      const taskId = data.replace("trix_", "");
+      const now = new Date().toISOString();
+      const { data: task } = await supabase.from("tasks").select("title").eq("id", taskId).single();
+      await supabase.from("tasks").update({ status: "cancelled", updated_at: now }).eq("id", taskId);
+      const title = task?.title || "Tâche";
+      await sendTelegramMessage(chatId, `🗑 *${title.substring(0, 50)}* — archivée`, "Markdown", {
+        inline_keyboard: [[{ text: "🧹 Continuer le tri", callback_data: "cleanup" }, { text: "🔙 Menu", callback_data: "menu_main" }]],
+      });
+    } catch (e) {
+      await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 100)}`);
+    }
+  }
+  // --- Bulk done/cancel by category: tri_done_{cat} / tri_cancel_{cat} ---
+  else if (data.startsWith("tri_done_") || data.startsWith("tri_cancel_")) {
+    try {
+      const isDone = data.startsWith("tri_done_");
+      const cat = data.replace(isDone ? "tri_done_" : "tri_cancel_", "");
+      const today = todayStr();
+      const now = new Date().toISOString();
+
+      const { data: overdue } = await supabase.from("tasks")
+        .select("id, title, priority, context")
+        .in("status", ["pending", "in_progress"])
+        .lt("due_date", today)
+        .limit(200);
+
+      if (!overdue || overdue.length === 0) {
+        await sendTelegramMessage(chatId, "✅ Aucune tâche en retard.");
+        return;
+      }
+
+      const toUpdate = cat === "all"
+        ? overdue.map((t: any) => t.id)
+        : overdue.filter((t: any) => triageCategory(t) === cat).map((t: any) => t.id);
+
+      if (toUpdate.length === 0) {
+        await sendTelegramMessage(chatId, "✅ Catégorie déjà vide.");
+        return;
+      }
+
+      const updateData: any = { status: isDone ? "completed" : "cancelled", updated_at: now };
+      if (isDone) updateData.completed_at = now;
+
+      await supabase.from("tasks").update(updateData).in("id", toUpdate);
+
+      const remaining = overdue.length - toUpdate.length;
+      const icon = isDone ? "✅" : "🗑";
+      const action = isDone ? "marquées faites" : "archivées";
+      let msg = `${icon} *${toUpdate.length} tâches ${action}*`;
+      if (isDone) msg += `\n+${toUpdate.length} au compteur !`;
+      if (remaining > 0) msg += `\n\n${remaining} tâches restantes en retard.`;
+      else msg += `\n\n🎉 Plus aucune tâche en retard !`;
+
+      await sendTelegramMessage(chatId, msg, "Markdown", {
+        inline_keyboard: remaining > 0
+          ? [[{ text: "🧹 Continuer le tri", callback_data: "cleanup" }, { text: "🔙 Menu", callback_data: "menu_main" }]]
+          : [[{ text: "📋 Mes tâches", callback_data: "menu_tasks" }, { text: "🔙 Menu", callback_data: "menu_main" }]],
+      });
+    } catch (e) {
+      await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 100)}`);
+    }
+  }
+  else if (data === "cleanup" || data.startsWith("cleanup_archive_")) {
+    await handleCleanup(chatId);
   }
   // === TASK MANAGEMENT V2 CALLBACKS ===
   // --- Inbox ---
@@ -3169,6 +3274,20 @@ async function handleCallbackQuery(callbackId: string, chatId: number, data: str
       await sendTelegramMessage(chatId, `✅ Plan validé pour ${date} !\nBonne soirée, demain sera productif 💪`);
     } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
   }
+  // --- Task context assignment ---
+  else if (data.startsWith("task_setctx_")) {
+    const parts = data.replace("task_setctx_", "").split("_");
+    const taskId = parts[0];
+    const context = parts[1];
+    try {
+      if (context === "none") {
+        await sendTelegramMessage(chatId, `👌 Tâche sans contexte.`);
+      } else {
+        await supabase.from("tasks").update({ context }).eq("id", taskId);
+        await sendTelegramMessage(chatId, `${CONTEXT_EMOJI[context] || "🏷"} Contexte: *${context}*`, "Markdown");
+      }
+    } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
+  }
   // --- Context filters ---
   else if (data.startsWith("ctx_")) {
     const context = data.replace("ctx_", "");
@@ -3208,6 +3327,68 @@ async function handleCallbackQuery(callbackId: string, chatId: number, data: str
   } else if (data === "career_add_job") {
     await sendTelegramMessage(chatId, "Format: /job url [titre]\nEx: _/job https://linkedin.com/jobs/view/123 AE Wiz_", "Markdown");
   }
+  // ─── 1-CLICK APPLY FLOW ───
+  else if (data.startsWith("job_applied_")) {
+    const jobId = data.replace("job_applied_", "");
+    try {
+      await supabase.from("job_listings").update({
+        status: "applied",
+        applied_date: todayStr(),
+      }).eq("id", jobId);
+      const { data: job } = await supabase.from("job_listings")
+        .select("title, company").eq("id", jobId).single();
+      if (job) {
+        await sendTelegramMessage(chatId, `✅ *${escapeMarkdown(job.title)}* @ ${escapeMarkdown(job.company)} — Marqué comme postulé !`, "Markdown");
+      }
+    } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
+  }
+  else if (data.startsWith("job_skip_")) {
+    const jobId = data.replace("job_skip_", "");
+    try {
+      await supabase.from("job_listings").update({ status: "rejected", notes: "Skipped from daily recommendations" }).eq("id", jobId);
+      await sendTelegramMessage(chatId, `⏭ Offre ignorée.`);
+    } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
+  }
+  else if (data.startsWith("job_cover_")) {
+    const jobId = data.replace("job_cover_", "");
+    try {
+      const { data: job } = await supabase.from("job_listings")
+        .select("title, company, location, cover_letter_snippet, job_url").eq("id", jobId).single();
+      if (!job) { await sendTelegramMessage(chatId, "Offre introuvable."); }
+      else {
+        // Generate full cover letter with callOpenAI
+        const OPENAI_KEY = Deno.env.get("OPENAI_API_KEY") || "";
+        const coverPrompt = `Tu es expert en candidature AE/SDR tech/SaaS. Oren est Account Executive bilingue FR/EN basé en Israël, avec expérience en vente B2B SaaS. Génère une lettre de motivation percutante et personnalisée (10-12 lignes) pour ce poste. Style: direct, orienté résultats, avec des métriques concrètes. Finis par un call-to-action fort.`;
+        const coverContent = `Poste: ${job.title} chez ${job.company} (${job.location || ""})`;
+
+        const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${OPENAI_KEY}` },
+          body: JSON.stringify({
+            model: "gpt-4o-mini",
+            messages: [
+              { role: "system", content: coverPrompt },
+              { role: "user", content: coverContent },
+            ],
+            max_tokens: 500,
+          }),
+        });
+        const json = await resp.json();
+        const letter = json?.choices?.[0]?.message?.content || "Erreur de génération.";
+
+        let msg = `📝 *LETTRE DE MOTIVATION*\n`;
+        msg += `${escapeMarkdown(job.title)} @ ${escapeMarkdown(job.company)}\n━━━━━━━━━━━━━━━━━━━━\n\n`;
+        msg += escapeMarkdown(letter);
+
+        await sendTelegramMessage(chatId, msg, "Markdown", [
+          [{ text: `✅ Postulé ${job.company.substring(0, 15)}`, callback_data: `job_applied_${jobId}` }],
+        ]);
+
+        // Cache for future use
+        await supabase.from("job_listings").update({ cover_letter_snippet: letter.substring(0, 500) }).eq("id", jobId);
+      }
+    } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 100)}`); }
+  }
   // === HIGROW SUB-MENU ===
   else if (data === "higrow_followup") {
     await handleHigrowFollowup(chatId);
@@ -3238,15 +3419,73 @@ async function handleCallbackQuery(callbackId: string, chatId: number, data: str
     try {
       const { error } = await supabase.from("tasks").update({ status: "completed", completed_at: new Date().toISOString() }).eq("id", taskId);
       if (error) throw error;
-      await sendTelegramMessage(chatId, `✓ Tache terminee`);
+
       // Spawn next recurrence if applicable
+      let fullTask: any = null;
       try {
-        const { data: fullTask } = await supabase.from("tasks").select("*").eq("id", taskId).single();
-        if (fullTask?.recurrence_rule) await spawnNextRecurrence(supabase, fullTask);
+        const { data: ft } = await supabase.from("tasks").select("*").eq("id", taskId).single();
+        fullTask = ft;
+        if (ft?.recurrence_rule) await spawnNextRecurrence(supabase, ft);
       } catch (_) {}
+
+      // Micro-feedback: 20% chance (or always for tasks with duration estimate)
+      const showFeedback = fullTask?.duration_minutes || Math.random() < 0.2;
+      if (showFeedback) {
+        const shortId = taskId.substring(0, 8);
+        await sendTelegramMessage(chatId, `✅ *Fait !* Ça a pris combien de temps ?`, "Markdown", {
+          inline_keyboard: [
+            [
+              { text: "⚡ 15min", callback_data: `fb_dur_${taskId}_15` },
+              { text: "⏱ 30min", callback_data: `fb_dur_${taskId}_30` },
+              { text: "🕐 1h", callback_data: `fb_dur_${taskId}_60` },
+              { text: "🕑 +1h", callback_data: `fb_dur_${taskId}_90` },
+            ],
+            [{ text: "⏭ Passer", callback_data: "fb_skip" }],
+          ],
+        });
+      } else {
+        await sendTelegramMessage(chatId, `✓ Tache terminee`);
+      }
     } catch (e) {
       await sendTelegramMessage(chatId, `error: ${String(e).substring(0, 50)}`);
     }
+  }
+  // Micro-feedback: duration response
+  else if (data.startsWith("fb_dur_")) {
+    try {
+      const parts = data.replace("fb_dur_", "").split("_");
+      const dur = parseInt(parts.pop()!, 10);
+      const taskId = parts.join("_");
+      await supabase.from("task_feedback").insert({ task_id: taskId, actual_duration_minutes: dur });
+      await sendTelegramMessage(chatId, `👍 Noté ! C'était:`, "Markdown", {
+        inline_keyboard: [
+          [
+            { text: "😎 Facile", callback_data: `fb_diff_${taskId}_easy` },
+            { text: "👌 Normal", callback_data: `fb_diff_${taskId}_normal` },
+            { text: "😤 Dur", callback_data: `fb_diff_${taskId}_hard` },
+          ],
+          [{ text: "⏭ Passer", callback_data: "fb_skip" }],
+        ],
+      });
+    } catch (_) {
+      await sendTelegramMessage(chatId, `✓ Noté`);
+    }
+  }
+  // Micro-feedback: difficulty response
+  else if (data.startsWith("fb_diff_")) {
+    try {
+      const parts = data.replace("fb_diff_", "").split("_");
+      const difficulty = parts.pop()!;
+      const taskId = parts.join("_");
+      await supabase.from("task_feedback").update({ difficulty }).eq("task_id", taskId);
+      await sendTelegramMessage(chatId, `📊 Merci ! Ces données améliorent mes prédictions.`);
+    } catch (_) {
+      await sendTelegramMessage(chatId, `✓`);
+    }
+  }
+  // Micro-feedback: skip
+  else if (data === "fb_skip") {
+    await sendTelegramMessage(chatId, `✓ Tache terminee`);
   }
   // Mission at specific time
   else if (data.startsWith("mission_at_")) {
@@ -3494,6 +3733,58 @@ async function handleCallbackQuery(callbackId: string, chatId: number, data: str
       }
     } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
   }
+  // ─── FAIL REASON CALLBACKS ───
+  // When user explains WHY a task wasn't done: fail_{reason}_{taskId}
+  else if (data.startsWith("fail_")) {
+    const parts = data.replace("fail_", "").split("_");
+    const reason = parts[0]; // blocked, forgot, toobig, energy, other
+    const taskId = parts.slice(1).join("_");
+
+    const REASON_LABELS: Record<string, string> = {
+      blocked: "🚧 Bloqué (dépendance externe)",
+      forgot: "🧠 Oublié",
+      toobig: "🏔 Trop grosse tâche",
+      energy: "🔋 Pas d'énergie",
+      skip: "⏭ Pas prioritaire",
+    };
+
+    try {
+      const label = REASON_LABELS[reason] || reason;
+
+      // Save to task_fail_reasons
+      await supabase.from("task_fail_reasons").insert({
+        task_id: taskId,
+        reason,
+        task_date: todayStr(),
+      });
+
+      // Update task with fail_reason and increment fail_count
+      const { data: taskData } = await supabase.from("tasks")
+        .select("title, fail_count").eq("id", taskId).single();
+
+      if (taskData) {
+        await supabase.from("tasks").update({
+          fail_reason: reason,
+          fail_count: (taskData.fail_count || 0) + 1,
+        }).eq("id", taskId);
+
+        let response = `📝 Noté: ${label}\n`;
+
+        // Smart follow-up based on reason
+        if (reason === "toobig") {
+          response += `\n💡 Essaie de la découper: /subtask ${taskId.substring(0, 8)} <sous-tâche>`;
+        } else if (reason === "blocked") {
+          response += `\nQui/quoi te bloque ? Tape ta réponse et je noterai.`;
+        } else if (reason === "energy") {
+          response += `\n💡 Je la déplacerai à un moment où tu as plus d'énergie.`;
+        }
+
+        await sendTelegramMessage(chatId, response);
+      } else {
+        await sendTelegramMessage(chatId, `Tâche introuvable.`);
+      }
+    } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
+  }
   // ─── TUTORIAL PAGES ───
   else if (data.startsWith("tuto_")) {
     const page = TUTO_PAGES[data];
@@ -3511,6 +3802,78 @@ async function handleCallbackQuery(callbackId: string, chatId: number, data: str
         await signals.emit("focus_mode_ended", "Focus mode désactivé via bouton", {}, { target: "task-reminder", priority: 2, ttlHours: 1 });
       }
       await sendTelegramMessage(chatId, `🔔 *Focus mode désactivé*\nLes notifications reprennent.`, "Markdown");
+    } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
+  }
+  // === ROCKS CALLBACKS ===
+  else if (data === "menu_rocks") {
+    await handleRock(chatId, []);
+  }
+  else if (data.startsWith("rock_done_")) {
+    const rockId = data.replace("rock_done_", "");
+    try {
+      await supabase.from("rocks").update({
+        current_status: "done", completed_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+      }).eq("id", rockId);
+      await sendTelegramMessage(chatId, `✅ Rock marqué comme *DONE* !`, "Markdown");
+    } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
+  }
+  else if (data.startsWith("rock_off_")) {
+    const rockId = data.replace("rock_off_", "");
+    try {
+      await supabase.from("rocks").update({
+        current_status: "off_track", updated_at: new Date().toISOString(),
+      }).eq("id", rockId);
+      await sendTelegramMessage(chatId, `⚠️ Rock marqué *OFF TRACK*`, "Markdown");
+    } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
+  }
+  else if (data.startsWith("rock_on_")) {
+    const rockId = data.replace("rock_on_", "");
+    try {
+      await supabase.from("rocks").update({
+        current_status: "on_track", updated_at: new Date().toISOString(),
+      }).eq("id", rockId);
+      await sendTelegramMessage(chatId, `✅ Rock marqué *ON TRACK*`, "Markdown");
+    } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
+  }
+  // === SCORECARD CALLBACK ===
+  else if (data === "menu_scorecard") {
+    await handleScorecard(chatId);
+  }
+  // === GOAL UPDATE CALLBACKS ===
+  else if (data.startsWith("goal_inc_")) {
+    const domain = data.replace("goal_inc_", "");
+    try {
+      const { data: goal } = await supabase.from("goals")
+        .select("id, metric_current, metric_target, metric_unit, direction, title")
+        .eq("domain", domain).eq("status", "active").limit(1).single();
+      if (goal) {
+        const current = Number(goal.metric_current) || 0;
+        const isDecrease = goal.direction === "decrease";
+        const newValue = isDecrease ? current - 1 : current + 1;
+        await supabase.from("goals").update({ metric_current: newValue }).eq("id", goal.id);
+        const arrow = isDecrease ? "↓" : "↑";
+        await sendTelegramMessage(chatId, `✅ ${goal.title}: ${current} → ${newValue}${goal.metric_unit || ""} ${arrow}`);
+        // Refresh goals view
+        await handleGoals(chatId);
+      } else {
+        await sendTelegramMessage(chatId, `Aucun objectif actif pour ${domain}`);
+      }
+    } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
+  }
+  // === CIR CALLBACKS ===
+  else if (data === "menu_cirs") {
+    await handleCIR(chatId, []);
+  }
+  else if (data.startsWith("cir_toggle_")) {
+    const cirId = data.replace("cir_toggle_", "");
+    try {
+      const { data: cir } = await supabase.from("critical_info_requirements")
+        .select("active").eq("id", cirId).single();
+      if (cir) {
+        await supabase.from("critical_info_requirements")
+          .update({ active: !cir.active }).eq("id", cirId);
+        await sendTelegramMessage(chatId, cir.active ? `🔕 CIR désactivé` : `🔔 CIR activé`);
+      }
     } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
   }
   else if (data.startsWith("focus_extend_")) {
@@ -3540,6 +3903,235 @@ async function handleCallbackQuery(callbackId: string, chatId: number, data: str
   }
 
   await answerCallbackQuery(callbackId);
+}
+
+// ============================================
+// TIER 5 — ROCKS, SCORECARD, CIR HANDLERS
+// ============================================
+
+async function handleRock(chatId: number, args: string[]): Promise<void> {
+  const supabase = getSupabaseClient();
+
+  // /rock add "title" domain
+  if (args[0] === "add" && args.length >= 3) {
+    const domain = args[args.length - 1];
+    const title = args.slice(1, -1).join(" ").replace(/"/g, "");
+    const now = new Date();
+    // Quarter: current 90-day window
+    const quarterStart = new Date(now.getFullYear(), Math.floor(now.getMonth() / 3) * 3, 1);
+    const quarterEnd = new Date(quarterStart.getFullYear(), quarterStart.getMonth() + 3, 0);
+
+    const { error } = await supabase.from("rocks").insert({
+      title,
+      domain,
+      measurable_target: title,
+      quarter_start: quarterStart.toISOString().split("T")[0],
+      quarter_end: quarterEnd.toISOString().split("T")[0],
+    });
+
+    if (error) {
+      await sendTelegramMessage(chatId, `Erreur: ${error.message}`);
+    } else {
+      await sendTelegramMessage(chatId,
+        `🪨 *Rock ajouté !*\n\n${escapeMarkdown(title)}\nDomaine: ${domain}\nTrimestre: ${quarterStart.toISOString().split("T")[0]} → ${quarterEnd.toISOString().split("T")[0]}`,
+        "Markdown");
+    }
+    return;
+  }
+
+  // /rock update <id_prefix> done|off_track|on_track
+  if (args[0] === "update" && args.length >= 3) {
+    const idPrefix = args[1];
+    const newStatus = args[2];
+    if (!["done", "off_track", "on_track"].includes(newStatus)) {
+      await sendTelegramMessage(chatId, "Status: done | off\\_track | on\\_track", "Markdown");
+      return;
+    }
+
+    const { data: rocks } = await supabase.from("rocks")
+      .select("id").in("current_status", ["on_track", "off_track"])
+      .order("created_at", { ascending: false }).limit(10);
+    const rock = (rocks || []).find((r: any) => r.id.startsWith(idPrefix));
+
+    if (!rock) {
+      await sendTelegramMessage(chatId, `Rock introuvable.`);
+      return;
+    }
+
+    await supabase.from("rocks").update({
+      current_status: newStatus,
+      updated_at: new Date().toISOString(),
+      ...(newStatus === "done" ? { completed_at: new Date().toISOString() } : {}),
+    }).eq("id", rock.id);
+
+    const statusEmoji = newStatus === "done" ? "✅" : newStatus === "off_track" ? "⚠️" : "🟢";
+    await sendTelegramMessage(chatId, `${statusEmoji} Rock mis à jour: *${newStatus}*`, "Markdown");
+    return;
+  }
+
+  // Default: /rock list
+  const { data: rocks } = await supabase.from("rocks")
+    .select("*")
+    .in("current_status", ["on_track", "off_track"])
+    .order("created_at", { ascending: true });
+
+  if (!rocks || rocks.length === 0) {
+    await sendTelegramMessage(chatId,
+      `🪨 *ROCKS* — Aucun Rock actif\n\nAjoute un Rock:\n/rock add "Obtenir 3 interviews" career\n\nDomaines: career, health, finance, learning, higrow`,
+      "Markdown");
+    return;
+  }
+
+  const now = new Date();
+  let msg = `🪨 *ROCKS — Q${Math.floor(now.getMonth() / 3) + 1} ${now.getFullYear()}*\n━━━━━━━━━━━━━━━━━━━━\n\n`;
+  const buttons: any[][] = [];
+
+  for (const r of rocks) {
+    const daysLeft = Math.ceil((new Date(r.quarter_end).getTime() - now.getTime()) / 86400000);
+    const statusIcon = r.current_status === "on_track" ? "🟢" : "⚠️";
+    const domainEmoji = { career: "💼", health: "🏋️", finance: "💰", learning: "📚", higrow: "🚀" }[r.domain] || "📌";
+
+    msg += `${statusIcon} ${domainEmoji} *${escapeMarkdown(r.title)}*\n`;
+    msg += `   J-${daysLeft} · ${r.current_status.replace("_", " ")}\n\n`;
+
+    const shortId = r.id.substring(0, 8);
+    buttons.push([
+      { text: `✅ Done ${shortId}`, callback_data: `rock_done_${r.id}` },
+      { text: `⚠️ Off`, callback_data: `rock_off_${r.id}` },
+      { text: `🟢 On`, callback_data: `rock_on_${r.id}` },
+    ]);
+  }
+
+  msg += `\n/rock add "titre" domaine — Ajouter\n/rock update <id> done|off\\_track — Modifier`;
+
+  await sendTelegramMessage(chatId, msg, "Markdown", { inline_keyboard: buttons });
+}
+
+async function handleScorecard(chatId: number): Promise<void> {
+  const supabase = getSupabaseClient();
+
+  // Calculate week dates (Sunday to Saturday)
+  const now = new Date();
+  const dayOfWeek = now.getDay();
+  const weekStartDate = new Date(now);
+  weekStartDate.setDate(now.getDate() - dayOfWeek);
+  const weekEndDate = new Date(weekStartDate);
+  weekEndDate.setDate(weekStartDate.getDate() + 6);
+
+  const weekStart = `${weekStartDate.getFullYear()}-${String(weekStartDate.getMonth() + 1).padStart(2, "0")}-${String(weekStartDate.getDate()).padStart(2, "0")}`;
+  const weekEnd = `${weekEndDate.getFullYear()}-${String(weekEndDate.getMonth() + 1).padStart(2, "0")}-${String(weekEndDate.getDate()).padStart(2, "0")}`;
+
+  // Fetch all data in parallel for scorecard
+  const [
+    jobAppsRes, jobInterviewsRes, leadsRes, leadsConvertedRes,
+    tasksRes, tasksDoneRes, workoutsRes, studyRes,
+    financeExpRes, financeIncRes, healthWeightRes,
+  ] = await Promise.all([
+    supabase.from("job_listings").select("id").eq("status", "applied").gte("applied_date", weekStart).lte("applied_date", weekEnd),
+    supabase.from("job_listings").select("id").eq("status", "interview"),
+    supabase.from("leads").select("id").gte("last_contact_date", weekStart + "T00:00:00").lte("last_contact_date", weekEnd + "T23:59:59"),
+    supabase.from("leads").select("id").eq("status", "converted"),
+    supabase.from("tasks").select("id, status").gte("due_date", weekStart).lte("due_date", weekEnd),
+    supabase.from("tasks").select("id").eq("status", "completed").gte("updated_at", weekStart + "T00:00:00"),
+    supabase.from("health_logs").select("log_date").eq("log_type", "workout").gte("log_date", weekStart).lte("log_date", weekEnd),
+    supabase.from("study_sessions").select("duration_minutes").gte("session_date", weekStart).lte("session_date", weekEnd),
+    supabase.from("finance_logs").select("amount").eq("transaction_type", "expense").gte("transaction_date", weekStart).lte("transaction_date", weekEnd),
+    supabase.from("finance_logs").select("amount").eq("transaction_type", "income").gte("transaction_date", weekStart).lte("transaction_date", weekEnd),
+    supabase.from("health_logs").select("value").eq("log_type", "weight").order("log_date", { ascending: false }).limit(1),
+  ]);
+
+  const jobApps = jobAppsRes.data?.length || 0;
+  const jobInterviews = jobInterviewsRes.data?.length || 0;
+  const leadsContacted = leadsRes.data?.length || 0;
+  const leadsConverted = leadsConvertedRes.data?.length || 0;
+  const totalTasks = Math.max((tasksRes.data || []).length, 1);
+  const tasksDone = tasksDoneRes.data?.length || 0;
+  const completionRate = Math.round((tasksDone / totalTasks) * 100);
+  const workoutDays = new Set((workoutsRes.data || []).map((w: any) => w.log_date)).size;
+  const studyHours = ((studyRes.data || []).reduce((s: number, l: any) => s + (l.duration_minutes || 0), 0) / 60);
+  const totalExp = (financeExpRes.data || []).reduce((s: number, f: any) => s + Number(f.amount), 0);
+  const totalInc = (financeIncRes.data || []).reduce((s: number, f: any) => s + Number(f.amount), 0);
+  const savingsRate = totalInc > 0 ? Math.round(((totalInc - totalExp) / totalInc) * 100) : 0;
+  const latestWeight = healthWeightRes.data?.[0]?.value ? Number(healthWeightRes.data[0].value) : null;
+
+  function sc(actual: number, goal: number, dir: "up" | "down" = "up"): string {
+    if (dir === "down") return actual <= goal ? "🟢" : actual <= goal * 1.2 ? "🟡" : "🔴";
+    return actual >= goal ? "🟢" : actual >= goal * 0.7 ? "🟡" : "🔴";
+  }
+
+  let msg = `📊 *SCORECARD* — Semaine du ${weekStart.substring(5)}\n━━━━━━━━━━━━━━━━━━━━\n\n`;
+  msg += `💼 Candidatures     ${jobApps}     /5    ${sc(jobApps, 5)}\n`;
+  msg += `💼 Interviews       ${jobInterviews}     /1    ${sc(jobInterviews, 1)}\n`;
+  msg += `🚀 Leads contactés  ${leadsContacted}    /10   ${sc(leadsContacted, 10)}\n`;
+  msg += `🚀 Clients          ${leadsConverted}     /2    ${sc(leadsConverted, 2)}\n`;
+  msg += `📋 Complétion       ${completionRate}%   /80%  ${sc(completionRate, 80)}\n`;
+  msg += `🏋️ Workouts         ${workoutDays}     /5    ${sc(workoutDays, 5)}\n`;
+  msg += `📚 Étude            ${studyHours.toFixed(1)}h  /5h   ${sc(studyHours, 5)}\n`;
+  msg += `💰 Épargne          ${savingsRate}%   /20%  ${sc(savingsRate, 20)}\n`;
+  msg += `⚖️ Poids            ${latestWeight || "?"}   /70   ${latestWeight ? sc(latestWeight, 70, "down") : "🟡"}\n`;
+
+  const greens = [
+    sc(jobApps, 5), sc(jobInterviews, 1), sc(leadsContacted, 10), sc(leadsConverted, 2),
+    sc(completionRate, 80), sc(workoutDays, 5), sc(studyHours, 5), sc(savingsRate, 20),
+  ].filter(s => s === "🟢").length;
+  const reds = [
+    sc(jobApps, 5), sc(jobInterviews, 1), sc(leadsContacted, 10), sc(leadsConverted, 2),
+    sc(completionRate, 80), sc(workoutDays, 5), sc(studyHours, 5), sc(savingsRate, 20),
+  ].filter(s => s === "🔴").length;
+
+  msg += `\n${greens}/9 on track · ${reds} off track`;
+
+  await sendTelegramMessage(chatId, msg, "Markdown");
+}
+
+async function handleCIR(chatId: number, args: string[]): Promise<void> {
+  const supabase = getSupabaseClient();
+
+  // /cir add "title" condition_type
+  if (args[0] === "add" && args.length >= 3) {
+    const condType = args[args.length - 1];
+    const title = args.slice(1, -1).join(" ").replace(/"/g, "");
+
+    const { error } = await supabase.from("critical_info_requirements").insert({
+      title,
+      condition_type: condType,
+      condition_config: {},
+      alert_priority: 1,
+    });
+
+    if (error) {
+      await sendTelegramMessage(chatId, `Erreur: ${error.message}`);
+    } else {
+      await sendTelegramMessage(chatId, `🚨 CIR ajouté: *${escapeMarkdown(title)}*`, "Markdown");
+    }
+    return;
+  }
+
+  // Default: list CIRs
+  const { data: cirs } = await supabase.from("critical_info_requirements")
+    .select("*").order("alert_priority", { ascending: true });
+
+  if (!cirs || cirs.length === 0) {
+    await sendTelegramMessage(chatId, `🚨 *CIRs* — Aucun configuré\n\nLes CIRs définissent quelles alertes passent en temps réel.`, "Markdown");
+    return;
+  }
+
+  let msg = `🚨 *CRITICAL INFORMATION REQUIREMENTS*\n━━━━━━━━━━━━━━━━━━━━\n\n`;
+  const buttons: any[][] = [];
+
+  for (const cir of cirs) {
+    const activeIcon = cir.active ? "🔔" : "🔕";
+    const prioIcon = cir.alert_priority === 1 ? "🔴 Immédiat" : "🟡 Briefing";
+    msg += `${activeIcon} *${escapeMarkdown(cir.title)}*\n`;
+    msg += `   ${prioIcon} · ${cir.condition_type}\n\n`;
+
+    buttons.push([
+      { text: `${cir.active ? "🔕 Désactiver" : "🔔 Activer"} ${cir.title.substring(0, 20)}`, callback_data: `cir_toggle_${cir.id}` },
+    ]);
+  }
+
+  msg += `\nClique pour activer/désactiver.`;
+  await sendTelegramMessage(chatId, msg, "Markdown", { inline_keyboard: buttons });
 }
 
 // --- Job URL Manual Capture ---
@@ -3673,16 +4265,15 @@ async function handleTradingMain(chatId: number): Promise<void> {
       text += `Aucune analyse récente (24h)\n`;
     }
 
-    // At night: show read-only menu (no fresh analysis button)
+    // Simplified trading buttons
     const tradingButtons = isNight
       ? [
-          [{ text: "📊 Dernière analyse", callback_data: "trading_last" }, { text: "📋 Plans semaine", callback_data: "trading_plans" }],
-          [{ text: "📈 Stats 7j", callback_data: "trading_stats" }, { text: "🔙 Menu", callback_data: "menu_main" }],
+          [{ text: "📊 Détails", callback_data: "trading_last" }, { text: "📈 Stats", callback_data: "trading_stats" }],
+          [{ text: "🔙 Menu", callback_data: "menu_main" }],
         ]
       : [
-          [{ text: "📊 Dernière analyse", callback_data: "trading_last" }, { text: "🔄 Analyse fraîche", callback_data: "trading_fresh" }],
-          [{ text: "📋 Plans semaine", callback_data: "trading_plans" }, { text: "📈 Stats 7j", callback_data: "trading_stats" }],
-          [{ text: "⚙️ Gérer pairs", callback_data: "trading_pairs" }, { text: "🔙 Menu", callback_data: "menu_main" }],
+          [{ text: "📊 Détails", callback_data: "trading_last" }, { text: "🔄 Analyser", callback_data: "trading_fresh" }],
+          [{ text: "📈 Stats", callback_data: "trading_stats" }, { text: "🔙 Menu", callback_data: "menu_main" }],
         ];
 
     await sendTelegramMessage(chatId, text, "Markdown", { inline_keyboard: tradingButtons });
@@ -3720,21 +4311,44 @@ async function handleTradingLast(chatId: number): Promise<void> {
     let text = `📊 *DERNIÈRE ANALYSE* (il y a ${agoText})\n\n`;
 
     for (const s of batch) {
-      const icon = s.signal_type === "BUY" ? "▲ BUY" : s.signal_type === "SELL" ? "▼ SELL" : "— HOLD";
-      text += `*${s.symbol}* ${icon}\n`;
-
       try {
         const notes = JSON.parse(s.notes || "{}");
-        text += `  1D ${notes.trend1D || "?"} · 4H ${notes.trend4H || "?"}\n`;
+        const trend1D = (notes.trend1D || "").toLowerCase();
+        const trend4H = (notes.trend4H || "").toLowerCase();
+        const isBearish = trend1D.includes("bear") || trend1D.includes("down") || trend4H.includes("bear") || trend4H.includes("down");
+
+        // Determine direction: SHORT if bearish + SELL, LONG if bullish + BUY
+        let direction = "";
+        let icon = "";
+        if (s.signal_type === "BUY") {
+          direction = "LONG ▲";
+          icon = "🟢";
+        } else if (s.signal_type === "SELL" && isBearish) {
+          direction = "SHORT ▼";
+          icon = "🔴";
+        } else if (s.signal_type === "SELL") {
+          direction = "SELL ▼";
+          icon = "🟠";
+        } else {
+          direction = "HOLD —";
+          icon = "⚪";
+        }
+
+        text += `${icon} *${s.symbol}* — ${direction}\n`;
+        text += `  Trend: 1D ${notes.trend1D || "?"} · 4H ${notes.trend4H || "?"}\n`;
         text += `  Contexte: ${notes.context || "?"} · EMA: ${notes.ema200 || "?"}\n`;
         text += `  Confluence: ${notes.confluence || "?"}/7\n`;
         if (notes.signal) {
           const sig = notes.signal;
-          text += `  Entry $${sig.entry?.toLocaleString() || "?"}\n`;
-          text += `  SL $${sig.sl?.toLocaleString() || "?"} · TP $${sig.tp?.toLocaleString() || "?"}\n`;
+          const posType = (s.signal_type === "SELL" && isBearish) ? "SHORT" : (s.signal_type === "BUY" ? "LONG" : "");
+          if (posType) text += `  📍 ${posType} Entry: $${sig.entry?.toLocaleString() || "?"}\n`;
+          else text += `  Entry $${sig.entry?.toLocaleString() || "?"}\n`;
+          text += `  🛑 SL $${sig.sl?.toLocaleString() || "?"} · 🎯 TP $${sig.tp?.toLocaleString() || "?"}\n`;
           text += `  R:R ${sig.rr || "?"} · ${sig.strategy || ""} · ${sig.confidence || "?"}%\n`;
         }
       } catch (_) {
+        const icon = s.signal_type === "BUY" ? "▲ BUY" : s.signal_type === "SELL" ? "▼ SELL" : "— HOLD";
+        text += `*${s.symbol}* ${icon}\n`;
         text += `  Conf: ${s.confidence}%\n`;
       }
       text += `\n`;
@@ -3772,8 +4386,16 @@ async function handleTradingFresh(chatId: number): Promise<void> {
     });
     const result = await res.json();
     if (result.success) {
-      await sendTelegramMessage(chatId, `✅ Analyse terminée!\n${result.analyses?.map((a: any) => `${a.symbol}: ${a.signal} (${a.confluence}/7)`).join("\n") || ""}`, "Markdown", {
-        inline_keyboard: [[{ text: "📊 Voir détails", callback_data: "trading_last" }, { text: "🔙 Trading", callback_data: "menu_signals" }]],
+      const count = result.analyses?.length || 0;
+      const summary = result.analyses?.map((a: any) => {
+        const icon = a.signal === "BUY" ? "▲" : a.signal === "SELL" ? "▼" : "—";
+        return `${icon} ${a.symbol}`;
+      }).join(" · ") || "";
+      await sendTelegramMessage(chatId, `✅ Analyse prête ! ${count} paires analysées\n${summary}`, "Markdown", {
+        inline_keyboard: [
+          [{ text: "📊 Voir l'analyse complète", callback_data: "trading_last" }],
+          [{ text: "🔙 Trading", callback_data: "menu_signals" }],
+        ],
       });
     } else {
       await sendTelegramMessage(chatId, `❌ Erreur: ${result.error || "inconnue"}`, "Markdown", {
@@ -4084,56 +4706,72 @@ async function handleReview(chatId: number): Promise<void> {
   const supabase = getSupabaseClient();
 
   try {
-    const now = new Date();
-    const dayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
+    const today = todayStr();
 
-    const { data: tasks } = await supabase
-      .from("tasks")
-      .select("*")
-      .eq("status", "completed")
-      .gte("updated_at", dayStart);
+    // Parallel data fetch (was sequential)
+    const [tasksRes, expensesRes, workoutsRes, studyRes, allTasksRes] = await Promise.all([
+      supabase.from("tasks").select("title, domain, priority")
+        .eq("status", "completed").gte("completed_at", today),
+      supabase.from("finance_logs").select("amount, category")
+        .eq("transaction_type", "expense").gte("transaction_date", today),
+      supabase.from("health_logs").select("workout_type, duration_minutes")
+        .eq("log_type", "workout").gte("log_date", today),
+      supabase.from("study_sessions").select("topic, duration_minutes")
+        .gte("session_date", today).neq("topic", "agent_analysis"),
+      supabase.from("tasks").select("status")
+        .eq("due_date", today),
+    ]);
 
-    const { data: expenses } = await supabase
-      .from("finance_logs")
-      .select("*")
-      .eq("transaction_type", "expense")
-      .gte("transaction_date", dayStart.split('T')[0]);
+    const tasks = tasksRes.data || [];
+    const expenses = expensesRes.data || [];
+    const workouts = workoutsRes.data || [];
+    const study = studyRes.data || [];
+    const allTasks = allTasksRes.data || [];
 
-    const { data: workouts } = await supabase
-      .from("health_logs")
-      .select("*")
-      .eq("log_type", "workout")
-      .gte("log_date", dayStart.split('T')[0]);
+    const totalTasks = allTasks.length;
+    const doneTasks = allTasks.filter((t: any) => t.status === "done" || t.status === "completed").length;
+    const completionRate = totalTasks > 0 ? Math.round((doneTasks / totalTasks) * 100) : 0;
 
-    let text = `*EVENING REVIEW*\n\n`;
+    let text = `🌙 *EVENING REVIEW*\n━━━━━━━━━━━━━━━━━━━━\n\n`;
 
-    if (tasks && tasks.length > 0) {
-      text += `Completes (${tasks.length}):\n`;
-      tasks.slice(0, 5).forEach(t => {
-        text += `✓ ${escapeMarkdown(t.title)}\n`;
+    // Score rapide
+    const score = Math.min(12, tasks.length + workouts.length * 2 + Math.min(2, Math.floor((study.reduce((s: number, ss: any) => s + (ss.duration_minutes || 0), 0)) / 30)));
+    text += `📊 Score: *${score}/12* · Complétion: ${completionRate}%\n\n`;
+
+    if (tasks.length > 0) {
+      text += `✅ *Complétées (${tasks.length}):*\n`;
+      tasks.slice(0, 8).forEach((t: any) => {
+        const p = (t.priority || 3) <= 2 ? "●" : "○";
+        text += `  ${p} ${escapeMarkdown(t.title)}\n`;
       });
       text += `\n`;
     } else {
-      text += `-- aucune tache completee\n\n`;
+      text += `⚠️ Aucune tâche complétée\n\n`;
     }
 
-    if (expenses && expenses.length > 0) {
-      const total = expenses.reduce((sum, e) => sum + e.amount, 0);
-      text += `Depenses (${expenses.length}): *${total.toFixed(0)}₪*\n`;
-      text += `\n`;
+    if (expenses.length > 0) {
+      const total = expenses.reduce((sum: number, e: any) => sum + e.amount, 0);
+      text += `💰 Dépenses: *${total.toFixed(0)}₪* (${expenses.length} transactions)\n`;
     }
 
-    if (workouts && workouts.length > 0) {
-      text += `Workouts (${workouts.length}):\n`;
-      workouts.forEach(w => {
-        text += `${w.workout_type}  ${w.duration_minutes}min\n`;
-      });
+    if (workouts.length > 0) {
+      text += `🏋️ Workouts: ${workouts.map((w: any) => `${w.workout_type} ${w.duration_minutes}min`).join(" · ")}\n`;
     }
 
-    await sendTelegramMessage(chatId, text);
+    if (study.length > 0) {
+      const studyMin = study.reduce((s: number, ss: any) => s + (ss.duration_minutes || 0), 0);
+      text += `📚 Étude: ${studyMin}min\n`;
+    }
+
+    await sendTelegramMessage(chatId, text, "Markdown", {
+      inline_keyboard: [
+        [{ text: "🌙 Review IA", callback_data: "review_agentic" }, { text: "📊 Dashboard", callback_data: "menu_dashboard" }],
+        [{ text: "🔙 Menu", callback_data: "menu_main" }],
+      ],
+    });
   } catch (e) {
     console.error("Review error:", e);
-    await sendTelegramMessage(chatId, `error: ${String(e).substring(0, 50)}`);
+    await sendTelegramMessage(chatId, `Erreur review: ${String(e).substring(0, 50)}`);
   }
 }
 
@@ -4448,6 +5086,146 @@ async function handleFocus(chatId: number, args: string[]): Promise<void> {
   }
 }
 
+// ─── SMART TASK TRIAGE (replaces old cleanup) ─────────────────────────────
+const TRIAGE_CATS = ["workout", "routine", "rdv", "career", "important", "other"] as const;
+const TRIAGE_CAT_LABELS: Record<string, string> = {
+  workout: "🏋️ Workouts",
+  routine: "🔁 Routines",
+  rdv: "📅 Rendez-vous",
+  career: "💼 Carrière",
+  important: "🔴 Prioritaires",
+  other: "📦 Autres",
+};
+
+function triageCategory(t: any): string {
+  const title = (t.title || "").toLowerCase();
+  if (/push|pull|legs|cardio|workout|musculation|sport/.test(title)) return "workout";
+  if (/pesée|repas|prépar|routine|jeûne|vitamines|méditation|journal/.test(title)) return "routine";
+  if (/rendez-vous|rdv|meeting|appel|call/.test(title)) return "rdv";
+  if (/career|cv|offre|candidat|linkedin|entretien|interview|postuler/.test(title) || t.context === "work") return "career";
+  if ((t.priority || 3) <= 2) return "important";
+  return "other";
+}
+
+// Entry point: show category summary + drill-down buttons
+async function handleCleanup(chatId: number): Promise<void> {
+  const supabase = getSupabaseClient();
+  try {
+    const today = todayStr();
+    const { data: overdue } = await supabase.from("tasks")
+      .select("id, title, due_date, priority, context")
+      .in("status", ["pending", "in_progress"])
+      .lt("due_date", today)
+      .order("due_date", { ascending: true })
+      .limit(200);
+
+    if (!overdue || overdue.length === 0) {
+      await sendTelegramMessage(chatId, "✅ Aucune tâche en retard ! Tout est clean.");
+      return;
+    }
+
+    // Count per category
+    const counts: Record<string, number> = {};
+    for (const t of overdue) {
+      const cat = triageCategory(t);
+      counts[cat] = (counts[cat] || 0) + 1;
+    }
+
+    let text = `🧹 *TRI — ${overdue.length} tâches en retard*\n\n`;
+    text += `Choisis une catégorie pour trier une par une:\n\n`;
+
+    const buttons: Array<Array<{ text: string; callback_data: string }>> = [];
+
+    for (const cat of TRIAGE_CATS) {
+      const n = counts[cat] || 0;
+      if (n === 0) continue;
+      text += `${TRIAGE_CAT_LABELS[cat]}: *${n}*\n`;
+      buttons.push([
+        { text: `${TRIAGE_CAT_LABELS[cat]} (${n})`, callback_data: `tricat_${cat}_0` },
+        { text: `✅ Tous faits`, callback_data: `tri_done_${cat}` },
+      ]);
+    }
+
+    buttons.push([
+      { text: "✅ TOUT fait", callback_data: "tri_done_all" },
+      { text: "🗑 TOUT archiver", callback_data: "tri_cancel_all" },
+    ]);
+    buttons.push([{ text: "🔙 Menu", callback_data: "menu_main" }]);
+
+    await sendTelegramMessage(chatId, text, "Markdown", { inline_keyboard: buttons });
+  } catch (e) {
+    console.error("Triage error:", e);
+    await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 100)}`);
+  }
+}
+
+// Show individual tasks for a category with ✅/❌ per task, paginated
+const TRIAGE_PAGE_SIZE = 8;
+async function handleTriagePage(chatId: number, cat: string, page: number): Promise<void> {
+  const supabase = getSupabaseClient();
+  try {
+    const today = todayStr();
+    const { data: overdue } = await supabase.from("tasks")
+      .select("id, title, due_date, priority, context")
+      .in("status", ["pending", "in_progress"])
+      .lt("due_date", today)
+      .order("due_date", { ascending: true })
+      .limit(200);
+
+    if (!overdue || overdue.length === 0) {
+      await sendTelegramMessage(chatId, "✅ Plus aucune tâche en retard !");
+      return;
+    }
+
+    // Filter to this category
+    const tasks = overdue.filter((t: any) => triageCategory(t) === cat);
+
+    if (tasks.length === 0) {
+      await sendTelegramMessage(chatId, `✅ ${TRIAGE_CAT_LABELS[cat]} — tout est traité !`, "Markdown", {
+        inline_keyboard: [[{ text: "🧹 Retour tri", callback_data: "cleanup" }, { text: "🔙 Menu", callback_data: "menu_main" }]],
+      });
+      return;
+    }
+
+    const totalPages = Math.ceil(tasks.length / TRIAGE_PAGE_SIZE);
+    const safePage = Math.min(page, totalPages - 1);
+    const pageTasks = tasks.slice(safePage * TRIAGE_PAGE_SIZE, (safePage + 1) * TRIAGE_PAGE_SIZE);
+
+    let text = `${TRIAGE_CAT_LABELS[cat]} *— ${tasks.length} en retard*`;
+    if (totalPages > 1) text += ` (page ${safePage + 1}/${totalPages})`;
+    text += `\n\n`;
+
+    const buttons: Array<Array<{ text: string; callback_data: string }>> = [];
+
+    for (const t of pageTasks) {
+      const age = Math.floor((Date.now() - new Date(t.due_date || t.created_at).getTime()) / 86400000);
+      const shortTitle = (t.title || "?").substring(0, 35);
+      text += `• ${shortTitle} _(${age}j)_\n`;
+
+      // Each task gets a row: ✅ Done | ❌ Archive
+      const shortId = t.id.substring(0, 8); // UUID first 8 chars for callback_data (< 64 bytes)
+      buttons.push([
+        { text: `✅ ${shortTitle.substring(0, 25)}`, callback_data: `trid_${t.id}` },
+        { text: `❌`, callback_data: `trix_${t.id}` },
+      ]);
+    }
+
+    // Navigation row
+    const navRow: Array<{ text: string; callback_data: string }> = [];
+    if (safePage > 0) navRow.push({ text: "⬅️ Préc.", callback_data: `tricat_${cat}_${safePage - 1}` });
+    navRow.push({ text: `✅ Tous ${TRIAGE_CAT_LABELS[cat]}`, callback_data: `tri_done_${cat}` });
+    if (safePage < totalPages - 1) navRow.push({ text: "Suiv. ➡️", callback_data: `tricat_${cat}_${safePage + 1}` });
+    buttons.push(navRow);
+
+    buttons.push([{ text: "🧹 Retour tri", callback_data: "cleanup" }, { text: "🔙 Menu", callback_data: "menu_main" }]);
+
+    await sendTelegramMessage(chatId, text, "Markdown", { inline_keyboard: buttons });
+  } catch (e) {
+    console.error("TriagePage error:", e);
+    await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 100)}`);
+  }
+}
+
 async function handleGoals(chatId: number): Promise<void> {
   const supabase = getSupabaseClient();
 
@@ -4460,44 +5238,168 @@ async function handleGoals(chatId: number): Promise<void> {
       return;
     }
 
-    const domainEmoji: Record<string, string> = {
-      career: "💼", finance: "💰", health: "🏋️",
-      higrow: "🚀", trading: "📈", learning: "📚", personal: "🏠"
-    };
+    // Use Goal Intelligence Engine
+    const ranked = rankGoals(goals);
+    const text = formatGoalIntelligence(ranked);
 
-    let text = "🎯 *MES OBJECTIFS*\n\n";
-    goals.forEach((g: any) => {
+    // Build inline update buttons for top goals
+    const buttons: InlineKeyboardButton[][] = [];
+    for (const g of ranked.slice(0, 4)) {
+      const domainEmoji: Record<string, string> = {
+        career: "💼", finance: "💰", health: "🏋️",
+        higrow: "🚀", trading: "📈", learning: "📚", personal: "🏠",
+      };
       const emoji = domainEmoji[g.domain] || "📌";
-      const current = Number(g.metric_current) || 0;
-      const target = Number(g.metric_target) || 1;
-      const start = Number(g.metric_start) || 0;
-      const isDecrease = g.direction === 'decrease';
+      // Quick increment button
+      const increment = g.direction === "decrease" ? "-1" : "+1";
+      buttons.push([
+        { text: `${emoji} ${g.title.substring(0, 16)} (${increment})`, callback_data: `goal_inc_${g.domain}` },
+      ]);
+    }
+    buttons.push([{ text: "🔙 Menu", callback_data: "menu_main" }]);
 
-      let progress: number;
-      if (isDecrease && start > target) {
-        // Decrease goal (e.g., weight: 75 → 70kg, currently 72.5)
-        const totalToLose = start - target;       // 75 - 70 = 5
-        const alreadyLost = start - current;      // 75 - 72.5 = 2.5
-        progress = Math.max(0, Math.min(100, Math.round((alreadyLost / totalToLose) * 100)));
-      } else {
-        progress = target > 0 ? Math.min(100, Math.round((current / target) * 100)) : 0;
-      }
-
-      const daysLeft = g.deadline ? Math.ceil((new Date(g.deadline).getTime() - Date.now()) / 86400000) : null;
-      const barFilled = Math.round(progress / 10);
-      const bar = "█".repeat(barFilled) + "░".repeat(10 - barFilled);
-
-      text += `${emoji} *${g.title}*\n`;
-      text += `   ${bar} ${progress}%\n`;
-      text += `   ${current}/${target}${g.metric_unit}`;
-      if (daysLeft !== null) text += ` · ${daysLeft}j restants`;
-      text += `\n\n`;
-    });
-
-    await sendTelegramMessage(chatId, text);
+    await sendTelegramMessage(chatId, text, "HTML", { inline_keyboard: buttons });
   } catch (e) {
     console.error("Goals error:", e);
     await sendTelegramMessage(chatId, `error: ${String(e).substring(0, 50)}`);
+  }
+}
+
+// --- Unified Dashboard (single view of all domains) ---
+
+async function handleDashboard(chatId: number): Promise<void> {
+  const supabase = getSupabaseClient();
+  const now = getIsraelNow();
+  const today = todayStr();
+  const dayName = ["Dim", "Lun", "Mar", "Mer", "Jeu", "Ven", "Sam"][now.getDay()];
+  const monthStart = `${today.substring(0, 7)}-01`;
+
+  try {
+    // Parallel fetch across all domains
+    const [
+      tasksRes, goalsRes, jobsRes, leadsRes,
+      financeRes, weightRes, workoutsRes, studyRes,
+    ] = await Promise.all([
+      // Tasks: today pending + completed
+      supabase.from("tasks").select("id, title, priority, status, due_time")
+        .eq("due_date", today).in("status", ["pending", "in_progress", "completed"])
+        .order("priority", { ascending: true }).limit(20),
+      // Goals: active
+      supabase.from("goals").select("domain, title, metric_current, metric_target, metric_unit, metric_start, direction, deadline, priority, daily_actions, created_at")
+        .eq("status", "active").order("priority").limit(8),
+      // Career: pipeline
+      supabase.from("job_listings").select("status")
+        .in("status", ["new", "applied", "interview", "offer"]),
+      // HiGrow: leads this month
+      supabase.from("leads").select("status")
+        .gte("created_at", monthStart),
+      // Finance: month summary
+      supabase.from("finance_logs").select("transaction_type, amount")
+        .gte("transaction_date", monthStart),
+      // Health: latest weight
+      supabase.from("health_logs").select("value")
+        .eq("log_type", "weight").order("log_date", { ascending: false }).limit(1),
+      // Health: workouts this week
+      supabase.from("health_logs").select("id")
+        .eq("log_type", "workout")
+        .gte("log_date", new Date(now.getTime() - 7 * 86400000).toISOString().split("T")[0]),
+      // Learning: study this week
+      supabase.from("study_sessions").select("duration_minutes")
+        .gte("session_date", new Date(now.getTime() - 7 * 86400000).toISOString().split("T")[0])
+        .neq("topic", "agent_analysis"),
+    ]);
+
+    const tasks = tasksRes.data || [];
+    const goals = goalsRes.data || [];
+    const jobs = jobsRes.data || [];
+    const leads = leadsRes.data || [];
+    const finance = financeRes.data || [];
+    const weight = weightRes.data?.[0]?.value || "?";
+    const workoutCount = workoutsRes.data?.length || 0;
+    const studyMinutes = (studyRes.data || []).reduce((s: number, ss: any) => s + (ss.duration_minutes || 0), 0);
+
+    // Process tasks
+    const pendingTasks = tasks.filter((t: any) => t.status !== "completed");
+    const completedTasks = tasks.filter((t: any) => t.status === "completed");
+    const p1p2 = pendingTasks.filter((t: any) => (t.priority || 3) <= 2);
+
+    // Process career
+    const newJobs = jobs.filter((j: any) => j.status === "new").length;
+    const applied = jobs.filter((j: any) => j.status === "applied").length;
+    const interviews = jobs.filter((j: any) => j.status === "interview").length;
+    const offers = jobs.filter((j: any) => j.status === "offer").length;
+
+    // Process HiGrow
+    const totalLeads = leads.length;
+    const converted = leads.filter((l: any) => l.status === "converted").length;
+
+    // Process finance
+    const monthIncome = finance.filter((f: any) => f.transaction_type === "income").reduce((s: number, e: any) => s + e.amount, 0);
+    const monthExpense = finance.filter((f: any) => f.transaction_type === "expense").reduce((s: number, e: any) => s + e.amount, 0);
+    const balance = monthIncome - monthExpense;
+    const savingsRate = monthIncome > 0 ? Math.round(((monthIncome - monthExpense) / monthIncome) * 100) : 0;
+
+    // Goal Intelligence — ranked by urgency
+    const rankedGoals = rankGoals(goals);
+    const criticalGoals = rankedGoals.filter(g => g.riskLevel === "critical" || g.riskLevel === "danger");
+
+    // Determine urgency level — goal-aware
+    let urgency = "🟢";
+    if (interviews === 0 || converted === 0 || criticalGoals.length > 0) urgency = "🔴";
+    else if (applied < 5 || savingsRate < 20 || rankedGoals.some(g => g.riskLevel === "watch")) urgency = "🟡";
+
+    // Build message
+    let msg = `${urgency} *DASHBOARD* — ${dayName} ${today}\n`;
+    msg += `━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+    // Tasks summary
+    msg += `📋 *TACHES:* ${completedTasks.length}✓ / ${tasks.length} total\n`;
+    if (p1p2.length > 0) {
+      msg += `  Urgentes: ${p1p2.map((t: any) => t.title).slice(0, 2).join(", ")}\n`;
+    }
+
+    // Career
+    msg += `\n💼 *CARRIERE:*\n`;
+    msg += `  ${newJobs} nouvelles · ${applied} postulées · ${interviews} interviews`;
+    if (offers > 0) msg += ` · ${offers} offres`;
+    msg += `\n`;
+    if (interviews === 0) msg += `  ⚠️ _0 interviews — augmenter les candidatures_\n`;
+
+    // HiGrow
+    msg += `\n🚀 *HIGROW:* ${converted}/${totalLeads || "?"} clients convertis\n`;
+    if (converted === 0 && totalLeads > 0) msg += `  ⚠️ _0 conversion — relancer les leads_\n`;
+
+    // Finance
+    msg += `\n💰 *FINANCE:*\n`;
+    msg += `  Revenus: ${Math.round(monthIncome)}₪ · Dépenses: ${Math.round(monthExpense)}₪\n`;
+    msg += `  Balance: ${balance >= 0 ? "+" : ""}${Math.round(balance)}₪ · Épargne: ${savingsRate}%\n`;
+
+    // Health
+    msg += `\n🏋️ *SANTE:* ${weight}kg · ${workoutCount}/5 workouts · ${Math.round(studyMinutes / 60)}h étude\n`;
+
+    // Goals — Intelligence-driven
+    if (rankedGoals.length > 0) {
+      const topGoals = rankedGoals.slice(0, 3);
+      msg += `\n🎯 *OBJECTIFS:*\n`;
+      for (const g of topGoals) {
+        const riskIcon = g.riskLevel === "critical" ? "🔴" : g.riskLevel === "danger" ? "🟠" : g.riskLevel === "watch" ? "🟡" : "🟢";
+        const domEmoji = g.domain === "career" ? "💼" : g.domain === "health" ? "🏋️" : g.domain === "higrow" ? "🚀" : g.domain === "finance" ? "💰" : "🎯";
+        msg += `  ${domEmoji} ${g.title}: ${g.progressPct}% ${riskIcon}`;
+        if (g.daysLeft < 999) msg += ` · J-${g.daysLeft}`;
+        if (g.gap > 0) msg += ` (-${g.gap}%)`;
+        msg += `\n`;
+      }
+    }
+
+    await sendTelegramMessage(chatId, msg, "Markdown", {
+      inline_keyboard: [
+        [{ text: "🧠 Insights", callback_data: "menu_insights" }, { text: "🎯 Goals", callback_data: "menu_goals" }, { text: "📊 Vélocité", callback_data: "menu_velocity" }],
+        [{ text: "🔄 Rafraîchir", callback_data: "dashboard" }, { text: "🔙 Menu", callback_data: "menu_main" }],
+      ],
+    });
+  } catch (e) {
+    console.error("Dashboard error:", e);
+    await sendTelegramMessage(chatId, "❌ Erreur dashboard. Réessaie.", "Markdown");
   }
 }
 
@@ -4593,8 +5495,8 @@ async function handleInsights(chatId: number): Promise<void> {
     const line4 = `🚀 HiGrow: ${higrowEmoji} ${converted}/${target} clients · ${daysRemaining}j restants · proj: ${velocity}`;
 
     const text = `🧠 *INSIGHTS*\n\n${line1}\n${line2}\n${line3}\n${line4}`;
-    await sendTelegramMessage(chatId, text, {
-      inline_keyboard: [[{ text: "🔙 Menu", callback_data: "start" }]],
+    await sendTelegramMessage(chatId, text, "Markdown", {
+      inline_keyboard: [[{ text: "📊 Dashboard", callback_data: "menu_dashboard" }, { text: "🔙 Menu", callback_data: "menu_main" }]],
     });
   } catch (e) {
     console.error("Insights error:", e);
@@ -4764,7 +5666,15 @@ RÈGLES:
 - IMPORTANT: Quand l'utilisateur partage une information (sur une personne, un meeting, un projet) sans demander d'action → utilise "add_note" pour sauvegarder cette info
 - NE JAMAIS répondre "je ne comprends pas" — si tu ne sais pas quoi faire, utilise "chat" et réponds intelligemment ou "add_note" si c'est une info à retenir`;
 
+// Cache AI context to avoid 5+ DB queries per natural language message
+let _aiContextCache: { text: string; ts: number } | null = null;
+const AI_CONTEXT_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
 async function getAIContext(): Promise<string> {
+  const now2 = Date.now();
+  if (_aiContextCache && (now2 - _aiContextCache.ts) < AI_CONTEXT_TTL_MS) {
+    return _aiContextCache.text;
+  }
   const supabase = getSupabaseClient();
   const now = getIsraelNow();
   const today = todayStr();
@@ -4833,6 +5743,7 @@ async function getAIContext(): Promise<string> {
     });
   }
 
+  _aiContextCache = { text: ctx, ts: Date.now() };
   return ctx;
 }
 
@@ -4943,10 +5854,11 @@ async function handleNaturalLanguage(chatId: number, text: string): Promise<void
           taskData.due_time = params.due_time;
           taskData.duration_minutes = params.duration || 30;
         }
-        if (params.context && TASK_CONTEXTS.includes(params.context)) taskData.context = params.context;
+        // Don't auto-assign context — ask the user instead
         if (params.energy) taskData.energy_level = params.energy;
-        const { error } = await supabase.from("tasks").insert(taskData);
+        const { data: inserted, error } = await supabase.from("tasks").insert(taskData).select("id").single();
         if (error) throw error;
+        const taskId = inserted.id;
 
         // Sync to Google Calendar if task has a time
         let calSync = "";
@@ -4966,7 +5878,13 @@ async function handleNaturalLanguage(chatId: number, text: string): Promise<void
           } catch (ce) { console.error("GCal add_task:", ce); }
         }
 
-        await sendTelegramMessage(chatId, (reply || `✅ Tâche ajoutée: ${params.title}`) + calSync);
+        const taskTitle = params.title || text;
+        await sendTelegramMessage(chatId, `${reply || `✅ Tâche ajoutée: ${taskTitle}`}${calSync}\n\n🏷 Quel contexte ?`, "Markdown", {
+          inline_keyboard: [
+            TASK_CONTEXTS.map(c => ({ text: `${CONTEXT_EMOJI[c]} ${c}`, callback_data: `task_setctx_${taskId}_${c}` })),
+            [{ text: "⏭ Pas de contexte", callback_data: `task_setctx_${taskId}_none` }],
+          ],
+        });
         break;
       }
 
@@ -5594,21 +6512,38 @@ async function analyzePhoto(chatId: number, fileId: string, caption?: string): P
   // Get DB context
   const context = await getAIContext();
 
-  const visionPrompt = `Tu es OREN, assistant personnel. Analyse cette image et réponds en JSON:
+  const visionPrompt = `Tu es OREN, assistant personnel. Analyse cette image avec précision et réponds en JSON.
+
+FORMAT DE RÉPONSE:
 {
-  "type": "receipt|document|screenshot|other",
-  "intent": "add_expense|add_task|add_job|chat",
+  "type": "receipt|bank_statement|document|screenshot|other",
+  "intent": "add_expenses|add_expense|add_task|add_job|chat",
+  "items": [
+    { "amount": number, "category": "string", "description": "string", "payment_method": "card|cash" }
+  ],
   "params": { ... },
   "reply": "description courte en français"
 }
 
-Si c'est un ticket/reçu: extrais montant, catégorie (restaurant|transport|shopping|health|entertainment|utilities|other), description.
-Si c'est une offre d'emploi: extrais titre, entreprise, URL si visible.
-Si c'est autre chose: décris simplement ce que tu vois.
-${caption ? `\nLégende de l'utilisateur: "${caption}"` : ""}
+INSTRUCTIONS:
+- Si c'est un relevé bancaire, ticket, liste de dépenses ou capture d'écran de transactions:
+  → intent = "add_expenses"
+  → Extrais CHAQUE dépense/transaction individuellement dans "items"
+  → Lis ATTENTIVEMENT chaque montant, ne les invente pas
+  → Catégories: restaurant, transport, shopping, health, entertainment, utilities, groceries, subscriptions, autre
+  → Inclus la description/marchand de chaque ligne
+  → Ne fusionne PAS les lignes entre elles, garde chaque transaction séparée
+
+- Si c'est un seul ticket/reçu simple avec un seul montant:
+  → intent = "add_expense"
+  → Mets les infos dans "params": { "amount", "category", "description", "payment_method" }
+
+- Si c'est une offre d'emploi: intent = "add_job", params: { title, company, url }
+- Si c'est autre chose: intent = "chat", reply = description
+${caption ? `\nMessage de l'utilisateur: "${caption}"` : ""}
 
 CONTEXTE: ${context}
-Réponds UNIQUEMENT en JSON.`;
+Réponds UNIQUEMENT en JSON valide. Sois PRÉCIS sur les montants.`;
 
   try {
     const response = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -5618,15 +6553,15 @@ Réponds UNIQUEMENT en JSON.`;
         "Authorization": `Bearer ${openaiKey}`,
       },
       body: JSON.stringify({
-        model: "gpt-4o-mini",
+        model: "gpt-4o",
         temperature: 0,
-        max_tokens: 1024,
+        max_tokens: 2048,
         messages: [
           {
             role: "user",
             content: [
               { type: "text", text: visionPrompt },
-              { type: "image_url", image_url: { url: dataUrl, detail: "low" } },
+              { type: "image_url", image_url: { url: dataUrl, detail: "high" } },
             ],
           },
         ],
@@ -5653,6 +6588,34 @@ Réponds UNIQUEMENT en JSON.`;
 
     // Route based on detected intent
     switch (result.intent) {
+      case "add_expenses": {
+        // Multiple expenses from bank statement / receipt list
+        const items = result.items || [];
+        if (items.length === 0) {
+          await sendTelegramMessage(chatId, result.reply || "Aucune dépense détectée sur l'image.");
+          break;
+        }
+        const supabase = getSupabaseClient();
+        const rows = items.map((item: { amount: number; category?: string; description?: string; payment_method?: string }) => ({
+          transaction_type: "expense",
+          amount: item.amount,
+          category: item.category || "autre",
+          description: item.description || "Depuis photo",
+          payment_method: item.payment_method || "card",
+          transaction_date: todayStr(),
+        }));
+        const { error } = await supabase.from("finance_logs").insert(rows);
+        if (error) throw error;
+
+        const total = items.reduce((sum: number, item: { amount: number }) => sum + item.amount, 0);
+        const lines = items.map((item: { amount: number; category?: string; description?: string }, i: number) =>
+          `${i + 1}. *${item.amount}₪* · ${item.category || "autre"}${item.description ? " — " + item.description : ""}`
+        );
+        await sendTelegramMessage(chatId,
+          `📸✅ *${items.length} dépenses* extraites et enregistrées:\n\n${lines.join("\n")}\n\n💰 Total: *${total}₪*`);
+        break;
+      }
+
       case "add_expense": {
         if (result.params?.amount) {
           const supabase = getSupabaseClient();
@@ -5714,6 +6677,262 @@ Réponds UNIQUEMENT en JSON.`;
     await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 80)}`);
   }
 }
+
+// ============================================
+// AGENTIC HANDLERS — Chief of Staff Integration
+// ============================================
+
+/** /ask <question> — Free-form question to the Chief of Staff */
+async function handleAsk(chatId: number, args: string[]): Promise<void> {
+  const question = args.join(" ").trim();
+  if (!question) {
+    await sendTelegramMessage(chatId, "Usage: /ask <question>\nEx: _/ask quel domaine est en retard ?_", "Markdown");
+    return;
+  }
+
+  await sendTelegramMessage(chatId, "🤖 Le Chief of Staff réfléchit...");
+
+  try {
+    const answer = await quickAgent(
+      "morning-briefing",
+      `Tu es le Chief of Staff d'Oren — un assistant exécutif ultra-concis. Réponds en français, de manière factuelle et actionnable. Ne dépasse pas 300 mots.`,
+      question,
+      `Date: ${todayStr()}, Heure: ${getIsraelNow().toTimeString().slice(0, 5)} IST`
+    );
+    await sendTelegramMessage(chatId, `🤖 *Chief of Staff*\n\n${answer}`, "Markdown", {
+      inline_keyboard: [[{ text: "🔙 Menu", callback_data: "menu_main" }]],
+    });
+  } catch (e) {
+    console.error("Ask error:", e);
+    await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 100)}`);
+  }
+}
+
+/** /agent_status — Dashboard santé des agents */
+async function handleAgentStatus(chatId: number): Promise<void> {
+  const supabase = getSupabaseClient();
+  try {
+    const today = todayStr();
+
+    // Fetch budgets + recent executions in parallel
+    const [budgetRes, execRes] = await Promise.all([
+      supabase.from("agent_budgets")
+        .select("agent_name, tokens_used, tool_calls, estimated_cost, consecutive_failures, is_circuit_broken")
+        .eq("date", today),
+      supabase.from("agent_executions")
+        .select("agent_name, success, duration_ms, loops_count, tool_calls_count, created_at")
+        .gte("created_at", today)
+        .order("created_at", { ascending: false })
+        .limit(30),
+    ]);
+
+    const budgets = budgetRes.data || [];
+    const execs = execRes.data || [];
+
+    // Aggregate executions by agent
+    const execsByAgent: Record<string, { runs: number; success: number; avgDuration: number; lastRun: string }> = {};
+    for (const e of execs) {
+      if (!execsByAgent[e.agent_name]) {
+        execsByAgent[e.agent_name] = { runs: 0, success: 0, avgDuration: 0, lastRun: e.created_at };
+      }
+      execsByAgent[e.agent_name].runs++;
+      if (e.success) execsByAgent[e.agent_name].success++;
+      execsByAgent[e.agent_name].avgDuration += e.duration_ms || 0;
+    }
+    for (const k of Object.keys(execsByAgent)) {
+      if (execsByAgent[k].runs > 0) execsByAgent[k].avgDuration = Math.round(execsByAgent[k].avgDuration / execsByAgent[k].runs);
+    }
+
+    let msg = `🤖 *AGENT STATUS* — ${today}\n━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+    const agentNames = ["morning-briefing", "evening-review", "career", "health", "finance", "learning", "trading"];
+    for (const name of agentNames) {
+      const budget = budgets.find((b: any) => b.agent_name === name);
+      const exec = execsByAgent[name];
+      const emoji = budget?.is_circuit_broken ? "🔴" : (budget?.consecutive_failures || 0) > 0 ? "🟡" : exec ? "🟢" : "⚪";
+
+      msg += `${emoji} *${name}*`;
+      if (exec) {
+        msg += ` — ${exec.runs} runs (${exec.success}✓) · avg ${Math.round(exec.avgDuration / 1000)}s`;
+      } else {
+        msg += ` — pas encore exécuté`;
+      }
+      if (budget) {
+        msg += `\n   💰 $${budget.estimated_cost?.toFixed(3) || "0"} · ${budget.tokens_used || 0} tokens · ${budget.tool_calls || 0} tools`;
+        if (budget.is_circuit_broken) msg += ` · ⚡ CIRCUIT BROKEN`;
+      }
+      msg += `\n`;
+    }
+
+    // Total cost
+    const totalCost = budgets.reduce((s: number, b: any) => s + (b.estimated_cost || 0), 0);
+    const totalTokens = budgets.reduce((s: number, b: any) => s + (b.tokens_used || 0), 0);
+    msg += `\n📊 *Total:* $${totalCost.toFixed(3)} · ${totalTokens} tokens · ${execs.length} runs`;
+
+    await sendTelegramMessage(chatId, msg, "Markdown", {
+      inline_keyboard: [[{ text: "🔄 Refresh", callback_data: "agent_status" }, { text: "🔙 Menu", callback_data: "menu_main" }]],
+    });
+  } catch (e) {
+    console.error("AgentStatus error:", e);
+    await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 100)}`);
+  }
+}
+
+/** /memory <search> — Search agent memories */
+async function handleMemory(chatId: number, args: string[]): Promise<void> {
+  const query = args.join(" ").trim();
+  if (!query) {
+    await sendTelegramMessage(chatId, "Usage: /memory <recherche>\nEx: _/memory pattern sommeil_", "Markdown");
+    return;
+  }
+
+  try {
+    const memory = getMemoryStore("morning-briefing");
+    const results = await memory.search(query, { limit: 5 });
+
+    if (!results || results.length === 0) {
+      await sendTelegramMessage(chatId, `🧠 Aucune mémoire trouvée pour "${query}"`);
+      return;
+    }
+
+    let msg = `🧠 *MÉMOIRES* — "${query}"\n━━━━━━━━━━━━━━━━━━━━\n\n`;
+    for (const r of results) {
+      const m = r.memory;
+      const icon = m.memory_type === "episodic" ? "📅" : m.memory_type === "semantic" ? "📖" : m.memory_type === "procedural" ? "⚙️" : m.memory_type === "decision" ? "🎯" : "💡";
+      msg += `${icon} *${m.memory_type}* (importance: ${m.importance}/5)\n`;
+      msg += `${m.content.substring(0, 150)}\n`;
+      msg += `_${m.created_at?.split("T")[0] || "?"} · ${m.agent_name}_\n\n`;
+    }
+
+    await sendTelegramMessage(chatId, msg, "Markdown");
+  } catch (e) {
+    console.error("Memory search error:", e);
+    await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 100)}`);
+  }
+}
+
+/** Upgraded /morning — Uses Chief of Staff ReAct agent */
+async function handleMorningAgentic(chatId: number): Promise<void> {
+  await sendTelegramMessage(chatId, "☀️ Chief of Staff prépare ton briefing...");
+
+  try {
+    const result = await runMorningBriefing();
+
+    if (result.success && result.output) {
+      const report = `☀️ *MORNING BRIEFING — Chief of Staff*\n━━━━━━━━━━━━━━━━━━━━\n\n${result.output.substring(0, 3500)}\n\n_⚡ ${result.totalLoops} loops · ${result.totalToolCalls} tools · ${Math.round(result.durationMs / 1000)}s_`;
+      await sendTelegramMessage(chatId, report, "Markdown", {
+        inline_keyboard: [
+          [{ text: "💪 Workout", callback_data: "health_workout" }, { text: "📋 Tasks", callback_data: "menu_tasks" }],
+          [{ text: "🤖 Agent Status", callback_data: "agent_status" }, { text: "🔙 Menu", callback_data: "menu_main" }],
+        ],
+      });
+    } else {
+      // Fallback to hardcoded briefing if agent fails
+      console.error("[Morning] Agent failed, falling back to hardcoded:", result.guardrailReason || result.output);
+      await handleMorningBriefing(chatId);
+    }
+  } catch (e) {
+    console.error("[Morning] Agent error, falling back:", e);
+    await handleMorningBriefing(chatId);
+  }
+}
+
+/** Upgraded /review — Uses Chief of Staff ReAct agent */
+async function handleReviewAgentic(chatId: number): Promise<void> {
+  await sendTelegramMessage(chatId, "🌙 Chief of Staff prépare ta review...");
+
+  try {
+    const result = await runEveningReview();
+
+    if (result.success && result.output) {
+      const report = `🌙 *EVENING REVIEW — Chief of Staff*\n━━━━━━━━━━━━━━━━━━━━\n\n${result.output.substring(0, 3500)}\n\n_⚡ ${result.totalLoops} loops · ${result.totalToolCalls} tools · ${Math.round(result.durationMs / 1000)}s_`;
+      await sendTelegramMessage(chatId, report, "Markdown", {
+        inline_keyboard: [
+          [{ text: "📊 Dashboard", callback_data: "menu_dashboard" }, { text: "🤖 Agents", callback_data: "agent_status" }],
+          [{ text: "🔙 Menu", callback_data: "menu_main" }],
+        ],
+      });
+    } else {
+      console.error("[Review] Agent failed, falling back:", result.guardrailReason || result.output);
+      await handleReview(chatId);
+    }
+  } catch (e) {
+    console.error("[Review] Agent error, falling back:", e);
+    await handleReview(chatId);
+  }
+}
+
+// ============================================
+// COMMAND DISPATCH MAP — Clean routing
+// ============================================
+
+type CommandHandler = (chatId: number, args: string[]) => Promise<void>;
+
+const COMMAND_MAP: Record<string, CommandHandler> = {
+  // --- Core ---
+  "/start": (chatId) => handleStart(chatId),
+  "/help": (chatId) => handleHelp(chatId),
+  "/status": (chatId) => handleStatus(chatId),
+  "/today": (chatId) => handleToday(chatId),
+  "/brief": (chatId, args) => handleBrief(chatId, args),
+  "/report": (chatId, args) => handleReport(chatId, args),
+
+  // --- Agentic (NEW) ---
+  "/ask": (chatId, args) => handleAsk(chatId, args),
+  "/agent": (chatId) => handleAgentStatus(chatId),
+  "/agents": (chatId) => handleAgentStatus(chatId),
+  "/memory": (chatId, args) => handleMemory(chatId, args),
+
+  // --- Tasks ---
+  "/inbox": (chatId) => handleInbox(chatId),
+  "/pomodoro": (chatId, args) => handlePomodoro(chatId, args),
+  "/pomo": (chatId, args) => handlePomodoro(chatId, args),
+  "/velocity": (chatId) => handleVelocity(chatId),
+  "/vel": (chatId) => handleVelocity(chatId),
+  "/timeblock": (chatId) => handleTimeBlock(chatId),
+  "/tb": (chatId) => handleTimeBlock(chatId),
+  "/cleanup": (chatId) => handleCleanup(chatId),
+  "/tri": (chatId) => handleCleanup(chatId),
+  "/focus": (chatId, args) => handleFocus(chatId, args),
+
+  // --- Finance ---
+  "/expense": (chatId, args) => handleExpense(chatId, args, "card"),
+  "/cash": (chatId, args) => handleExpense(chatId, args, "cash"),
+  "/income": (chatId, args) => handleIncome(chatId, args),
+  "/budget": (chatId) => handleBudget(chatId),
+
+  // --- Health ---
+  "/health": (chatId, args) => handleHealth(chatId, args),
+  "/study": (chatId, args) => handleStudy(chatId, args),
+
+  // --- Career ---
+  "/lead": (chatId, args) => handleLead(chatId, args),
+  "/mission": (chatId, args) => handleMission(chatId, args),
+  "/job": (chatId, args) => handleJobAdd(chatId, args),
+  "/jobs": (chatId) => handleJobs(chatId),
+
+  // --- Trading ---
+  "/signals": (chatId) => handleTradingMain(chatId),
+
+  // --- Briefings (AGENTIC) ---
+  "/morning": (chatId) => handleMorningAgentic(chatId),
+  "/bonjour": (chatId) => handleMorningAgentic(chatId),
+  "/review": (chatId) => handleReviewAgentic(chatId),
+
+  // --- Intelligence ---
+  "/dashboard": (chatId) => handleDashboard(chatId),
+  "/d": (chatId) => handleDashboard(chatId),
+  "/insights": (chatId) => handleInsights(chatId),
+  "/goals": (chatId) => handleGoals(chatId),
+
+  // --- EOS ---
+  "/rock": (chatId, args) => handleRock(chatId, args),
+  "/rocks": (chatId, args) => handleRock(chatId, args),
+  "/scorecard": (chatId) => handleScorecard(chatId),
+  "/sc": (chatId) => handleScorecard(chatId),
+  "/cir": (chatId, args) => handleCIR(chatId, args),
+  "/cirs": (chatId, args) => handleCIR(chatId, args),
+};
 
 // --- Main Router ---
 
@@ -5793,88 +7012,59 @@ serve(async (req: Request) => {
 
     console.log(`[${new Date().toISOString()}] ${chatId}: ${text}`);
 
-    // Command Router
-    if (command === "/start") {
-      await handleStart(chatId);
-    } else if (command === "/help") {
-      await handleHelp(chatId);
-    } else if (command === "/status") {
-      await handleStatus(chatId);
-    } else if (command === "/today") {
-      await handleToday(chatId);
-    } else if (command === "/brief") {
-      await handleBrief(chatId, args);
-    } else if (command === "/report") {
-      await handleReport(chatId, args);
-    } else if (command === "/task") {
-      if (args[0] === "add") {
-        await handleTaskAdd(chatId, args.slice(1));
-      } else if (args[0] === "list") {
-        await handleTaskList(chatId);
-      } else if (args[0] === "done") {
-        await handleTaskDone(chatId, args.slice(1));
-      } else {
-        await sendTelegramMessage(chatId, `Format: /task add|list|done`);
-      }
-    } else if (command === "/expense") {
-      await handleExpense(chatId, args, "card");
-    } else if (command === "/cash") {
-      await handleExpense(chatId, args, "cash");
-    } else if (command === "/income") {
-      await handleIncome(chatId, args);
-    } else if (command === "/budget") {
-      await handleBudget(chatId);
-    } else if (command === "/health") {
-      await handleHealth(chatId, args);
-    } else if (command === "/study") {
-      await handleStudy(chatId, args);
-    } else if (command === "/lead") {
-      await handleLead(chatId, args);
-    } else if (command === "/mission") {
-      await handleMission(chatId, args);
-    } else if (command === "/job") {
-      await handleJobAdd(chatId, args);
-    } else if (command === "/jobs") {
-      await handleJobs(chatId);
-    } else if (command === "/signals") {
-      await handleTradingMain(chatId);
-    } else if (command === "/morning" || command === "/bonjour") {
-      await handleMorningBriefing(chatId);
-    } else if (command === "/dashboard") {
-      const sbUrl = Deno.env.get("SUPABASE_URL") || "";
-      await sendTelegramMessage(chatId, `📊 *Dashboard OREN*\n\n${sbUrl}/functions/v1/dashboard`, "Markdown");
-    } else if (command === "/review") {
-      await handleReview(chatId);
-    } else if (command === "/insights") {
-      await handleInsights(chatId);
-    } else if (command === "/goals") {
-      await handleGoals(chatId);
-    } else if (command === "/focus") {
-      await handleFocus(chatId, args);
+    // Command Router — Dispatch Map (O(1) lookup)
+    const handler = COMMAND_MAP[command];
+
+    if (handler) {
+      await handler(chatId, args);
     }
-    // === TASK MANAGEMENT V2 COMMANDS ===
-    else if (command === "/inbox") {
-      await handleInbox(chatId);
-    } else if (command === "/pomodoro" || command === "/pomo") {
-      await handlePomodoro(chatId, args);
-    } else if (command === "/velocity" || command === "/vel") {
-      await handleVelocity(chatId);
-    } else if (command === "/repeat" || command === "/recurring") {
+    // Commands with sub-routing (not in dispatch map)
+    else if (command === "/task") {
+      if (args[0] === "add") await handleTaskAdd(chatId, args.slice(1));
+      else if (args[0] === "list") await handleTaskList(chatId);
+      else if (args[0] === "done") await handleTaskDone(chatId, args.slice(1));
+      else await sendTelegramMessage(chatId, `Format: /task add|list|done`);
+    }
+    else if (command === "/goal") {
+      if (args[0] === "update" && args[1] && args[2]) {
+        const domain = args[1].toLowerCase();
+        const newValue = parseFloat(args[2]);
+        if (isNaN(newValue)) {
+          await sendTelegramMessage(chatId, "Format: /goal update <domaine> <valeur>\nEx: /goal update health 72.5");
+        } else {
+          try {
+            const supabase = getSupabaseClient();
+            const { data: goal } = await supabase.from("goals")
+              .select("id, title, metric_current, metric_unit")
+              .eq("domain", domain).eq("status", "active").limit(1).single();
+            if (goal) {
+              const oldValue = Number(goal.metric_current) || 0;
+              await supabase.from("goals").update({ metric_current: newValue }).eq("id", goal.id);
+              await sendTelegramMessage(chatId, `✅ ${goal.title}: ${oldValue} → ${newValue}${goal.metric_unit || ""}`);
+            } else {
+              await sendTelegramMessage(chatId, `Aucun objectif actif pour "${domain}"`);
+            }
+          } catch (e) { await sendTelegramMessage(chatId, `Erreur: ${String(e).substring(0, 50)}`); }
+        }
+      } else {
+        await sendTelegramMessage(chatId, "Usage:\n/goals — Voir les objectifs\n/goal update <domaine> <valeur>\nEx: /goal update career 45\nEx: /goal update health 72.5");
+      }
+    }
+    else if (command === "/repeat" || command === "/recurring") {
       if (args.length === 0) await handleRecurringList(chatId);
       else await handleRecurringAdd(chatId, args);
-    } else if (command === "/sprint") {
+    }
+    else if (command === "/sprint") {
       if (args.length === 0) await handleSprintGoals(chatId);
       else await handleSprintCreate(chatId, args);
-    } else if (command === "/timeblock" || command === "/tb") {
-      await handleTimeBlock(chatId);
-    } else if (command === "/tomorrow" || command === "/demain") {
+    }
+    else if (command === "/tomorrow" || command === "/demain") {
       await handleTomorrowPlan(chatId);
-    } else if (command === "/subtask" || command === "/sub") {
-      // /subtask parentId titre
+    }
+    else if (command === "/subtask" || command === "/sub") {
       if (args.length >= 2) {
         const parentRef = args[0];
         const subTitle = args.slice(1).join(" ");
-        // Find parent by short ID prefix
         const supabase = getSupabaseClient();
         const { data: parents } = await supabase.from("tasks")
           .select("id").in("status", ["pending", "in_progress"])
@@ -5885,18 +7075,22 @@ serve(async (req: Request) => {
       } else {
         await sendTelegramMessage(chatId, "Format: /subtask id_parent titre\nEx: /subtask abc123 Préparer le CV");
       }
-    } else if (command === "/context" || command === "/ctx") {
+    }
+    else if (command === "/context" || command === "/ctx") {
       if (args.length > 0 && TASK_CONTEXTS.includes(args[0] as any)) {
         await handleTasksByContext(chatId, args[0]);
       } else {
         await sendTelegramMessage(chatId, `Contextes: ${TASK_CONTEXTS.map(c => `${CONTEXT_EMOJI[c]} ${c}`).join(', ')}\nEx: /ctx work`);
       }
-    } else if (command === "/tuto" || command === "/tutorial" || command === "/guide") {
+    }
+    else if (command === "/tuto" || command === "/tutorial" || command === "/guide") {
       const page = TUTO_PAGES["tuto_main"];
       await sendTelegramMessage(chatId, page.text, "HTML", page.buttons);
-    } else if (command.startsWith("/")) {
-      await sendTelegramMessage(chatId, `? commande inconnue — /help`);
-    } else {
+    }
+    else if (command.startsWith("/")) {
+      await sendTelegramMessage(chatId, `❓ commande inconnue — /help`);
+    }
+    else {
       // Natural language processing
       await handleNaturalLanguage(chatId, text);
     }

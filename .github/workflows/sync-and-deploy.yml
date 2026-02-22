@@ -26,16 +26,16 @@ jobs:
         with:
           version: latest
 
-      # --- Sync root .ts files to supabase/functions/ ---
-      - name: Sync source files to Edge Functions
+      # --- Bi-directional sync: edge functions are source of truth ---
+      # Edge function index.ts → root .ts (keeps root copies up to date)
+      # Root .ts → edge function index.ts (only if edge doesn't exist yet)
+      - name: Sync Edge Functions ↔ Root files
         run: |
           declare -A FILE_MAP=(
             ["telegram-bot.ts"]="telegram-bot"
             ["task-reminder.ts"]="task-reminder"
             ["evening-review.ts"]="evening-review"
-            ["weekly-planning.ts"]="weekly-planning"
             ["morning-briefing.ts"]="morning-briefing"
-            ["sync-calendar.ts"]="sync-calendar"
             ["career-agent.ts"]="career-agent"
             ["finance-agent.ts"]="finance-agent"
             ["health-agent.ts"]="health-agent"
@@ -49,13 +49,20 @@ jobs:
 
           for file in "${!FILE_MAP[@]}"; do
             func="${FILE_MAP[$file]}"
-            if [ -f "$file" ]; then
-              mkdir -p "supabase/functions/$func"
-              if ! diff -q "$file" "supabase/functions/$func/index.ts" > /dev/null 2>&1; then
-                cp "$file" "supabase/functions/$func/index.ts"
-                echo "Synced $file -> supabase/functions/$func/index.ts"
+            edge="supabase/functions/$func/index.ts"
+            if [ -f "$edge" ] && [ -f "$file" ]; then
+              # Edge exists: sync edge → root (edge is source of truth)
+              if ! diff -q "$edge" "$file" > /dev/null 2>&1; then
+                cp "$edge" "$file"
+                echo "Synced $edge -> $file (edge is source of truth)"
                 synced=true
               fi
+            elif [ -f "$file" ] && [ ! -f "$edge" ]; then
+              # Edge doesn't exist: bootstrap from root
+              mkdir -p "supabase/functions/$func"
+              cp "$file" "$edge"
+              echo "Bootstrapped $file -> $edge"
+              synced=true
             fi
           done
 

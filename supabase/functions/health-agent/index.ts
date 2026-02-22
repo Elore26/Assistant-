@@ -13,48 +13,10 @@ interface WorkoutProgram { type: string; title: string; duration: number; exerci
 interface MealPlan { meal: string; time: string; foods: string; calories: number; protein: number; }
 interface DayHealthPlan { workout: WorkoutProgram | null; meals: MealPlan[]; fasting: { start: string; end: string; eating_window: string }; water_target: number; steps_target: number; supplements: string[]; }
 
-// --- Timezone ---
-function getIsraelNow(): Date {
-  return new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Jerusalem" }));
-}
-function todayStr(): string {
-  const d = getIsraelNow();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-}
-
-// --- OpenAI ---
-async function callOpenAI(systemPrompt: string, userContent: string, maxTokens = 800): Promise<string> {
-  const apiKey = Deno.env.get("OPENAI_API_KEY");
-  if (!apiKey) return "";
-  try {
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
-      body: JSON.stringify({
-        model: "gpt-4o-mini", temperature: 0.6, max_tokens: maxTokens,
-        messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userContent }],
-      }),
-    });
-    if (!response.ok) return "";
-    const data = await response.json();
-    return data.choices?.[0]?.message?.content || "";
-  } catch (e) { console.error("OpenAI error:", e); return ""; }
-}
-
-// --- Telegram ---
-async function sendTelegram(text: string): Promise<boolean> {
-  const token = Deno.env.get("TELEGRAM_BOT_TOKEN");
-  const chatId = Deno.env.get("TELEGRAM_CHAT_ID") || "775360436";
-  if (!token) return false;
-  try {
-    const r = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML" }),
-    });
-    return r.ok;
-  } catch (e) { console.error("TG error:", e); return false; }
-}
+// --- Shared Imports ---
+import { getIsraelNow, todayStr } from "../_shared/timezone.ts";
+import { callOpenAI } from "../_shared/openai.ts";
+import { sendTG } from "../_shared/telegram.ts";
 
 // ============================================
 // PROGRAMMES D'ENTRAÎNEMENT COMPLETS
@@ -351,14 +313,11 @@ async function getAICoachAdvice(supabase: any, plan: DayHealthPlan): Promise<str
   context += `Nutrition: Jeûne 16:8, fenêtre ${plan.fasting.eating_window}\n`;
 
   const advice = await callOpenAI(
-    `Tu es le coach santé personnel d'Oren. Profil: homme, ~75kg, objectif recomposition (muscle + perte de gras → 70kg).
-Programme: PPL 5x/semaine + jeûne intermittent 16:8.
-Donne un conseil UNIQUE et ACTIONNABLE pour aujourd'hui en 3-4 lignes max.
-Adapte le conseil au programme du jour et aux données récentes.
-Si les workouts manquent → motive. Si poids stagne → ajuste nutrition. Si bonne progression → félicite.
-Français, direct, coach sportif motivant. Emojis ok.`,
+    `Coach santé Oren. 75kg→70kg, PPL 5x/sem, IF 16:8.
+1 conseil ACTIONNABLE (3 lignes max). Adapte au jour + données.
+Français, direct, emojis ok.`,
     context,
-    250
+    150
   );
 
   return advice;
@@ -414,24 +373,34 @@ async function weeklyHealthReview(supabase: any): Promise<string> {
   // AI Weekly Analysis
   const aiContext = `Semaine: ${totalWorkouts}/5 workouts, ${totalMinutes} min total. Types: ${JSON.stringify(byType)}. Poids: ${weights.map((w: any) => w.value).join("→")}kg. Objectif: 70kg recomp.`;
   const aiReview = await callOpenAI(
-    `Tu es coach santé. Analyse la semaine d'Oren et donne:
-1) Score de la semaine /10
-2) Point fort de la semaine
-3) Axe d'amélioration principal
-4) Objectif précis pour la semaine prochaine
-5) Ajustement nutrition si nécessaire
-Max 6 lignes, français, direct.`,
-    aiContext, 350
+    `Coach santé. Bilan hebdo (5 points, 6 lignes max):
+Score /10 · Point fort · Axe amélioration · Objectif semaine prochaine · Ajustement nutrition si besoin.
+Français, direct.`,
+    aiContext, 250
   );
 
   if (aiReview) {
     msg += `\n<b>🧠 Analyse IA:</b>\n${aiReview}\n`;
   }
 
-  // Update goal metric_current with latest weight
+  // Update goal metric_current with latest weight + sync health rock
   if (goal && weights.length > 0) {
     const latestWeight = weights[weights.length - 1].value;
     await supabase.from("goals").update({ metric_current: latestWeight }).eq("id", goal.id);
+    // Sync health rock progress
+    try {
+      const { data: healthRock } = await supabase.from("rocks").select("id")
+        .eq("domain", "health").in("current_status", ["on_track", "off_track"]).limit(1);
+      if (healthRock && healthRock.length > 0) {
+        const targetWeight = Number(goal.metric_target) || 70;
+        const onTrack = latestWeight <= targetWeight * 1.05; // within 5% of target
+        await supabase.from("rocks").update({
+          progress_notes: `Poids: ${latestWeight}kg (objectif ${targetWeight}kg), ${workouts.length} workouts cette semaine`,
+          current_status: onTrack ? "on_track" : "off_track",
+          updated_at: new Date().toISOString(),
+        }).eq("id", healthRock[0].id);
+      }
+    } catch (_) {}
   }
 
   return msg;
@@ -561,22 +530,58 @@ serve(async (req: Request) => {
       console.error("[Signals] Health error:", sigErr);
     }
 
-    await sendTelegram(message);
+    // Send compact notification with 2 buttons (not the full wall of text)
+    let notif = `<b>🏋️ Coach Santé — ${todayStr()}</b>\n`;
+    if (plan.workout) {
+      notif += `${plan.workout.title}\n⏰ ${scheduleEntry.time} · ${plan.workout.duration} min\n`;
+    }
+    if (workoutDone) {
+      const w = todayWorkouts![0];
+      notif += `\n✅ Workout fait: ${w.workout_type} ${w.duration_minutes}min`;
+    } else {
+      notif += `\n⏳ Workout prévu: ${scheduleEntry.time}`;
+    }
+    if (aiAdvice) {
+      // Keep AI advice short — max 2 lines
+      const shortAdvice = aiAdvice.split("\n").slice(0, 2).join("\n");
+      notif += `\n\n💡 ${shortAdvice}`;
+    }
+
+    await sendTG(notif, {
+      buttons: [
+        [{ text: "💪 Mon Entraînement", callback_data: "morning_sport" }, { text: "🍽 Mon Alimentation", callback_data: "morning_nutrition" }],
+        [{ text: "🔙 Menu", callback_data: "menu_main" }],
+      ],
+    });
+
+    // Save full message to DB for retrieval via buttons
+    try {
+      await supabase.from("health_logs").insert({
+        log_type: "daily_message", log_date: todayStr(),
+        notes: message,
+      });
+    } catch (_) {}
 
     // 6. Weekly review on Sunday
     let weeklyMsg = "";
     if (isSunday) {
       weeklyMsg = await weeklyHealthReview(supabase);
-      await sendTelegram(weeklyMsg);
+      await sendTG(weeklyMsg);
       responseType = "weekly";
     }
 
-    // 7. Save analysis
-    await supabase.from("health_logs").insert({
-      log_type: "agent_analysis",
-      log_date: today,
-      notes: JSON.stringify({ type: responseType, tasks_created: tasksCreated, workout_done: workoutDone }),
-    }).then(() => {}).catch(() => {});
+    // 7. Save analysis (dedup: skip if already saved today)
+    try {
+      const { data: existingAnalysis } = await supabase.from("health_logs")
+        .select("id").eq("log_type", "agent_analysis").eq("log_date", today).limit(1);
+      if (!existingAnalysis || existingAnalysis.length === 0) {
+        await supabase.from("health_logs").insert({
+          log_type: "agent_analysis",
+          log_date: today,
+          notes: JSON.stringify({ type: responseType, tasks_created: tasksCreated, workout_done: workoutDone }),
+        });
+      }
+    } catch (_) {}
 
     return new Response(JSON.stringify({
       success: true,

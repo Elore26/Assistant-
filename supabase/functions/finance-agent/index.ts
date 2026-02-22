@@ -1,25 +1,9 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { getSignalBus } from "../_shared/agent-signals.ts";
-
-// ─── AI Helper ──────────────────────────────────────────────────────────
-async function callOpenAI(systemPrompt: string, userContent: string, maxTokens = 500): Promise<string> {
-  const apiKey = Deno.env.get("OPENAI_API_KEY");
-  if (!apiKey) return "";
-  try {
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
-      body: JSON.stringify({
-        model: "gpt-4o-mini", temperature: 0.7, max_tokens: maxTokens,
-        messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userContent }],
-      }),
-    });
-    if (!response.ok) return "";
-    const data = await response.json();
-    return data.choices?.[0]?.message?.content || "";
-  } catch (e) { console.error("OpenAI error:", e); return ""; }
-}
+import { getIsraelNow, dateStr, monthStart, weekStart } from "../_shared/timezone.ts";
+import { callOpenAI } from "../_shared/openai.ts";
+import { sendTG } from "../_shared/telegram.ts";
 
 // ─── Interfaces ─────────────────────────────────────────────────────────
 interface CategoryBudget {
@@ -74,47 +58,11 @@ interface MonthlySummary {
   projectedSavingsRate: number;
 }
 
-// ─── Date Helpers ───────────────────────────────────────────────────────
-function getIsraeliDate(): Date {
-  const now = new Date();
-  const utcDate = new Date(now.getTime() + now.getTimezoneOffset() * 60000);
-  return new Date(utcDate.getTime() + 2 * 60 * 60 * 1000);
-}
-
-function dateStr(d: Date): string {
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-}
-
-function monthStart(d: Date): string {
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-01`;
-}
-
+// ─── Date Helpers (local — uses shared dateStr) ─────────────────────────
 function prevMonthRange(d: Date): { start: string; end: string } {
   const prev = new Date(d.getFullYear(), d.getMonth() - 1, 1);
   const end = new Date(d.getFullYear(), d.getMonth(), 0);
   return { start: dateStr(prev), end: dateStr(end) };
-}
-
-function weekStart(d: Date): string {
-  const dd = new Date(d);
-  const day = dd.getDay();
-  const diff = dd.getDate() - day + (day === 0 ? -6 : 1);
-  return dateStr(new Date(dd.setDate(diff)));
-}
-
-// ─── Telegram ───────────────────────────────────────────────────────────
-async function sendTG(message: string): Promise<boolean> {
-  const botToken = Deno.env.get("TELEGRAM_BOT_TOKEN");
-  const chatId = Deno.env.get("TELEGRAM_CHAT_ID") || "775360436";
-  if (!botToken) return false;
-  try {
-    const res = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, text: message }),
-    });
-    return res.ok;
-  } catch { return false; }
 }
 
 // ─── Normalize Category ─────────────────────────────────────────────────
@@ -183,7 +131,7 @@ async function getMonthlyData(supabase: any, from: string, to: string): Promise<
     .gte("transaction_date", from)
     .lte("transaction_date", to);
 
-  const now = getIsraeliDate();
+  const now = getIsraelNow();
   const dim = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
   const dom = now.getDate();
 
@@ -266,7 +214,7 @@ async function getCategoryStatus(
 }
 
 async function getTrends(supabase: any, currentMonth: MonthlySummary): Promise<TrendData[]> {
-  const now = getIsraeliDate();
+  const now = getIsraelNow();
   const prev = prevMonthRange(now);
   const { data } = await supabase.from("finance_logs")
     .select("amount, category")
@@ -311,7 +259,7 @@ async function getDaysSinceLastCashLog(supabase: any): Promise<number> {
 
   if (!data || data.length === 0) return 999; // Never logged cash
   const lastDate = new Date(data[0].transaction_date);
-  const now = getIsraeliDate();
+  const now = getIsraelNow();
   return Math.floor((now.getTime() - lastDate.getTime()) / (1000 * 60 * 60 * 24));
 }
 
@@ -384,13 +332,21 @@ async function processFinanceAgent(): Promise<any> {
   }
 
   const supabase = createClient(supabaseUrl, supabaseKey);
-  const now = getIsraeliDate();
+  const now = getIsraelNow();
   const today = dateStr(now);
-  const mStart = monthStart(now);
+  const mStart = monthStart();
   const isSunday = now.getDay() === 0;
   const targetSavingsRate = 20;
 
   try {
+    // --- Deduplication: skip if already processed today ---
+    const { data: existingReport } = await supabase.from("finance_reports")
+      .select("id").eq("report_date", today).limit(1);
+    if (existingReport && existingReport.length > 0) {
+      console.log(`[Finance] Already processed today (${today}), skipping duplicate`);
+      return { success: true, type: "skipped_duplicate", date: today };
+    }
+
     const signals = getSignalBus("finance");
 
     // ─── Fetch all data in parallel ─────────────────────────────
@@ -554,7 +510,7 @@ async function processFinanceAgent(): Promise<any> {
 
     // ─── Weekly Summary (Sunday) ────────────────────────────────
     if (isSunday) {
-      const wStart = weekStart(now);
+      const wStart = weekStart();
 
       // Get weekly data
       const { data: weekData } = await supabase.from("finance_logs")

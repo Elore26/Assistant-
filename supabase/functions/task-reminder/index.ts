@@ -1,26 +1,14 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { getSignalBus } from "../_shared/agent-signals.ts";
+import { getIsraelNow, todayStr, timeStr } from "../_shared/timezone.ts";
+import { sendTG, escHTML } from "../_shared/telegram.ts";
+import { analyzeReminderEffectiveness } from "../_shared/intelligence-engine.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") || "";
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
-const TELEGRAM_BOT_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN") || "";
-const TELEGRAM_CHAT_ID = Deno.env.get("TELEGRAM_CHAT_ID") || "775360436";
 
 const LINE = "━━━━━━━━━━━━━━━━━━━━";
-
-function getIsraelNow(): Date {
-  return new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Jerusalem" }));
-}
-
-function todayStr(): string {
-  const d = getIsraelNow();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-}
-
-function timeStr(d: Date): string {
-  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
-}
 
 function addMinutes(d: Date, min: number): Date {
   return new Date(d.getTime() + min * 60000);
@@ -44,38 +32,6 @@ function getScheduleEvents(dow: number): Array<{ time: string; label: string }> 
     events.push({ time: dow === 0 ? "19:30" : "15:30", label: "Fin bureau" });
   }
   return events;
-}
-
-// Send TG with optional inline keyboard
-async function sendTG(text: string, buttons?: any[][]): Promise<boolean> {
-  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-  const payload: any = {
-    chat_id: TELEGRAM_CHAT_ID,
-    text,
-    parse_mode: "HTML",
-    disable_web_page_preview: true,
-  };
-  if (buttons && buttons.length > 0) {
-    payload.reply_markup = { inline_keyboard: buttons };
-  }
-
-  let r = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  if (r.ok) return true;
-  // Fallback plain (without buttons)
-  r = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: text.replace(/<[^>]*>/g, "") }),
-  });
-  return r.ok;
-}
-
-function esc(s: string): string {
-  return (s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 serve(async (_req: Request) => {
@@ -129,7 +85,7 @@ serve(async (_req: Request) => {
         for (const t of filteredUpcoming) {
           const p = (t.priority || 3) <= 2 ? "●" : (t.priority || 3) === 3 ? "◐" : "○";
           const dur = t.duration_minutes ? ` · ${t.duration_minutes}min` : "";
-          msg += `${p} ${esc(t.title)} → <b>${t.due_time?.substring(0, 5)}</b>${dur}\n`;
+          msg += `${p} ${escHTML(t.title)} → <b>${t.due_time?.substring(0, 5)}</b>${dur}\n`;
         }
       }
 
@@ -147,6 +103,16 @@ serve(async (_req: Request) => {
       if (upcoming && upcoming.length > 0) {
         const ids = upcoming.map(t => t.id);
         await supabase.from("tasks").update({ reminder_sent: true }).in("id", ids);
+      }
+
+      // Track reminder effectiveness
+      for (const t of filteredUpcoming) {
+        try {
+          await supabase.from("reminder_effectiveness").insert({
+            task_id: t.id, reminder_type: "upcoming",
+            hour_sent: now.getHours(), day_of_week: dow,
+          });
+        } catch (_) {}
       }
     }
 
@@ -178,7 +144,7 @@ serve(async (_req: Request) => {
           const delay = diffMin(t.due_time?.substring(0, 5) || nowTime, nowTime);
           const rBadge = t.urgency_level === "critique" ? "🔴" : t.urgency_level === "urgent" ? "🟠" : t.urgency_level === "attention" ? "🟡" : "";
           const rInfo = (t.reschedule_count || 0) > 0 ? ` (report x${t.reschedule_count})` : "";
-          nudgeMsg += `⚠️ ${rBadge}${esc(t.title)} — <b>${delay}min</b> retard${rInfo}\n`;
+          nudgeMsg += `⚠️ ${rBadge}${escHTML(t.title)} — <b>${delay}min</b> retard${rInfo}\n`;
 
           buttons.push([
             { text: `✅ Fait`, callback_data: `tdone_${t.id}` },
@@ -188,12 +154,22 @@ serve(async (_req: Request) => {
         }
 
         nudgeMsg += `\nQu'est-ce qui bloque ?`;
-        await sendTG(nudgeMsg, buttons);
+        await sendTG(nudgeMsg, { buttons });
         reminderCount += missed.length;
 
         // Mark missed tasks as reminded to prevent duplicate nudges
         const missedIds = missed.map((t: any) => t.id);
         await supabase.from("tasks").update({ reminder_sent: true }).in("id", missedIds);
+
+        // Track reminder effectiveness
+        for (const t of missed) {
+          try {
+            await supabase.from("reminder_effectiveness").insert({
+              task_id: t.id, reminder_type: "missed",
+              hour_sent: now.getHours(), day_of_week: dow,
+            });
+          } catch (_) {}
+        }
       }
     }
 
@@ -210,39 +186,277 @@ serve(async (_req: Request) => {
         .gte("updated_at", twoHoursAgo)
         .limit(1);
 
-      // Check if there are pending tasks today
+      // Check if there are pending tasks today that are ACTIONABLE now
+      // Exclude tasks with a due_time more than 1h in the future (e.g. RDV at 19:00 shouldn't nudge at 10:00)
+      const in1h = timeStr(addMinutes(now, 60));
       const { data: pendingToday } = await supabase
         .from("tasks")
-        .select("id, title, priority")
+        .select("id, title, priority, due_time")
         .eq("due_date", today)
         .in("status", ["pending", "in_progress"])
         .is("parent_task_id", null)
         .order("priority", { ascending: true })
-        .limit(1);
+        .limit(10);
 
-      if ((!recentDone || recentDone.length === 0) && pendingToday && pendingToday.length > 0) {
+      // Filter: keep tasks with no due_time OR due_time within the next hour
+      const actionable = (pendingToday || []).filter((t: any) => {
+        if (!t.due_time) return true; // No specific time = actionable anytime
+        const taskTime = t.due_time.substring(0, 5);
+        return taskTime <= in1h; // Due now or within next hour
+      });
+
+      if ((!recentDone || recentDone.length === 0) && actionable.length > 0) {
         // Only send idle nudge once per 2h block (check minutes)
         const min = now.getMinutes();
         if (min >= 0 && min < 15) {
-          const nextTask = pendingToday[0];
-          let idleMsg = `<b>💪 NUDGE</b>\n`;
-          idleMsg += `Rien complété depuis 2h. Ta prochaine tâche :\n\n`;
-          idleMsg += `→ <b>${esc(nextTask.title)}</b>\n\n`;
-          idleMsg += `Commence par 5 minutes. C'est tout.`;
+          // DEDUP: check if we already sent an idle nudge in the last 2 hours
+          const twoHoursAgoISO = new Date(now.getTime() - 2 * 60 * 60 * 1000).toISOString();
+          const { data: recentNudge } = await supabase
+            .from("agent_executions")
+            .select("id")
+            .eq("agent_name", "task-reminder-idle")
+            .gte("executed_at", twoHoursAgoISO)
+            .limit(1);
 
-          await sendTG(idleMsg, [
-            [
-              { text: "✅ J'y suis", callback_data: `tstart_${nextTask.id}` },
-              { text: "🍅 Pomodoro", callback_data: `pomo_start_${nextTask.id}` },
-            ],
-            [
-              { text: "⏰ +1h", callback_data: `tsnz1h_${nextTask.id}` },
-              { text: "🔄 Reporter", callback_data: `reschedule_${nextTask.id}` },
-            ],
-          ]);
-          reminderCount++;
+          if (!recentNudge || recentNudge.length === 0) {
+            const nextTask = actionable[0];
+            let idleMsg = `<b>💪 NUDGE</b>\n`;
+            idleMsg += `Rien complété depuis 2h. Ta prochaine tâche :\n\n`;
+            idleMsg += `→ <b>${escHTML(nextTask.title)}</b>\n\n`;
+            idleMsg += `Commence par 5 minutes. C'est tout.`;
+
+            await sendTG(idleMsg, {
+              buttons: [
+                [
+                  { text: "✅ J'y suis", callback_data: `tstart_${nextTask.id}` },
+                  { text: "🍅 Pomodoro", callback_data: `pomo_start_${nextTask.id}` },
+                ],
+                [
+                  { text: "⏰ +1h", callback_data: `tsnz1h_${nextTask.id}` },
+                  { text: "🔄 Reporter", callback_data: `reschedule_${nextTask.id}` },
+                ],
+              ],
+            });
+            reminderCount++;
+
+            // Log execution for dedup
+            try {
+              await supabase.from("agent_executions").insert({
+                agent_name: "task-reminder-idle",
+                executed_at: new Date().toISOString(),
+                result_summary: `Nudged: ${nextTask.title}`,
+              });
+            } catch (_) { /* dedup log non-critical */ }
+          }
         }
       }
+    }
+
+    // ─── 3b. MID-DAY CAREER CHECK — if 0 apps today, alert ──────
+    if (!focusActive && dow !== 6 && hour >= 14 && hour <= 16 && now.getMinutes() < 15) {
+      try {
+        // Check if career nudge already sent today
+        const { data: careerNudge } = await supabase.from("agent_executions")
+          .select("id").eq("agent_name", "task-reminder-career")
+          .gte("executed_at", today + "T00:00:00").limit(1);
+
+        if (!careerNudge || careerNudge.length === 0) {
+          // Count today's career task completions
+          const { data: careerDoneToday } = await supabase.from("tasks")
+            .select("id").eq("status", "completed")
+            .eq("agent_type", "career")
+            .gte("completed_at", today + "T00:00:00").limit(1);
+
+          // Count today's new applications
+          const { data: appliedToday } = await supabase.from("job_listings")
+            .select("id").eq("status", "applied").eq("applied_date", today).limit(1);
+
+          const hasCareerAction = (careerDoneToday && careerDoneToday.length > 0) ||
+            (appliedToday && appliedToday.length > 0);
+
+          if (!hasCareerAction) {
+            // Get a recommended job to apply to
+            const { data: topJob } = await supabase.from("job_listings")
+              .select("id, title, company, job_url")
+              .eq("status", "new")
+              .order("date_posted", { ascending: false })
+              .limit(1);
+
+            let careerMsg = `<b>💼 CAREER CHECK</b> — ${nowTime}\n${LINE}\n`;
+            careerMsg += `0 candidatures aujourd'hui.\n\n`;
+
+            if (topJob && topJob.length > 0) {
+              const job = topJob[0];
+              careerMsg += `Offre recommandée:\n→ <b>${escHTML(job.title)}</b> @ ${escHTML(job.company)}\n`;
+              if (job.job_url) careerMsg += `${job.job_url}\n`;
+
+              await sendTG(careerMsg, {
+                buttons: [[
+                  { text: `✅ Postulé`, callback_data: `job_applied_${job.id}` },
+                  { text: `📝 Lettre`, callback_data: `job_cover_${job.id}` },
+                  { text: `📋 Toutes`, callback_data: `menu_jobs` },
+                ]],
+              });
+            } else {
+              careerMsg += `Aucune offre en attente. Ajoute des offres manuellement.`;
+              await sendTG(careerMsg);
+            }
+
+            reminderCount++;
+            await supabase.from("agent_executions").insert({
+              agent_name: "task-reminder-career",
+              executed_at: new Date().toISOString(),
+              result_summary: "Career nudge sent",
+            });
+          }
+        }
+      } catch (careerErr) { console.error("[Career nudge] Error:", careerErr); }
+    }
+
+    // ─── 3c. EVENING SCORE PREVIEW — 19:00 push if score low ──
+    if (!focusActive && dow !== 6 && hour === 19 && now.getMinutes() < 15) {
+      try {
+        const { data: previewNudge } = await supabase.from("agent_executions")
+          .select("id").eq("agent_name", "task-reminder-preview")
+          .gte("executed_at", today + "T00:00:00").limit(1);
+
+        if (!previewNudge || previewNudge.length === 0) {
+          // Quick score calculation
+          const { count: doneCount } = await supabase.from("tasks")
+            .select("id", { count: "exact", head: true })
+            .eq("status", "completed").gte("updated_at", today + "T00:00:00");
+
+          const { count: workoutCount } = await supabase.from("health_logs")
+            .select("id", { count: "exact", head: true })
+            .eq("log_type", "workout").eq("log_date", today);
+
+          const { count: studyCount } = await supabase.from("study_sessions")
+            .select("id", { count: "exact", head: true })
+            .eq("session_date", today);
+
+          const quickScore = Math.min(3, doneCount || 0) +
+            ((workoutCount || 0) > 0 ? 2 : 0) +
+            ((studyCount || 0) > 0 ? 1 : 0);
+
+          if (quickScore < 4) {
+            let previewMsg = `<b>⚡ SCORE PREVIEW</b> — ${quickScore}/6\n${LINE}\n`;
+            previewMsg += `Il te reste ~2h avant le bilan.\n\n`;
+            if ((workoutCount || 0) === 0) previewMsg += `🏋️ Pas de workout → +2 points\n`;
+            if ((studyCount || 0) === 0) previewMsg += `📚 Pas d'étude → +1 point\n`;
+            if ((doneCount || 0) < 3) previewMsg += `📋 ${doneCount || 0}/3 tâches → fais-en ${3 - (doneCount || 0)} de plus\n`;
+
+            await sendTG(previewMsg);
+            reminderCount++;
+
+            await supabase.from("agent_executions").insert({
+              agent_name: "task-reminder-preview",
+              executed_at: new Date().toISOString(),
+              result_summary: `Score preview: ${quickScore}/6`,
+            });
+          }
+        }
+      } catch (prevErr) { console.error("[Preview] Error:", prevErr); }
+    }
+
+    // ─── 3d. CIR-BASED ALERTS (Critical Information Requirements) ──
+    // Check CIRs once per hour (at minute 0-14)
+    if (!focusActive && dow !== 6 && hour >= 8 && hour <= 21 && now.getMinutes() < 15) {
+      try {
+        // Dedup: only check CIRs once per hour
+        const { data: cirNudge } = await supabase.from("agent_executions")
+          .select("id").eq("agent_name", "task-reminder-cir")
+          .gte("executed_at", new Date(now.getTime() - 60 * 60 * 1000).toISOString())
+          .limit(1);
+
+        if (!cirNudge || cirNudge.length === 0) {
+          const { data: activeCIRs } = await supabase.from("critical_info_requirements")
+            .select("*").eq("active", true).eq("alert_priority", 1);
+
+          for (const cir of activeCIRs || []) {
+            let triggered = false;
+            let alertMsg = "";
+
+            if (cir.condition_type === "job_status_change" && cir.condition_config?.value === "interview") {
+              // Check if any job moved to interview status today
+              const { data: newInterviews } = await supabase.from("job_listings")
+                .select("company, title")
+                .eq("status", "interview")
+                .gte("updated_at", today + "T00:00:00")
+                .limit(3);
+              if (newInterviews && newInterviews.length > 0) {
+                triggered = true;
+                alertMsg = `🔴 <b>CIR: ${escHTML(cir.title)}</b>\n\n`;
+                for (const job of newInterviews) {
+                  alertMsg += `→ ${escHTML(job.company)} — ${escHTML(job.title)}\n`;
+                }
+                alertMsg += `\nPrépare-toi immédiatement !`;
+              }
+            }
+
+            if (triggered && alertMsg) {
+              await sendTG(alertMsg, {
+                buttons: [[
+                  { text: "📋 Voir pipeline", callback_data: "menu_jobs" },
+                  { text: "🪨 Rocks", callback_data: "menu_rocks" },
+                ]],
+              });
+              reminderCount++;
+            }
+          }
+
+          // Log execution for dedup
+          await supabase.from("agent_executions").insert({
+            agent_name: "task-reminder-cir",
+            executed_at: new Date().toISOString(),
+            result_summary: `CIR check done`,
+          });
+        }
+      } catch (cirErr) { console.error("[CIR] Error:", cirErr); }
+    }
+
+    // ─── 3e. ROCK DEADLINE ANTICIPATORY ALERTS ───────────────────
+    // Once daily at 10:00 — check if any Rock deadline < 14 days
+    if (!focusActive && dow !== 6 && hour === 10 && now.getMinutes() < 15) {
+      try {
+        const { data: rockAlert } = await supabase.from("agent_executions")
+          .select("id").eq("agent_name", "task-reminder-rock")
+          .gte("executed_at", today + "T00:00:00").limit(1);
+
+        if (!rockAlert || rockAlert.length === 0) {
+          const { data: urgentRocks } = await supabase.from("rocks")
+            .select("title, domain, quarter_end, current_status")
+            .in("current_status", ["on_track", "off_track"]);
+
+          const warnings: string[] = [];
+          for (const rock of urgentRocks || []) {
+            const daysLeft = Math.ceil((new Date(rock.quarter_end).getTime() - now.getTime()) / 86400000);
+            if (daysLeft <= 14 && daysLeft > 0) {
+              const emoji = rock.current_status === "off_track" ? "🔴" : "🟡";
+              warnings.push(`${emoji} ${escHTML(rock.title)} — J-${daysLeft} (${rock.current_status.replace("_", " ")})`);
+            }
+          }
+
+          if (warnings.length > 0) {
+            let rockMsg = `<b>🪨 ROCK DEADLINE ALERT</b>\n━━━━━━━━━━━━━━━━━━━━\n\n`;
+            rockMsg += warnings.join("\n");
+            rockMsg += `\n\nConcentre-toi sur ces priorités.`;
+
+            await sendTG(rockMsg, {
+              buttons: [[
+                { text: "🪨 Voir Rocks", callback_data: "menu_rocks" },
+                { text: "📊 Scorecard", callback_data: "menu_scorecard" },
+              ]],
+            });
+            reminderCount++;
+          }
+
+          await supabase.from("agent_executions").insert({
+            agent_name: "task-reminder-rock",
+            executed_at: new Date().toISOString(),
+            result_summary: `Rock check: ${warnings.length} alerts`,
+          });
+        }
+      } catch (rockErr) { console.error("[Rock alert] Error:", rockErr); }
     }
 
     // ─── 4. RECURRING TASKS SPAWNER ──────────────────────────────
@@ -330,12 +544,14 @@ serve(async (_req: Request) => {
             }
           }
 
-          await sendTG(`🍅 <b>POMODORO TERMINÉ !</b>\n\n${esc(taskName)}\n☕ Pause 5 min.`, [
-            [
-              { text: "🍅 Encore un !", callback_data: session.task_id ? `pomo_start_${session.task_id}` : "pomo_start_free" },
-              { text: "✅ Tâche finie", callback_data: session.task_id ? `tdone_${session.task_id}` : "menu_tasks" },
+          await sendTG(`🍅 <b>POMODORO TERMINÉ !</b>\n\n${escHTML(taskName)}\n☕ Pause 5 min.`, {
+            buttons: [
+              [
+                { text: "🍅 Encore un !", callback_data: session.task_id ? `pomo_start_${session.task_id}` : "pomo_start_free" },
+                { text: "✅ Tâche finie", callback_data: session.task_id ? `tdone_${session.task_id}` : "menu_tasks" },
+              ],
             ],
-          ]);
+          });
           reminderCount++;
         }
       }
@@ -349,12 +565,19 @@ serve(async (_req: Request) => {
           .eq("is_inbox", true).in("status", ["pending", "in_progress"]);
 
         if (inboxCount && inboxCount > 0) {
-          await sendTG(`📥 <b>${inboxCount} tâche(s) dans l'inbox</b>\nPrends 2 min pour trier.`, [
-            [{ text: "📥 Trier l'inbox", callback_data: "menu_inbox" }],
-          ]);
+          await sendTG(`📥 <b>${inboxCount} tâche(s) dans l'inbox</b>\nPrends 2 min pour trier.`, {
+            buttons: [[{ text: "📥 Trier l'inbox", callback_data: "menu_inbox" }]],
+          });
           reminderCount++;
         }
       } catch (ibxErr) { console.error("[Inbox] Reminder error:", ibxErr); }
+    }
+
+    // ─── 7. BACKFILL REMINDER EFFECTIVENESS (once/hour) ────────
+    if (now.getMinutes() < 15) {
+      try {
+        await analyzeReminderEffectiveness(supabase);
+      } catch (e) { console.error("[Intelligence] Effectiveness backfill:", e); }
     }
 
     return new Response(
