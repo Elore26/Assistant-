@@ -422,7 +422,7 @@ registry.register(
     tier: "gated",
     parameters: [
       { name: "text", type: "string", description: "Message text (HTML supported)", required: true },
-      { name: "buttons", type: "array", description: "Optional inline keyboard buttons — array of rows, each row is an array of {text, callback_data}", required: false, items: { type: "array", properties: { text: { type: "string" }, callback_data: { type: "string" } } } },
+      { name: "buttons", type: "array", description: "Optional inline keyboard buttons — array of rows, each row is an array of {text, callback_data}", required: false, items: { type: "array", items: { type: "object", properties: { text: { type: "string" }, callback_data: { type: "string" } } } } },
     ],
   },
   async (args, _ctx) => {
