@@ -1066,8 +1066,7 @@ Ton = empathique, direct, data-driven. JAMAIS de honte/culpabilité. Max 120 mot
           } catch (_) {}
         }
 
-        // Pattern learning (background, no TG, no retro message)
-        try { await learnPatterns(supabase); } catch (_) {}
+        // Pattern learning already called above (line 917), skip duplicate on Sunday
 
         // Save weekly briefing record
         try {

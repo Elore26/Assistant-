@@ -263,17 +263,7 @@ async function getDaysSinceLastCashLog(supabase: any): Promise<number> {
   return Math.floor((now.getTime() - lastDate.getTime()) / (1000 * 60 * 60 * 24));
 }
 
-// ─── Report Saver ───────────────────────────────────────────────────────
-async function saveReport(supabase: any, type: string, date: string, content: string, metrics: any) {
-  try {
-    await supabase.from("finance_reports").insert({
-      report_type: type,
-      report_date: date,
-      content,
-      metrics,
-    });
-  } catch (e) { console.error("Error saving report:", e); }
-}
+// saveReport removed — finance_reports was write-only waste table
 
 // ─── Goal Updater ───────────────────────────────────────────────────────
 async function updateSavingsGoal(supabase: any, savingsRate: number) {
@@ -340,9 +330,10 @@ async function processFinanceAgent(): Promise<any> {
 
   try {
     // --- Deduplication: skip if already processed today ---
-    const { data: existingReport } = await supabase.from("finance_reports")
-      .select("id").eq("report_date", today).limit(1);
-    if (existingReport && existingReport.length > 0) {
+    const { data: existingRun } = await supabase.from("agent_executions")
+      .select("id").eq("agent_name", "finance-agent")
+      .gte("executed_at", today + "T00:00:00").limit(1);
+    if (existingRun && existingRun.length > 0) {
       console.log(`[Finance] Already processed today (${today}), skipping duplicate`);
       return { success: true, type: "skipped_duplicate", date: today };
     }
@@ -409,15 +400,7 @@ async function processFinanceAgent(): Promise<any> {
         msg += `\n💵 Cash: ₪${daily.cashTotal.toFixed(0)} · 💳 Carte: ₪${daily.cardTotal.toFixed(0)}`;
       }
 
-      // AI advice
-      const catList = Object.entries(daily.byCategory)
-        .map(([c, a]) => `${c}: ₪${(a as number).toFixed(0)}`).join(", ");
-      const advice = await callOpenAI(
-        "Tu es conseiller financier d'Oren. Donne un conseil court (2 lignes) pour demain.",
-        `Budget jour: ₪${dailyBudget.toFixed(0)}. Dépensé: ₪${daily.total.toFixed(0)}. Détail: ${catList}. Excès: ₪${excess.toFixed(0)}.`,
-        80
-      );
-      if (advice) msg += `\n\n💡 ${advice}`;
+      // AI daily advice removed — saves ~80 tokens/day, evening coach already covers this
 
       await sendTG(msg);
       alerts.push("daily_budget_alert");
@@ -620,24 +603,17 @@ Donne 3 insights SPÉCIFIQUES avec chiffres. Max 4 lignes. Français.`;
 
       weeklySent = await sendTG(msg);
 
-      // Save weekly report
-      await saveReport(supabase, "weekly", today, msg, {
-        weekIncome, weekExpense, weekSavings, weekDailyAvg,
-        weekByCategory, cashPct: monthly.cashPct,
-        projectedSavingsRate: monthly.projectedSavingsRate,
-      });
+      weeklySent = true;
     }
 
-    // ─── Save daily report (clean, no more polluting finance_logs) ──
-    await saveReport(supabase, "daily", today,
-      `Daily: ₪${daily.total.toFixed(0)} (${daily.count}tx) | Month: ₪${monthly.totalExpense.toFixed(0)}/₪${monthly.totalIncome.toFixed(0)} (${monthly.savingsRate}%)`,
-      {
-        daily: { total: daily.total, count: daily.count, byCategory: daily.byCategory, cash: daily.cashTotal },
-        monthly: { expense: monthly.totalExpense, income: monthly.totalIncome, savingsRate: monthly.savingsRate },
-        alerts,
-        categoryStatus: categoryStatus.map(c => ({ cat: c.category, amt: c.amount, budget: c.budget, pct: c.pct, status: c.status })),
-      }
-    );
+    // Save execution for dedup (replaces write-only finance_reports)
+    try {
+      await supabase.from("agent_executions").insert({
+        agent_name: "finance-agent",
+        executed_at: new Date().toISOString(),
+        result_summary: `Daily: ₪${daily.total.toFixed(0)} (${daily.count}tx) | Savings: ${monthly.savingsRate}% | Alerts: ${alerts.length}`,
+      });
+    } catch (_) {}
 
     return {
       success: true,

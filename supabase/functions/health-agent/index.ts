@@ -276,52 +276,7 @@ async function createHealthTasks(supabase: any, plan: DayHealthPlan, scheduleEnt
   return created;
 }
 
-// ============================================
-// AI COACHING PERSONNALISÉ
-// ============================================
-
-async function getAICoachAdvice(supabase: any, plan: DayHealthPlan): Promise<string> {
-  // Fetch recent data for context
-  const today = todayStr();
-  const weekAgo = new Date(getIsraelNow().getTime() - 7 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
-
-  const [weightsRes, workoutsRes, goalsRes] = await Promise.all([
-    supabase.from("health_logs").select("value, log_date").eq("log_type", "weight").order("log_date", { ascending: false }).limit(7),
-    supabase.from("health_logs").select("workout_type, duration_minutes, log_date").eq("log_type", "workout").gte("log_date", weekAgo).order("log_date", { ascending: false }),
-    supabase.from("goals").select("title, metric_current, metric_target, metric_unit, deadline, daily_actions").eq("domain", "health").eq("status", "active").limit(1),
-  ]);
-
-  const weights = weightsRes.data || [];
-  const workouts = workoutsRes.data || [];
-  const goal = goalsRes.data?.[0] || null;
-
-  let context = `DONNÉES SANTÉ D'OREN:\n`;
-  if (weights.length > 0) {
-    context += `Poids actuel: ${weights[0].value}kg\n`;
-    if (weights.length > 1) context += `Poids il y a 7 jours: ${weights[weights.length - 1].value}kg\n`;
-  }
-  context += `Workouts cette semaine: ${workouts.length}\n`;
-  workouts.forEach(w => { context += `  - ${w.workout_type} ${w.duration_minutes}min (${w.log_date})\n`; });
-
-  if (goal) {
-    context += `\nOBJECTIF: ${goal.title}\n`;
-    context += `Cible: ${goal.metric_target}${goal.metric_unit}\n`;
-    context += `Deadline: ${goal.deadline}\n`;
-  }
-
-  context += `\nPLAN DU JOUR: ${plan.workout?.title || "Repos"}\n`;
-  context += `Nutrition: Jeûne 16:8, fenêtre ${plan.fasting.eating_window}\n`;
-
-  const advice = await callOpenAI(
-    `Coach santé Oren. 75kg→70kg, PPL 5x/sem, IF 16:8.
-1 conseil ACTIONNABLE (3 lignes max). Adapte au jour + données.
-Français, direct, emojis ok.`,
-    context,
-    150
-  );
-
-  return advice;
-}
+// getAICoachAdvice removed — daily AI advice was redundant with evening coach
 
 // ============================================
 // WEEKLY REVIEW COMPLÈTE
@@ -447,11 +402,7 @@ serve(async (req: Request) => {
     // 3. Build and send daily health message
     let message = formatWorkoutMessage(plan, scheduleEntry);
 
-    // 4. AI Coach advice
-    const aiAdvice = await getAICoachAdvice(supabase, plan);
-    if (aiAdvice) {
-      message += `\n<b>🧠 Coach IA:</b>\n${aiAdvice}\n`;
-    }
+    // AI daily coach removed — saves ~150 tokens/day, plan is static and doesn't need daily AI commentary
 
     // 5. Workout status
     if (workoutDone) {
@@ -461,9 +412,9 @@ serve(async (req: Request) => {
       message += `\n⏳ <b>Workout prévu:</b> ${scheduleEntry.time} — ${plan.workout?.title || "Repos"}\n`;
     }
 
-    // --- Inter-Agent Signals ---
+    // --- Inter-Agent Signals (minimal — only actionable alerts) ---
     try {
-      // Check sleep data and emit low_sleep signal
+      // Low sleep → affects morning briefing mode (recovery)
       const { data: sleepLog } = await supabase.from("health_logs")
         .select("value").eq("log_type", "sleep").eq("log_date", todayDate).limit(1);
       const sleepHours = sleepLog?.[0]?.value || null;
@@ -473,18 +424,7 @@ serve(async (req: Request) => {
         }, { priority: 2, ttlHours: 18 });
       }
 
-      // Check workout completion
-      const { data: todayWorkout } = await supabase.from("health_logs")
-        .select("id, workout_type, duration_minutes")
-        .eq("log_type", "workout").eq("log_date", todayDate).limit(1);
-      if (todayWorkout && todayWorkout.length > 0) {
-        await signals.emit("workout_completed", `Workout ${todayWorkout[0].workout_type || "done"} (${todayWorkout[0].duration_minutes || 0}min)`, {
-          type: todayWorkout[0].workout_type,
-          duration: todayWorkout[0].duration_minutes,
-        }, { priority: 4, ttlHours: 24 });
-      }
-
-      // Check cumulative fatigue (workouts this week)
+      // Cumulative fatigue → morning briefing suggests deload (reuse todayWorkouts)
       const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
       const { data: weekWorkouts } = await supabase.from("health_logs")
         .select("duration_minutes").eq("log_type", "workout")
@@ -497,35 +437,7 @@ serve(async (req: Request) => {
           workoutCount, totalMinutes, recommendation: "deload",
         }, { priority: 2, ttlHours: 24 });
       }
-
-      // Check if tomorrow has a workout scheduled (streak at risk)
-      const tomorrow = new Date();
-      tomorrow.setDate(tomorrow.getDate() + 1);
-      const tomorrowStr = tomorrow.toISOString().split("T")[0];
-      const { data: tomorrowTasks } = await supabase.from("tasks")
-        .select("id").eq("agent_type", "health").eq("due_date", tomorrowStr)
-        .in("status", ["pending", "in_progress"]).limit(1);
-
-      // Check current streak
-      const { data: recentWorkouts } = await supabase.from("health_logs")
-        .select("log_date").eq("log_type", "workout")
-        .order("log_date", { ascending: false }).limit(14);
-      let streak = 0;
-      if (recentWorkouts) {
-        const checkDate = new Date();
-        for (const w of recentWorkouts) {
-          const wDate = w.log_date;
-          const expected = checkDate.toISOString().split("T")[0];
-          if (wDate === expected) { streak++; checkDate.setDate(checkDate.getDate() - 1); }
-          else break;
-        }
-      }
-
-      if (streak >= 3 && (!tomorrowTasks || tomorrowTasks.length === 0)) {
-        await signals.emit("streak_at_risk", `Streak workout ${streak}j en danger: rien de prévu demain`, {
-          currentStreak: streak, tomorrow: tomorrowStr,
-        }, { priority: 2, ttlHours: 18 });
-      }
+      // workout_completed and streak_at_risk signals removed — low-value noise, streaks tracked by evening-review
     } catch (sigErr) {
       console.error("[Signals] Health error:", sigErr);
     }
@@ -541,12 +453,6 @@ serve(async (req: Request) => {
     } else {
       notif += `\n⏳ Workout prévu: ${scheduleEntry.time}`;
     }
-    if (aiAdvice) {
-      // Keep AI advice short — max 2 lines
-      const shortAdvice = aiAdvice.split("\n").slice(0, 2).join("\n");
-      notif += `\n\n💡 ${shortAdvice}`;
-    }
-
     await sendTG(notif, {
       buttons: [
         [{ text: "💪 Mon Entraînement", callback_data: "morning_sport" }, { text: "🍽 Mon Alimentation", callback_data: "morning_nutrition" }],

@@ -307,33 +307,7 @@ function getMotivationalMessage(streak: number): string {
   }
 }
 
-async function saveAnalysis(
-  supabase: ReturnType<typeof createClient>,
-  analysisText: string,
-  analysisType: string
-): Promise<boolean> {
-  try {
-    const todayDate = dateStr(getIsraelNow());
-
-    const { error } = await supabase.from("study_sessions").insert({
-      session_date: todayDate,
-      topic: "agent_analysis",
-      duration_minutes: 0,
-      notes: `[${analysisType}] ${analysisText}`,
-      created_at: new Date().toISOString(),
-    });
-
-    if (error) {
-      console.error("Error saving analysis:", error);
-      return false;
-    }
-
-    return true;
-  } catch (error) {
-    console.error("Error in saveAnalysis:", error);
-    return false;
-  }
-}
+// saveAnalysis removed — was creating fake study_sessions entries with duration=0
 
 async function processLearningAgent() {
   const signals = getSignalBus("learning");
@@ -451,17 +425,11 @@ async function processLearningAgent() {
       // Add career urgency signals to message
       reminderMessage += careerUrgency;
 
-      // Add AI motivational nudge
-      const skillGapHint = careerSkillGaps.length > 0 ? ` Compétences à bosser pour ses entretiens: ${careerSkillGaps.slice(0, 3).join(", ")}.` : "";
-      const aiPrompt = `Tu es tuteur motivant. Oren n'a pas étudié aujourd'hui. Streak: ${streakData.currentStreak} jours.${skillGapHint} Génère un message court (2 lignes) pour l'encourager avec une suggestion concrète de quoi étudier.`;
-      const aiMotivation = await callOpenAI(
-        "Tu es tuteur motivant et enthousiaste. Donne des encouragements personnels et sincères.",
-        aiPrompt,
-        80
-      );
+      // AI motivational nudge removed — saves ~80 tokens/day, static streak message is enough for TDAH
 
-      if (aiMotivation) {
-        reminderMessage += `\n\n🎯 Message IA:\n${aiMotivation}`;
+      // Add concrete suggestion based on career skill gaps (no AI needed)
+      if (careerSkillGaps.length > 0) {
+        reminderMessage += `\n\n🎯 Suggestion: ${careerSkillGaps.slice(0, 2).join(" ou ")} (demandé dans tes candidatures)`;
       }
 
       sentReminder = await sendTG(reminderMessage);
@@ -522,19 +490,10 @@ Donne: 1) Compétence PRIORITAIRE à travailler (liée à ses candidatures) 2) R
 
         sentWeekly = await sendTG(weeklyMessage);
         responseType = "weekly";
-
-        // Save weekly analysis
-        const analysisText = `Weekly: ${weeklyData.totalStudyHours}h studied, Streak: ${weeklyData.currentStreak}d, Resources: ${weeklyData.resourcesCompleted} completed`;
-        await saveAnalysis(supabase, analysisText, "WEEKLY_SUMMARY");
       }
     }
 
-    // Save daily analysis if no study today
-    if (!studiedToday) {
-      const focusTopics = focusAreaStats.slice(0, 3).map((s) => `${s.topic}(${s.percentage}%)`).join(", ");
-      const analysisText = `No study logged. Streak: ${streakData.currentStreak}d, Focus areas: ${focusTopics}`;
-      await saveAnalysis(supabase, analysisText, "DAILY_CHECK");
-    }
+    // saveAnalysis calls removed — was polluting study_sessions with fake duration=0 entries
 
     // --- Auto-create learning tasks from skill-gap signals ---
     try {

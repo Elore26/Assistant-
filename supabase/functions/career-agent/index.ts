@@ -335,23 +335,7 @@ async function sendFollowupAlerts(followups: JobListing[]): Promise<boolean> {
     message += `\n(+${followups.length - 3} more)`;
   }
 
-  // --- AI Career Coach ---
-  try {
-    const followupContext = followups
-      .slice(0, 3)
-      .map((j) => `${j.title} @ ${j.company} (appliqué il y a ${daysSince(j.applied_date)} jours)`)
-      .join("\n");
-    const followupMsg = await callOpenAI(
-      `Tu es coach carrière. Génère un court template de relance par email en français pour chaque candidature (max 3 lignes par poste). Professionnel mais chaleureux.`,
-      followupContext,
-      500
-    );
-    if (followupMsg) {
-      message += `\n\n📧 <b>TEMPLATES RELANCE</b>\n${followupMsg}`;
-    }
-  } catch (e) {
-    console.error("AI follow-up template error:", e);
-  }
+  // AI follow-up templates removed — saves ~500 tokens/day, templates are repetitive
 
   return await sendTG(message);
 }
@@ -367,20 +351,7 @@ async function sendInterviewAlerts(interviews: JobListing[]): Promise<boolean> {
     message += `— ${job.company} · ${job.title}\n`;
   });
 
-  // --- AI Career Coach ---
-  try {
-    const jobList = interviews.map((j) => `${j.title} @ ${j.company}`).join(", ");
-    const prepTips = await callOpenAI(
-      `Tu es un coach carrière expert en SaaS/tech. Oren est Account Executive / SDR. Génère des conseils de préparation d'entretien en français (max 5 lignes par poste). Inclus: questions probables, points à préparer, erreurs à éviter.`,
-      `Entretiens à venir: ${jobList}`,
-      600
-    );
-    if (prepTips) {
-      message += `\n🎯 <b>PREP INTERVIEW</b>\n${prepTips}`;
-    }
-  } catch (e) {
-    console.error("AI interview prep error:", e);
-  }
+  // AI prep tips removed — prep tasks are auto-created with specific actions (research, STAR stories, pitch)
 
   return await sendTG(message);
 }
@@ -434,20 +405,7 @@ async function sendWeeklyReport(report: any): Promise<boolean> {
     `Offers        ${report.offers_received}\n` +
     `Conversion    ${report.conversion_rate}`;
 
-  // --- AI Career Coach ---
-  try {
-    const pipelineContext = `Cette semaine: ${report.applications_sent} candidatures, ${report.interviews_scheduled} entretiens, ${report.offers_received} offres, conversion ${report.conversion_rate}.`;
-    const strategy = await callOpenAI(
-      `Tu es coach carrière expert en SaaS. Oren est Account Executive / SDR. Basé sur les métriques de la semaine, fournis 3-4 conseils tactiques pour améliorer son pipeline de recrutement la semaine prochaine. Sois spécifique et actif.`,
-      pipelineContext,
-      400
-    );
-    if (strategy) {
-      message += `\n\n💡 <b>STRATÉGIE SEMAINE PRO</b>\n${strategy}`;
-    }
-  } catch (e) {
-    console.error("AI strategy advice error:", e);
-  }
+  // AI weekly strategy removed — evening-review already provides cross-domain AI coaching
 
   return await sendTG(message);
 }
@@ -811,15 +769,7 @@ serve(async (req: Request) => {
         }
       } catch (_) {}
 
-      // AI daily career tip
-      try {
-        const aiTip = await callOpenAI(
-          "Tu es coach carrière. Oren cherche un poste AE/SDR en tech/SaaS en Israël. Salaire cible: 25k₪+.",
-          `Pipeline: ${pipeline.new} new, ${pipeline.applied} applied, ${pipeline.interview} interview, ${pipeline.offer} offer, ${pipeline.rejected} rejected. Conversion interview: ${interviewRate}%. Donne 1 conseil ACTIONNABLE en 2 lignes max pour aujourd'hui. Sois SPÉCIFIQUE (ex: "Relance X", "Prépare tel angle pour interview").`,
-          120
-        );
-        if (aiTip) msg += `\n\n💡 ${aiTip}`;
-      } catch (_) {}
+      // AI daily tip removed — morning briefing chief-of-staff already provides daily priorities
 
       await sendTG(msg);
       alertsSent.push("scan_pipeline");
