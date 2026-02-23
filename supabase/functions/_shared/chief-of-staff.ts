@@ -21,7 +21,7 @@ import { getSignalBus, type AgentName, type Signal } from "./agent-signals.ts";
 // sendTG/escHTML removed — sending is now handled by callers (telegram-bot, morning-briefing)
 import { callOpenAI } from "./openai.ts";
 import { getIsraelNow, todayStr } from "./timezone.ts";
-import { WORK_SCHEDULE, WORKOUT_SCHEDULE, USER_PROFILE } from "./config.ts";
+import { WORK_SCHEDULE, WORKOUT_SCHEDULE, USER_PROFILE, getEnergyAt } from "./config.ts";
 
 // ─── Chief-Specific Tools ─────────────────────────────────────────────
 
@@ -364,12 +364,19 @@ Tu ne suis PAS un script fixe. Tu RAISONNES :
 
 Tu es CONCIS et ACTIONNABLE. Pas de bavardage. Des décisions.
 
+ADHD-SPÉCIFIQUE :
+- Placer les tâches P1 pendant les créneaux peak (9h-11h)
+- Si signal "overload_detected" → réduire à 3 tâches max
+- Si signal "fail_pattern" → appliquer la suggestion (ex: "Placer P1 en créneau peak")
+- Toujours mentionner les streaks actifs (signal "streaks_update") pour la motivation
+
 Format de ton rapport final (en français) :
 1. MODE DU JOUR : urgence/focus/normal/recovery + pourquoi
-2. SIGNAUX CRITIQUES (s'il y en a)
-3. TOP 3 ACTIONS du jour (les plus impactantes)
-4. MÉTRIQUES CLÉS (scorecard express — candidatures envoyées, entretiens obtenus, prospection LinkedIn)
-5. RISQUES & ALERTES`,
+2. 🔥 STREAKS (workout Xj, étude Xj — si actifs)
+3. SIGNAUX CRITIQUES (s'il y en a)
+4. TOP 3 ACTIONS du jour (les plus impactantes, avec créneau horaire suggéré)
+5. MÉTRIQUES CLÉS (scorecard express — candidatures envoyées, entretiens obtenus, prospection LinkedIn)
+6. RISQUES & ALERTES`,
 
     goal: `Exécuter le briefing matinal intelligent :
 
@@ -384,6 +391,8 @@ Format de ton rapport final (en français) :
 Le briefing doit être envoyé via Telegram comme rapport unifié.`,
 
     context: `Heure: ${getIsraelNow().toTimeString().slice(0, 5)} IST
+Énergie TDAH: 9h-11h=PEAK, 12h=medium, 13h-14h=LOW (crash), 15h-17h=medium, 18h+=low
+Énergie actuelle: ${getEnergyAt(getIsraelNow().getHours())}
 ${memoryContext}`,
 
     maxLoops: 6,

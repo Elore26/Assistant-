@@ -13,7 +13,7 @@ import { progressBar, trend, simpleProgressBar } from "../_shared/formatting.ts"
 import { DOMAIN_EMOJIS, TOMORROW_SCHEDULE, FAIL_REASON_LABELS } from "../_shared/config.ts";
 import { buildScorecard, formatScorecardHTML } from "../_shared/scorecard.ts";
 import { rankGoals, type GoalRanked } from "../_shared/goal-engine.ts";
-import { learnPatterns, generateBotRetro, formatRetro } from "../_shared/intelligence-engine.ts";
+import { learnPatterns } from "../_shared/intelligence-engine.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") || "";
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
@@ -406,34 +406,46 @@ serve(async (_req: Request) => {
     msg += signalsSummary;
     msg += `\n`;
 
-    // --- TACHES (with accountability) ---
+    // --- TACHES (anti-shame: start with wins, then offer cleanup) ---
     msg += `<b>📌 TÂCHES</b>  ${trend(tasksDoneToday, tasksWeekAvg)}\n`;
-    msg += `✅ ${tasksDoneToday} faites · ❌ ${failedCount} non faites · Taux: <b>${completionRate}%</b>\n`;
+
+    // WINS FIRST — always celebrate what was done
     if (humanCompleted.length > 0) {
+      msg += `✅ <b>${tasksDoneToday} faite${tasksDoneToday > 1 ? "s" : ""}</b>\n`;
       humanCompleted.slice(0, 4).forEach((t: any) => {
         msg += `  ✓ ${escHTML(t.title)}\n`;
       });
       if (humanCompleted.length > 4) msg += `  + ${humanCompleted.length - 4} autres\n`;
+    } else {
+      msg += `Journée sans tâches complétées — ça arrive.\n`;
     }
+
     // Collect fail reason buttons for top 3 failed tasks
     const failReasonButtons: any[][] = [];
 
+    // FAILED TASKS — neutral tone, offer actionable cleanup
     if (failedTasks.length > 0) {
-      msg += `\n<b>⚠️ PAS FAIT (${failedTasks.length}):</b>\n`;
-      failedTasks.slice(0, 15).forEach((t: any) => {
-        const dueTime = t.due_time ? ` (${t.due_time.substring(0, 5)})` : "";
-        const p = (t.priority || 3) <= 1 ? "🔴" : (t.priority || 3) === 2 ? "🟠" : "🟡";
-        msg += `  ✗ ${p} ${escHTML(t.title)}${dueTime}\n`;
-      });
-      if (failedTasks.length > 15) msg += `  <i>+ ${failedTasks.length - 15} autres tâches anciennes...</i>\n`;
+      // Only show P1-P2 not done (skip low-priority noise)
+      const criticalFailed = failedTasks.filter((t: any) => (t.priority || 3) <= 2);
+      const lowFailed = failedTasks.filter((t: any) => (t.priority || 3) > 2);
 
-      // Add fail reason prompt for top 3 failed P1-P2 tasks
-      const topFailed = failedTasks
-        .filter((t: any) => (t.priority || 3) <= 3)
-        .slice(0, 3);
+      if (criticalFailed.length > 0) {
+        msg += `\n<b>📌 À reporter (${criticalFailed.length} P1/P2):</b>\n`;
+        criticalFailed.slice(0, 5).forEach((t: any) => {
+          const dueTime = t.due_time ? ` (${t.due_time.substring(0, 5)})` : "";
+          const p = (t.priority || 3) <= 1 ? "🔴" : "🟠";
+          msg += `  ${p} ${escHTML(t.title)}${dueTime}\n`;
+        });
+      }
 
+      if (lowFailed.length > 0) {
+        msg += `\n<i>${lowFailed.length} tâche${lowFailed.length > 1 ? "s" : ""} secondaire${lowFailed.length > 1 ? "s" : ""} restante${lowFailed.length > 1 ? "s" : ""}</i>\n`;
+      }
+
+      // Add fail reason prompt for top 3 critical failed tasks (actionable, not shaming)
+      const topFailed = criticalFailed.slice(0, 3);
       if (topFailed.length > 0) {
-        msg += `\n<b>📝 Pourquoi pas fait ?</b> (clique pour chaque tâche)\n`;
+        msg += `\n<b>📝 Qu'est-ce qui a bloqué ?</b>\n`;
         for (const t of topFailed) {
           const shortTitle = (t.title || "").substring(0, 20);
           msg += `  → ${escHTML(shortTitle)}...\n`;
@@ -448,15 +460,12 @@ serve(async (_req: Request) => {
 
       // Show fail reason pattern if enough data
       if (topFailReason && failReasons7d.length >= 3) {
-          msg += `\n📊 <i>Pattern 7j: "${FAIL_REASON_LABELS[topFailReason[0]] || topFailReason[0]}" = raison #1 (${topFailReason[1]}x)</i>\n`;
-      }
-
-      if (completionRate < 50) {
-        msg += `  <i>Moins de la moitié fait. Qu'est-ce qui a bloqué ?</i>\n`;
+        msg += `\n📊 <i>Pattern: "${FAIL_REASON_LABELS[topFailReason[0]] || topFailReason[0]}" = cause #1 cette semaine (${topFailReason[1]}x)</i>\n`;
       }
     }
-    if (dayPattern) msg += `\n${dayPattern}\n`;
-    msg += `  <i>Moy 7j: ${tasksWeekAvg.toFixed(1)}/jour</i>\n\n`;
+    msg += `\n${completionRate}% · <i>Moy 7j: ${tasksWeekAvg.toFixed(1)}/jour</i>`;
+    if (dayPattern) msg += ` · ${dayPattern}`;
+    msg += `\n\n`;
 
     // --- FINANCE ---
     msg += `<b>💰 FINANCE</b>  ${trend(-totalExpenses, -avgExpDaily)}\n`;
@@ -751,15 +760,14 @@ Goals:\n${goalsContext}
 Demain: ${TOMORROW_SCHEDULE[tomorrowDay]}`;
 
       const aiReflection = await callOpenAI(
-        `Coach Oren. Réflexion soirée (7 lignes max, français):
-1. Quel goal est le plus en danger et pourquoi (pace vs requis)
-2. Cause racine du score aujourd'hui (chiffres)
-3. Lien entre tâches non faites et goals en retard
-4. TOP 3 actions demain orientées goal critique
-5. UNE question de coaching provocante sur l'objectif critique
-Data-driven, focus sur les goals. Max 150 mots.`,
+        `Tu es un coach bienveillant pour Oren (TDAH). Ton soirée (6 lignes max, français):
+1. Commence par ce qui a été BIEN fait (renforce le positif)
+2. UN seul point d'amélioration concret (pas de liste de reproches)
+3. TOP 3 actions demain orientées goal critique
+4. UNE question de coaching motivante (pas culpabilisante)
+Ton = empathique, direct, data-driven. JAMAIS de honte/culpabilité. Max 120 mots.`,
         aiContext,
-        300
+        250
       );
 
       if (aiReflection) {
@@ -828,6 +836,37 @@ Data-driven, focus sur les goals. Max 150 mots.`,
           requiredPace: cg.requiredDailyPace,
         }, { target: "morning-briefing", priority: cg.riskLevel === "critical" ? 1 : 2, ttlHours: 14 });
       }
+
+      // #7 FEEDBACK LOOP — actionable insights for morning to act on
+      // Fail reason pattern → morning knows what to adjust
+      if (topFailReason && failReasons7d.length >= 3) {
+        await signals.emit("fail_pattern", `Cause #1 d'échec: ${FAIL_REASON_LABELS[topFailReason[0]] || topFailReason[0]} (${topFailReason[1]}x/7j)`, {
+          reason: topFailReason[0],
+          count: topFailReason[1],
+          suggestion: topFailReason[0] === "energy" ? "Placer P1 en créneau peak (9h-11h)"
+            : topFailReason[0] === "toobig" ? "Découper les P1 en sous-tâches de 25min"
+            : topFailReason[0] === "forgot" ? "Activer rappels 15min avant chaque P1"
+            : topFailReason[0] === "blocked" ? "Identifier les bloqueurs dès le matin"
+            : "Revoir la planification",
+        }, { target: "morning-briefing", priority: 2, ttlHours: 14 });
+      }
+
+      // Completion rate → morning adjusts task load
+      if (completionRate < 50) {
+        await signals.emit("overload_detected", `Taux completion ${completionRate}% — réduire la charge demain`, {
+          completionRate,
+          scheduledCount: todayTotalScheduled,
+          doneCount: tasksDoneToday,
+          suggestion: "Max 3-5 tâches demain, prioriser P1 uniquement",
+        }, { target: "morning-briefing", priority: 2, ttlHours: 14 });
+      }
+
+      // Streaks data for morning display
+      await signals.emit("streaks_update", `Workout: ${workoutStreak}j, Étude: ${studyStreak}j`, {
+        workoutStreak,
+        studyStreak,
+        workoutsThisWeek,
+      }, { target: "morning-briefing", priority: 3, ttlHours: 14 });
     } catch (sigErr) {
       console.error("[Signals] Evening emit error:", sigErr);
     }

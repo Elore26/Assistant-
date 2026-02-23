@@ -155,12 +155,21 @@ async function answerCallbackQuery(callbackId: string, text?: string): Promise<v
 }
 
 // --- Inline Keyboard Helpers ---
+// ADHD-friendly: 4 buttons max, less cognitive load
 const MAIN_MENU: InlineKeyboardMarkup = {
   inline_keyboard: [
-    [{ text: "☀️ Briefing", callback_data: "morning_agentic" }, { text: "📋 Tasks", callback_data: "menu_tasks" }, { text: "💰 Budget", callback_data: "menu_budget" }],
-    [{ text: "💼 Carrière", callback_data: "menu_jobs" }, { text: "🚀 HiGrow", callback_data: "menu_leads" }, { text: "🏋️ Santé", callback_data: "menu_health" }],
-    [{ text: "📈 Trading", callback_data: "menu_signals" }, { text: "📊 Dashboard", callback_data: "menu_dashboard" }, { text: "🎯 EOS", callback_data: "menu_eos" }],
-    [{ text: "🤖 Agents", callback_data: "agent_status" }, { text: "❓ Tuto", callback_data: "tuto_main" }],
+    [{ text: "📋 Tâches", callback_data: "menu_tasks" }, { text: "💼 Carrière", callback_data: "menu_jobs" }],
+    [{ text: "📊 Bilan", callback_data: "menu_dashboard" }, { text: "➕ Plus", callback_data: "menu_extended" }],
+  ],
+};
+
+// Extended menu for less-used features (accessible via "Plus")
+const EXTENDED_MENU: InlineKeyboardMarkup = {
+  inline_keyboard: [
+    [{ text: "☀️ Briefing", callback_data: "morning_agentic" }, { text: "💰 Budget", callback_data: "menu_budget" }],
+    [{ text: "🏋️ Santé", callback_data: "menu_health" }, { text: "📈 Trading", callback_data: "menu_signals" }],
+    [{ text: "🚀 HiGrow", callback_data: "menu_leads" }, { text: "🎯 EOS", callback_data: "menu_eos" }],
+    [{ text: "🔙 Menu", callback_data: "menu_main" }],
   ],
 };
 
@@ -2916,6 +2925,8 @@ async function handleCallbackQuery(callbackId: string, chatId: number, data: str
   // === MAIN MENU BUTTONS ===
   else if (data === "menu_main") {
     await sendTelegramMessage(chatId, "📌 *OREN*", "Markdown", MAIN_MENU);
+  } else if (data === "menu_extended") {
+    await sendTelegramMessage(chatId, "📌 *Plus d'options*", "Markdown", EXTENDED_MENU);
   } else if (data === "dashboard") {
     await handleDashboard(chatId);
   } else if (data === "menu_tasks") {
@@ -2934,6 +2945,25 @@ async function handleCallbackQuery(callbackId: string, chatId: number, data: str
     await handleInsights(chatId);
   } else if (data === "menu_goals") {
     await handleGoals(chatId);
+  }
+  // === COMMITMENT DEVICE (morning engagement) ===
+  else if (data.startsWith("commit_")) {
+    const payload = data.replace("commit_", "");
+    if (payload === "done") {
+      await answerCallbackQuery(callbackId, "🚀 C'est parti !");
+      await sendTelegramMessage(chatId, "🚀 *Go ! Focus sur tes engagements.*\nJe te rappelle dans 15 min si besoin.", "Markdown", MAIN_MENU);
+    } else {
+      // Toggle task as committed (mark in_progress)
+      try {
+        const { data: task } = await supabase.from("tasks").select("id, title, status").eq("id", payload).single();
+        if (task) {
+          const newStatus = task.status === "in_progress" ? "pending" : "in_progress";
+          await supabase.from("tasks").update({ status: newStatus, updated_at: new Date().toISOString() }).eq("id", payload);
+          const icon = newStatus === "in_progress" ? "✅" : "↩️";
+          await answerCallbackQuery(callbackId, `${icon} ${(task.title || "").substring(0, 30)}`);
+        }
+      } catch (e) { await answerCallbackQuery(callbackId, "Erreur"); }
+    }
   }
   // === DASHBOARD SUB-MENU (Insights + Goals + Vélocité) ===
   else if (data === "menu_dashboard") {
@@ -5825,6 +5855,29 @@ async function callAI(userMessage: string, context: string): Promise<any> {
 
 async function handleNaturalLanguage(chatId: number, text: string): Promise<void> {
   try {
+    // --- BRAIN DUMP: detect multi-task lists (comma/newline separated) ---
+    // Saves tokens by skipping AI call for obvious lists
+    const lines = text.split(/[,\n]+/).map(s => s.trim()).filter(s => s.length > 2 && s.length < 100);
+    if (lines.length >= 2 && !text.startsWith("/")) {
+      // Looks like a brain dump — batch-create tasks in inbox
+      const supabase = getSupabaseClient();
+      const today = new Date().toISOString().slice(0, 10);
+      const tasks = lines.map(title => ({
+        title: title.substring(0, 100),
+        status: "pending" as const,
+        priority: 3,
+        is_inbox: true,
+        due_date: today,
+        created_at: new Date().toISOString(),
+      }));
+      const { error } = await supabase.from("tasks").insert(tasks);
+      if (!error) {
+        const list = lines.map(t => `→ ${t}`).join("\n");
+        await sendTelegramMessage(chatId, `📥 *${lines.length} tâches ajoutées*\n\n${list}\n\n_Inbox · P3 · Aujourd'hui_`, "Markdown");
+        return;
+      }
+    }
+
     // Get DB context for the AI
     const context = await getAIContext();
 
@@ -6832,12 +6885,28 @@ async function handleMorningAgentic(chatId: number): Promise<void> {
 
     if (result.success && result.output) {
       const report = `☀️ *MORNING BRIEFING — Chief of Staff*\n━━━━━━━━━━━━━━━━━━━━\n\n${result.output.substring(0, 3500)}\n\n_⚡ ${result.totalLoops} loops · ${result.totalToolCalls} tools · ${Math.round(result.durationMs / 1000)}s_`;
-      await sendTelegramMessage(chatId, report, "Markdown", {
-        inline_keyboard: [
-          [{ text: "💪 Workout", callback_data: "health_workout" }, { text: "📋 Tasks", callback_data: "menu_tasks" }],
-          [{ text: "🤖 Agent Status", callback_data: "agent_status" }, { text: "🔙 Menu", callback_data: "menu_main" }],
-        ],
-      });
+      await sendTelegramMessage(chatId, report, "Markdown");
+
+      // #2 COMMITMENT DEVICE — Ask Oren to pick his 3 commitments
+      try {
+        const supabase = getSupabaseClient();
+        const today = new Date().toISOString().slice(0, 10);
+        const { data: topTasks } = await supabase.from("tasks")
+          .select("id, title, priority")
+          .eq("due_date", today)
+          .in("status", ["pending", "in_progress"])
+          .order("priority", { ascending: true })
+          .limit(5);
+
+        if (topTasks && topTasks.length > 0) {
+          const commitButtons = topTasks.map((t: any) => [{
+            text: `${(t.priority || 3) <= 1 ? "🔴" : (t.priority || 3) === 2 ? "🟠" : "🟡"} ${(t.title || "").substring(0, 30)}`,
+            callback_data: `commit_${t.id}`,
+          }]);
+          commitButtons.push([{ text: "✅ C'est bon, je me lance", callback_data: "commit_done" }]);
+          await sendTelegramMessage(chatId, "🎯 *Choisis tes engagements du jour :*\n_(clique sur 1 à 3 tâches)_", "Markdown", { inline_keyboard: commitButtons });
+        }
+      } catch (_) {}
     } else {
       // Fallback to hardcoded briefing if agent fails
       console.error("[Morning] Agent failed, falling back to hardcoded:", result.guardrailReason || result.output);

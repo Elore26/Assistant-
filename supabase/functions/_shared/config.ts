@@ -107,12 +107,38 @@ export const AGENT_NAMES = {
   morningBriefing: "morning-briefing",
   eveningReview: "evening-review",
   taskReminder: "task-reminder",
-  taskReminderIdle: "task-reminder-idle",
-  taskReminderCareer: "task-reminder-career",
-  taskReminderPreview: "task-reminder-preview",
+  taskReminderMissed: "task-reminder-missed",
   taskReminderCir: "task-reminder-cir",
-  taskReminderRock: "task-reminder-rock",
   careerAgent: "career-agent",
   healthAgent: "health-agent",
   learningAgent: "learning-agent",
 };
+
+// --- ADHD Energy Curve (hour ranges → energy level) ---
+// Used by morning briefing to schedule tasks at optimal times
+export const ENERGY_CURVE: Record<string, "peak" | "medium" | "low"> = {
+  "06": "low",    // réveil
+  "07": "low",
+  "08": "medium", // café/stimulant kick-in
+  "09": "peak",   // meilleur créneau pour tâches dures
+  "10": "peak",
+  "11": "peak",
+  "12": "medium", // post-lunch dip incoming
+  "13": "low",    // crash classique TDAH
+  "14": "low",
+  "15": "medium", // second souffle
+  "16": "medium",
+  "17": "medium",
+  "18": "low",    // fatigue fin de journée
+  "19": "low",
+  "20": "low",
+  "21": "low",
+};
+
+// Returns energy level for a given hour
+export function getEnergyAt(hour: number): "peak" | "medium" | "low" {
+  return ENERGY_CURVE[String(hour).padStart(2, "0")] || "low";
+}
+
+// --- ADHD Time Buffer (tasks always take longer than estimated) ---
+export const TIME_BUFFER_MULTIPLIER = 1.5; // 30min estimé → 45min réel

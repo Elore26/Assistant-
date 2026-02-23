@@ -156,6 +156,36 @@ serve(async (_req: Request) => {
       } catch (e) { console.error("[Missed] Error:", e); }
     }
 
+    // ─── 2b. "1 SEULE CHOSE" — 10h nudge if nothing done yet ────
+    if (!focusActive && dow !== 6 && hour === 10 && now.getMinutes() < 15) {
+      try {
+        const { data: doneToday } = await supabase.from("tasks")
+          .select("id").eq("status", "completed")
+          .gte("updated_at", today + "T00:00:00").limit(1);
+
+        if (!doneToday || doneToday.length === 0) {
+          // Find THE single most important task
+          const { data: topOne } = await supabase.from("tasks")
+            .select("id, title, priority")
+            .eq("due_date", today)
+            .in("status", ["pending", "in_progress"])
+            .order("priority", { ascending: true })
+            .limit(1);
+
+          if (topOne && topOne.length > 0) {
+            const t = topOne[0];
+            await sendTG(`🎯 <b>1 SEULE CHOSE</b>\n\nRien fait ce matin — c'est OK.\nFais juste ça :\n\n→ <b>${escHTML(t.title)}</b>`, {
+              buttons: [[
+                { text: "🍅 Go (25min)", callback_data: `pomo_start_${t.id}` },
+                { text: "✅ Déjà fait", callback_data: `tdone_${t.id}` },
+              ]],
+            });
+            reminderCount++;
+          }
+        }
+      } catch (e) { console.error("[OneTask] Error:", e); }
+    }
+
     // ─── 3. CIR ALERTS (interviews only) ─────────────────────────
     if (dow !== 6 && hour >= 8 && hour <= 21 && now.getMinutes() < 15) {
       try {
@@ -240,6 +270,35 @@ serve(async (_req: Request) => {
           });
         }
       } catch (recErr) { console.error("[Recurring] Spawn error:", recErr); }
+
+      // ─── 4b. AUTO-CLEANUP dead tasks (background, no TG) ───────
+      try {
+        const d14ago = new Date(now); d14ago.setDate(d14ago.getDate() - 14);
+        const d14str = `${d14ago.getFullYear()}-${String(d14ago.getMonth() + 1).padStart(2, "0")}-${String(d14ago.getDate()).padStart(2, "0")}`;
+        const d30ago = new Date(now); d30ago.setDate(d30ago.getDate() - 30);
+        const d30str = `${d30ago.getFullYear()}-${String(d30ago.getMonth() + 1).padStart(2, "0")}-${String(d30ago.getDate()).padStart(2, "0")}`;
+
+        // P4-P5 pending for >14 days → cancelled
+        const { count: cleanedLow } = await supabase.from("tasks")
+          .update({ status: "cancelled", updated_at: new Date().toISOString() })
+          .in("status", ["pending"])
+          .gte("priority", 4)
+          .lte("due_date", d14str)
+          .select("id", { count: "exact", head: true });
+
+        // P3 pending for >30 days → cancelled
+        const { count: cleanedMed } = await supabase.from("tasks")
+          .update({ status: "cancelled", updated_at: new Date().toISOString() })
+          .in("status", ["pending"])
+          .eq("priority", 3)
+          .lte("due_date", d30str)
+          .select("id", { count: "exact", head: true });
+
+        const totalCleaned = (cleanedLow || 0) + (cleanedMed || 0);
+        if (totalCleaned > 0) {
+          console.log(`[Cleanup] Archived ${totalCleaned} dead tasks (${cleanedLow} low-pri, ${cleanedMed} med-pri)`);
+        }
+      } catch (cleanErr) { console.error("[Cleanup] Error:", cleanErr); }
     }
 
     // ─── 5. POMODORO CHECK — notify if active session expired ────
