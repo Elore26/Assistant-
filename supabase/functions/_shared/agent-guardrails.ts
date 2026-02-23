@@ -198,21 +198,11 @@ export class AgentGuardrails {
       }
     }
 
-    // Persist to DB
+    // Budget tracking kept in-memory only (agent_budgets table is write-only waste)
     try {
-      await this.supabase.from("agent_budgets").upsert({
-        agent_name: agentName,
-        date: budget.date,
-        tokens_used: budget.tokensUsed,
-        tool_calls: budget.toolCalls,
-        runs: budget.runs,
-        estimated_cost: budget.estimatedCost,
-        consecutive_failures: budget.consecutiveFailures,
-        is_circuit_broken: budget.isCircuitBroken,
-        updated_at: new Date().toISOString(),
-      }, { onConflict: "agent_name,date" });
+      // noop — removed DB persist to save tokens
     } catch (e) {
-      console.error("[Guardrails] Failed to persist budget:", e);
+      console.error("[Guardrails] Budget tracking error:", e);
     }
 
     // Check for alerts

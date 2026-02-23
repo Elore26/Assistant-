@@ -347,11 +347,7 @@ serve(async (req: Request) => {
       await sendTG(formatFinanceReport(result));
     }
 
-    // Save report record
-    await supabase.from("finance_reports").insert({
-      report_date: today, report_type: getIsraelNow().getDay() === 0 ? "weekly" : "daily",
-      metrics: { loops: result.totalLoops, tools: result.totalToolCalls, duration: result.durationMs },
-    }).catch(() => {});
+    // finance_reports insert removed — write-only table, never read
 
     return new Response(JSON.stringify({
       success: result.success, type: "finance_agent_react",

@@ -642,16 +642,7 @@ serve(async (_req: Request) => {
       const pomCount = todayPomodoros.data?.length || 0;
       const deepWork = (todayPomodoros.data || []).reduce((s: number, p: any) => s + (p.duration_minutes || 25), 0);
 
-      await supabase.from("task_metrics").upsert({
-        metric_date: today,
-        tasks_completed: tasksDoneToday,
-        tasks_created: todayCreated.count || 0,
-        tasks_rescheduled: todayRescheduled.count || 0,
-        total_pomodoros: pomCount,
-        deep_work_minutes: deepWork,
-        completion_rate: completionRate,
-        most_rescheduled_task: mostRescheduled?.[0]?.title || null,
-      }, { onConflict: "metric_date" });
+      // task_metrics upsert removed — write-only table, data already in tasks
     } catch (metErr) { console.error("[Metrics] Save error:", metErr); }
 
     // ============================================
@@ -899,16 +890,10 @@ Data-driven, focus sur les goals. Max 150 mots.`,
         const LINE_L10 = "━━━━━━━━━━━━━━━━━━━━";
         const dayNameShort = (ds: string) => ["Dim", "Lun", "Mar", "Mer", "Jeu", "Ven", "Sam"][new Date(ds + "T12:00:00").getDay()];
 
-        // MESSAGE 1: EOS SCORECARD
+        // CONSOLIDATED L10 WEEKLY — single message (ADHD-friendly)
         const scorecardData = await buildScorecard(supabase, weekStartStr, weekEndStr);
         const scorecardMsg = formatScorecardHTML(scorecardData);
-        await sendTG(`<b>📋 L10 WEEKLY</b> — Dimanche ${today}\n${LINE_L10}\n\n${scorecardMsg}`);
-
-        try {
-          await supabase.from("scorecard_snapshots").upsert({
-            week_start: weekStartStr, week_end: weekEndStr, metrics: scorecardData.metrics,
-          }, { onConflict: "week_start" });
-        } catch (_) {}
+        let l10Msg = `<b>📋 L10 WEEKLY</b> — Dimanche ${today}\n${LINE_L10}\n\n${scorecardMsg}\n`;
 
         // Fetch week tasks for breakdown
         const [{ data: weekAllTasks }, { data: weekDoneTasks }, { data: weekExpenses }, { data: weekHealth },
@@ -978,156 +963,72 @@ Data-driven, focus sur les goals. Max 150 mots.`,
         wFailReasons.forEach((fr: any) => { wFailCounts[fr.reason] = (wFailCounts[fr.reason] || 0) + 1; });
         const wTopFail = Object.entries(wFailCounts).sort((a, b) => b[1] - a[1])[0];
 
-        // MESSAGE 2: ROCK REVIEW + TASK BREAKDOWN
+        // ROCKS
         const wRocks = rocksData || [];
-        let rockMsg = `\n<b>🪨 ROCK REVIEW</b>\n${LINE_L10}\n`;
         if (wRocks.length > 0) {
+          l10Msg += `\n<b>🪨 ROCKS</b>\n`;
           for (const rock of wRocks) {
             const dLeft = Math.ceil((new Date(rock.quarter_end).getTime() - now.getTime()) / 86400000);
             const sIcon = rock.current_status === "on_track" ? "✅" : "⚠️";
-            const emoji = DOMAIN_EMOJIS[rock.domain] || "📌";
-            rockMsg += `${sIcon} ${emoji} ${escHTML(rock.title)} — <b>${rock.current_status.replace("_", " ").toUpperCase()}</b>\n`;
-            rockMsg += `   J-${dLeft} · ${escHTML(rock.measurable_target)}\n`;
-            if (rock.progress_notes) rockMsg += `   <i>${escHTML(rock.progress_notes)}</i>\n`;
-            rockMsg += `\n`;
+            l10Msg += `${sIcon} ${escHTML(rock.title)} — J-${dLeft}\n`;
           }
-          const onT = wRocks.filter((r: any) => r.current_status === "on_track").length;
-          const offT = wRocks.filter((r: any) => r.current_status === "off_track").length;
-          rockMsg += `${onT} on track · ${offT} off track\n`;
-        } else {
-          rockMsg += `Aucun Rock défini.\n`;
         }
 
-        rockMsg += `\n<b>📋 TÂCHES</b>\n`;
-        rockMsg += `${simpleProgressBar(wCompletionRate)} ${wCompletionRate}%\n`;
-        rockMsg += `✅ ${wDoneTasks.length} faites · ❌ ${wFailedTasks.length} non faites\n`;
-        if (wP1p2.length > 0) rockMsg += `🎯 P1/P2: ${wP1p2Done}/${wP1p2.length} (${wP1p2Rate}%)\n`;
+        // TASKS
+        l10Msg += `\n<b>📋 TÂCHES</b> ${simpleProgressBar(wCompletionRate)} ${wCompletionRate}%\n`;
+        l10Msg += `✅ ${wDoneTasks.length} · ❌ ${wFailedTasks.length}`;
+        if (wP1p2.length > 0) l10Msg += ` · P1/P2: ${wP1p2Done}/${wP1p2.length}`;
+        l10Msg += `\n`;
+        if (bestDay) l10Msg += `💪 ${bestDay} (${bestRate}%)`;
+        if (worstDay && worstDay !== bestDay) l10Msg += ` · ⚠️ ${worstDay} (${worstRate}%)`;
+        l10Msg += `\n`;
 
-        rockMsg += `\n<b>📅 Par jour:</b>\n`;
-        for (const d of ["Dim", "Lun", "Mar", "Mer", "Jeu", "Ven", "Sam"]) {
-          const s = wDayStats[d];
-          if (!s || s.total === 0) continue;
-          const rate = Math.round((s.done / s.total) * 100);
-          const icon = rate >= 80 ? "🟢" : rate >= 50 ? "🟡" : "🔴";
-          rockMsg += `${icon} ${d}: ${s.done}/${s.total} (${rate}%)\n`;
-        }
-        if (bestDay) rockMsg += `\n💪 Meilleur: <b>${bestDay}</b> (${bestRate}%)`;
-        if (worstDay && worstDay !== bestDay) rockMsg += ` · ⚠️ Faible: <b>${worstDay}</b> (${worstRate}%)`;
-        rockMsg += `\n\n<b>💰 DÉPENSES</b> · ₪${Math.round(wTotalSpent)}`;
-        if (wCash > 0) rockMsg += ` (₪${Math.round(wCash)} cash)`;
-        rockMsg += `\n`;
-        for (const [cat, amt] of wTopCats) { rockMsg += `  · ${cat}: ₪${Math.round(amt as number)}\n`; }
-        rockMsg += `\n<b>🏋️ SANTÉ</b> · ${new Set(wWorkouts.map((w: any) => w.log_date)).size}j · ${wWorkoutMin}min · Sommeil: ${wAvgSleep}h\n`;
+        // FINANCE + HEALTH (compact)
+        l10Msg += `\n💰 ₪${Math.round(wTotalSpent)}`;
+        for (const [cat, amt] of wTopCats.slice(0, 2)) { l10Msg += ` · ${cat} ₪${Math.round(amt as number)}`; }
+        l10Msg += `\n🏋️ ${new Set(wWorkouts.map((w: any) => w.log_date)).size}j · ${wWorkoutMin}min · Sommeil: ${wAvgSleep}h\n`;
         if (wTopFail && wFailReasons.length >= 3) {
-          rockMsg += `\n📊 <i>Pattern échecs: "${FAIL_REASON_LABELS[wTopFail[0]] || wTopFail[0]}" = raison #1 (${wTopFail[1]}x)</i>\n`;
-        }
-        await sendTG(rockMsg);
-
-        // MESSAGE 3: IDS ISSUES (AI-generated)
-        const idsContext = {
-          completionRate: wCompletionRate, totalDone: wDoneTasks.length,
-          totalFailed: wFailedTasks.length, p1p2Rate: wP1p2Rate,
-          bestDay, worstDay, totalSpent: Math.round(wTotalSpent),
-          workoutDays: new Set(wWorkouts.map((w: any) => w.log_date)).size, avgSleep: wAvgSleep,
-          overdueCount: (overdueRaw || []).length,
-          rocksOffTrack: wRocks.filter((r: any) => r.current_status === "off_track").map((r: any) => r.title),
-          rocksOnTrack: wRocks.filter((r: any) => r.current_status === "on_track").map((r: any) => r.title),
-          topFailReason: wTopFail ? `${wTopFail[0]} (${wTopFail[1]}x)` : "N/A",
-        };
-
-        const idsInsight = await callOpenAI(
-          `Coach EOS. Section IDS du L10 weekly (3 issues max, HTML <b>/<i>):
-🔴/🟡 <b>ISSUE:</b> [court] → <b>ROOT CAUSE:</b> [pourquoi] → <b>SOLVE:</b> [action mesurable]
-Prio: Rocks off-track > métriques off-track > patterns échec. Rock off-track = toujours issue.
-Faits + solutions seulement. Max 150 mots.`,
-          JSON.stringify(idsContext), 400
-        );
-        if (idsInsight) {
-          await sendTG(`\n<b>⚠️ IDS — Identify, Discuss, Solve</b>\n${LINE_L10}\n\n${idsInsight.trim()}`);
+          l10Msg += `📊 <i>Pattern: "${FAIL_REASON_LABELS[wTopFail[0]] || wTopFail[0]}" (${wTopFail[1]}x)</i>\n`;
         }
 
-        // MESSAGE 4: NEXT WEEK PLAN
-        let planMsg = `\n<b>📝 PLAN SEMAINE PROCHAINE</b>\n${LINE_L10}\n`;
+        // NEXT WEEK (compact)
         const overdue = overdueRaw || [];
         if (overdue.length > 0) {
-          planMsg += `\n<b>⚠️ REPORT (${overdue.length} en retard):</b>\n`;
-          for (const t of overdue.slice(0, 5)) {
-            const pIcon = (t.priority || 3) <= 2 ? "🔴" : "🟡";
-            const days = Math.round((new Date(today).getTime() - new Date(t.due_date).getTime()) / 86400000);
-            planMsg += `${pIcon} ${escHTML(t.title)} <i>(${days}j)</i>\n`;
+          l10Msg += `\n<b>⚠️ ${overdue.length} en retard</b>\n`;
+          for (const t of overdue.slice(0, 3)) {
+            l10Msg += `→ ${escHTML(t.title)}\n`;
           }
         }
         const nextWeek = nextWeekTasks || [];
         if (nextWeek.length > 0) {
-          planMsg += `\n<b>📌 PLANIFIÉ (${nextWeek.length}):</b>\n`;
-          const byDay: Record<string, string[]> = {};
-          for (const t of nextWeek) {
-            const d = `${dayNameShort(t.due_date)} ${t.due_date.substring(5)}`;
-            if (!byDay[d]) byDay[d] = [];
-            byDay[d].push(`${(t.priority || 3) <= 2 ? "●" : "○"} ${escHTML(t.title)}`);
+          l10Msg += `\n<b>📝 SEMAINE</b> (${nextWeek.length} tâches)\n`;
+          for (const t of nextWeek.slice(0, 5)) {
+            const pIcon = (t.priority || 3) <= 2 ? "●" : "○";
+            l10Msg += `${pIcon} ${escHTML(t.title)}\n`;
           }
-          for (const [d, tasks] of Object.entries(byDay)) {
-            planMsg += `\n<b>${d}:</b>\n`;
-            for (const task of tasks.slice(0, 3)) { planMsg += `  ${task}\n`; }
-            if (tasks.length > 3) planMsg += `  +${tasks.length - 3}\n`;
-          }
-        } else {
-          planMsg += `\nAucune tâche planifiée.\n`;
+          if (nextWeek.length > 5) l10Msg += `+${nextWeek.length - 5} autres\n`;
         }
 
-        // Velocity
-        try {
-          const { data: weekMetrics } = await supabase.from("task_metrics")
-            .select("*").gte("metric_date", weekStartStr).lte("metric_date", weekEndStr);
-          if (weekMetrics && weekMetrics.length > 0) {
-            const totalPomo = weekMetrics.reduce((s: number, m: any) => s + (m.total_pomodoros || 0), 0);
-            const totalDeepWork = weekMetrics.reduce((s: number, m: any) => s + (m.deep_work_minutes || 0), 0);
-            if (totalPomo > 0 || totalDeepWork > 0) {
-              const avgComp = weekMetrics.reduce((s: number, m: any) => s + (m.completion_rate || 0), 0) / weekMetrics.length;
-              planMsg += `\n<b>📊 VÉLOCITÉ:</b>\n`;
-              planMsg += `🍅 ${totalPomo} pomodoros · ${Math.round(totalDeepWork / 60)}h deep work · Taux: ${Math.round(avgComp)}%\n`;
-            }
-          }
-        } catch (_) {}
-        await sendTG(planMsg);
+        // Send consolidated L10 (1 message instead of 8)
+        await sendTG(l10Msg, {
+          buttons: [[
+            { text: "🪨 Rocks", callback_data: "menu_rocks" },
+            { text: "📋 Tâches", callback_data: "menu_tasks" },
+          ]],
+        });
 
-        // Auto carry-over critical overdue tasks
+        // Auto carry-over critical overdue tasks (background, no TG)
         const overdueCritical = overdue.filter((t: any) => (t.priority || 3) <= 2);
         const tomorrow = new Date(now); tomorrow.setDate(tomorrow.getDate() + 1);
         const tomorrowStr = `${tomorrow.getFullYear()}-${String(tomorrow.getMonth() + 1).padStart(2, "0")}-${String(tomorrow.getDate()).padStart(2, "0")}`;
-        let carryCount = 0;
         for (const t of overdueCritical.slice(0, 5)) {
           try {
             await supabase.from("tasks").update({ due_date: tomorrowStr, reminder_sent: false }).eq("id", t.id);
-            carryCount++;
           } catch (_) {}
         }
-        if (carryCount > 0) {
-          await sendTG(`✅ ${carryCount} tâche(s) prioritaire(s) reportée(s) à demain.`);
-        }
 
-        // ─── BOT SELF-RETRO + PATTERN LEARNING ─────────────────
-        try {
-          const patternsLearned = await learnPatterns(supabase);
-          const retro = await generateBotRetro(supabase);
-          const retroMsg = formatRetro(retro);
-          if (patternsLearned > 0) {
-            await sendTG(retroMsg + `\n\n<i>📈 ${patternsLearned} patterns mis à jour</i>`);
-          } else {
-            await sendTG(retroMsg);
-          }
-        } catch (retroErr) { console.error("[Retro] Error:", retroErr); }
-
-        await sendTG(
-          `<b>✨ Bonne semaine Oren !</b>\nFocus sur les Rocks. 3 tâches max par jour.`,
-          { buttons: [[
-            { text: "🪨 Rocks", callback_data: "menu_rocks" },
-            { text: "📊 Scorecard", callback_data: "menu_scorecard" },
-          ], [
-            { text: "📋 Tâches", callback_data: "menu_tasks" },
-            { text: "🎯 Sprint", callback_data: "sprint_create" },
-          ]] }
-        );
+        // Pattern learning (background, no TG, no retro message)
+        try { await learnPatterns(supabase); } catch (_) {}
 
         // Save weekly briefing record
         try {

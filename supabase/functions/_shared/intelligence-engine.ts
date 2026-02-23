@@ -510,13 +510,7 @@ export async function generateBotRetro(supabase: SupabaseClient): Promise<BotRet
     });
   }
 
-  // Save retro
-  const weekStart = sevenDaysAgo;
-  await supabase.from("bot_retro").upsert({
-    week_start: weekStart,
-    retro_data: { whatWorks, whatFails },
-    changes_applied: changesApplied,
-  }, { onConflict: "week_start" });
+  // bot_retro upsert removed — write-only table, never read
 
   return { whatWorks, whatFails, changesApplied };
 }
