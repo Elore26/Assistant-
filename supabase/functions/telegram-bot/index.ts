@@ -6813,6 +6813,18 @@ async function handleMemory(chatId: number, args: string[]): Promise<void> {
 
 /** Upgraded /morning — Uses Chief of Staff ReAct agent */
 async function handleMorningAgentic(chatId: number): Promise<void> {
+  // Dedup: skip if morning-briefing edge function already sent today
+  try {
+    const supabase = getSupabaseClient();
+    const today = new Date().toISOString().slice(0, 10);
+    const { data: existing } = await supabase.from("briefings")
+      .select("id").eq("briefing_type", "morning").eq("briefing_date", today).limit(1);
+    if (existing && existing.length > 0) {
+      await sendTelegramMessage(chatId, "☀️ Le briefing matinal a déjà été envoyé aujourd'hui.");
+      return;
+    }
+  } catch (_) {}
+
   await sendTelegramMessage(chatId, "☀️ Chief of Staff prépare ton briefing...");
 
   try {
@@ -6839,6 +6851,18 @@ async function handleMorningAgentic(chatId: number): Promise<void> {
 
 /** Upgraded /review — Uses Chief of Staff ReAct agent */
 async function handleReviewAgentic(chatId: number): Promise<void> {
+  // Dedup: skip if evening-review edge function already sent today
+  try {
+    const supabase = getSupabaseClient();
+    const today = new Date().toISOString().slice(0, 10);
+    const { data: existing } = await supabase.from("briefings")
+      .select("id").eq("briefing_type", "evening").eq("briefing_date", today).limit(1);
+    if (existing && existing.length > 0) {
+      await sendTelegramMessage(chatId, "🌙 La review du soir a déjà été envoyée aujourd'hui.");
+      return;
+    }
+  } catch (_) {}
+
   await sendTelegramMessage(chatId, "🌙 Chief of Staff prépare ta review...");
 
   try {

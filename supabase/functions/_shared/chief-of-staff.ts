@@ -12,14 +12,13 @@
 // - LEARNS from cross-domain patterns
 // ============================================
 
-import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { runReActAgent, type AgentConfig, type AgentResult } from "./react-agent.ts";
 import { registry, type ToolResult } from "./tool-registry.ts";
 import { getGuardrails } from "./agent-guardrails.ts";
 import { getMemoryStore } from "./agent-memory.ts";
 import { getSignalBus, type AgentName, type Signal } from "./agent-signals.ts";
-import { sendTG, escHTML } from "./telegram.ts";
+// sendTG/escHTML removed — sending is now handled by callers (telegram-bot, morning-briefing)
 import { callOpenAI } from "./openai.ts";
 import { getIsraelNow, todayStr } from "./timezone.ts";
 import { WORK_SCHEDULE, WORKOUT_SCHEDULE, USER_PROFILE } from "./config.ts";
@@ -502,56 +501,6 @@ ${memoryContext}`,
   return result;
 }
 
-// ─── HTTP Handler ─────────────────────────────────────────────────────
-
-serve(async (req: Request) => {
-  try {
-    const url = new URL(req.url);
-    const mode = url.searchParams.get("mode") || "morning";
-
-    const supabase = createClient(
-      Deno.env.get("SUPABASE_URL") ?? "",
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? ""
-    );
-
-    // Dedup
-    const today = todayStr();
-    const agentName = mode === "evening" ? "evening-review" : "morning-briefing";
-    const { data: already } = await supabase.from("agent_executions")
-      .select("id").eq("agent_name", agentName).gte("created_at", today).limit(1);
-    // Allow re-runs for testing — dedup only in production
-    // if (already?.length) { return skip... }
-
-    let result: AgentResult;
-
-    if (mode === "evening") {
-      result = await runEveningReview();
-    } else {
-      result = await runMorningBriefing();
-    }
-
-    if (result.output && result.success) {
-      const emoji = mode === "evening" ? "🌙" : "☀️";
-      const label = mode === "evening" ? "EVENING REVIEW" : "MORNING BRIEFING";
-      let report = `<b>${emoji} ${label} — Chief of Staff</b>\n━━━━━━━━━━━━━━━━━━━━\n\n`;
-      report += escHTML(result.output.slice(0, 3800));
-      report += `\n\n<i>⚡ ${result.totalLoops} loops · ${result.totalToolCalls} tools · ${Math.round(result.durationMs / 1000)}s</i>`;
-      if (result.stoppedByGuardrail) report += `\n⚠️ ${escHTML(result.guardrailReason || "")}`;
-      await sendTG(report);
-    }
-
-    return new Response(JSON.stringify({
-      success: result.success,
-      type: `chief_${mode}`,
-      output: result.output?.slice(0, 500),
-      loops: result.totalLoops,
-      toolCalls: result.totalToolCalls,
-      durationMs: result.durationMs,
-    }), { status: 200, headers: { "Content-Type": "application/json" } });
-
-  } catch (error) {
-    console.error("Chief of Staff Error:", error);
-    return new Response(JSON.stringify({ success: false, error: String(error) }),
-      { status: 500, headers: { "Content-Type": "application/json" } });
-  }
-});
+// NOTE: No serve() handler here — chief-of-staff is a _shared module.
+// Callers (telegram-bot, morning-briefing) import runMorningBriefing/runEveningReview
+// and handle their own HTTP serving + Telegram sending.
